@@ -618,6 +618,11 @@ class CodingThread(TimestampMixin, Base):
         back_populates="thread",
         cascade="all, delete-orphan",
     )
+    provider_tokens = relationship(
+        "CodingProviderToken",
+        back_populates="thread",
+        cascade="all, delete-orphan",
+    )
 
     __table_args__ = (
         Index('ix_coding_threads_owner_project', 'owner', 'project_id', 'updated_at'),
@@ -699,6 +704,33 @@ class CodingModelConfigSnapshot(Base):
     __table_args__ = (
         Index('ix_coding_model_snapshots_thread_created', 'thread_id', 'created_at'),
         Index('ix_coding_model_snapshots_owner', 'owner', 'created_at'),
+    )
+
+
+class CodingProviderToken(Base):
+    """Thread-scoped bearer token for external coding-provider tool calls."""
+    __tablename__ = "coding_provider_tokens"
+
+    id                = Column(String, primary_key=True, index=True)
+    thread_id         = Column(String, ForeignKey("coding_threads.id", ondelete="CASCADE"), nullable=False, index=True)
+    owner             = Column(String, nullable=True, index=True)
+    name              = Column(String, nullable=False, default="Provider")
+    token_prefix      = Column(String, nullable=False, index=True)
+    token_hash        = Column(String(64), nullable=False)
+    capabilities_json = Column(Text, nullable=False, default="[]")
+    metadata_json     = Column(Text, nullable=True)
+    expires_at        = Column(DateTime, nullable=True, index=True)
+    last_used_at      = Column(DateTime, nullable=True)
+    revoked_at        = Column(DateTime, nullable=True, index=True)
+    created_at        = Column(DateTime, nullable=False, default=datetime.utcnow)
+    updated_at        = Column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    thread = relationship("CodingThread", back_populates="provider_tokens")
+
+    __table_args__ = (
+        UniqueConstraint('token_hash', name='uq_coding_provider_tokens_hash'),
+        Index('ix_coding_provider_tokens_owner_thread', 'owner', 'thread_id', 'created_at'),
+        Index('ix_coding_provider_tokens_prefix_active', 'token_prefix', 'revoked_at', 'expires_at'),
     )
 
 

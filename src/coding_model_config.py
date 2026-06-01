@@ -148,6 +148,7 @@ def build_launch_env(db, owner: str | None, endpoint_id: str | None, model: str 
     api_key = getattr(endpoint, "api_key", None) if endpoint else None
     if api_key:
         env["OPENAI_API_KEY"] = api_key
+        env["CODEX_API_KEY"] = api_key
         host = (urlparse(config["endpoint_url"]).hostname or "").lower()
         if host.endswith("anthropic.com"):
             env["ANTHROPIC_API_KEY"] = api_key

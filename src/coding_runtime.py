@@ -24,7 +24,16 @@ from core.database import (
     SessionLocal,
 )
 from src.coding_harnesses import build_harness_command, get_harness
-from src.coding_model_config import build_launch_env
+from src.coding_model_config import build_launch_env, thread_model_config
+from src.coding_provider_launch import build_coding_agent_launch_plan
+from src.coding_provider_bridge import (
+    PROVIDER_BRIDGE_ENV_KEYS,
+    ProviderBridgeScope,
+    get_provider_bridge_service,
+    scripts_dir,
+    with_scripts_on_path,
+)
+from src.coding_pty_bridge import CodingPtyBridge
 from src.settings import get_setting
 
 logger = logging.getLogger(__name__)
@@ -33,6 +42,8 @@ RUN_ROOT = Path(DATA_DIR) / "coding_runs"
 ACTIVE_STATUSES = {"starting", "running", "stopping"}
 BLOCKING_STATUSES = {"queued", "starting", "running", "stopping"}
 FINISHED_STATUSES = {"exited", "failed", "cancelled"}
+PROVIDER_ODYSSEUS_ENV_KEYS = frozenset(PROVIDER_BRIDGE_ENV_KEYS)
+TMUX_PROVIDER_ENV_PREFIXES = ("OPENAI_", "OLLAMA_", "ANTHROPIC_", "CODEX_")
 
 
 class CodingRuntimeError(Exception):
@@ -82,11 +93,32 @@ def _user_login_shell() -> str:
     return shell or "/bin/bash"
 
 
+def _sanitize_base_launch_env(env: dict[str, str]) -> dict[str, str]:
+    return {key: value for key, value in env.items() if not key.startswith("ODYSSEUS_")}
+
+
+def _drop_private_odysseus_env(env: dict[str, str]) -> dict[str, str]:
+    return {
+        key: value
+        for key, value in env.items()
+        if not key.startswith("ODYSSEUS_") or key in PROVIDER_ODYSSEUS_ENV_KEYS
+    }
+
+
 class CodingRuntimeService:
     def __init__(self):
         self._lock = asyncio.Lock()
         self._active_tasks: dict[str, asyncio.Task] = {}
         self._active_processes: dict[str, asyncio.subprocess.Process] = {}
+        self._deleting_threads: set[tuple[str, str]] = set()
+        self._launching_runs: dict[str, tuple[str, str]] = {}
+        self._provider_bridge = get_provider_bridge_service()
+        self._pty_bridge = CodingPtyBridge(
+            tmux_available=self.tmux_available,
+            get_owned_run=self._get_owned_run,
+            finished_statuses=FINISHED_STATUSES,
+            logger=logger,
+        )
 
     def max_concurrent_runs(self) -> int:
         try:
@@ -100,6 +132,49 @@ class CodingRuntimeService:
 
     def run_dir(self, run_id: str) -> Path:
         return RUN_ROOT / run_id
+
+    def _tmux_session_name(self, run_id: str) -> str:
+        return f"ody-code-{run_id.replace('-', '')[:16]}"
+
+    def _issue_provider_bridge_env(self, run: CodingRun, thread: CodingThread | None) -> dict[str, str]:
+        scope = ProviderBridgeScope(
+            owner=run.owner or "",
+            project_id=(thread.project_id if thread else "") or "",
+            thread_id=run.thread_id or "",
+            run_id=run.id or "",
+        )
+        return self._provider_bridge.create_run_env(scope)
+
+    def _thread_delete_key(self, owner: str | None, thread_id: str | None) -> tuple[str, str]:
+        return ((owner or "").strip(), (thread_id or "").strip())
+
+    def _build_launch_environment(
+        self,
+        db,
+        run: CodingRun,
+        thread: CodingThread | None,
+    ) -> tuple[dict[str, str], dict[str, Any]]:
+        env = _sanitize_base_launch_env(os.environ.copy())
+        if thread:
+            env.update(build_launch_env(db, run.owner, thread.model_endpoint_id, thread.model))
+        provider_env = self._issue_provider_bridge_env(run, thread)
+        env.update(provider_env)
+        env = _drop_private_odysseus_env(env)
+        env = with_scripts_on_path(env)
+        return env, self._provider_bridge.metadata_for_env(provider_env)
+
+    def _tmux_launch_env_items(self, env: dict[str, str]) -> list[tuple[str, str]]:
+        allowed: list[tuple[str, str]] = []
+        for key, value in sorted(env.items()):
+            if key == "PATH" or key.startswith(TMUX_PROVIDER_ENV_PREFIXES) or key in PROVIDER_ODYSSEUS_ENV_KEYS:
+                allowed.append((key, value))
+        return allowed
+
+    def _revoke_run_provider_credentials(self, run_id: str) -> None:
+        try:
+            self._provider_bridge.revoke_run_token(run_id=run_id)
+        except Exception:
+            logger.debug("Failed to revoke provider bridge token for coding run %s", run_id, exc_info=True)
 
     def _append_event_db(
         self,
@@ -196,6 +271,9 @@ class CodingRuntimeService:
                 )
                 if not project:
                     raise CodingRuntimeError(404, "Project not found")
+                project_id = project.id
+                if self._thread_delete_key(owner, thread.id) in self._deleting_threads:
+                    raise CodingRuntimeError(409, "Thread deletion is in progress")
 
                 if idempotency_key:
                     existing = (
@@ -242,11 +320,31 @@ class CodingRuntimeService:
                 log_path = run_dir / "raw.log"
                 state_path = run_dir / "state.json"
 
-                built_command = build_harness_command(selected_harness, command, metadata)
+                requested_command = (command or "").strip()
+                metadata_command = str(metadata.get("command") or "").strip()
+                default_harness_command = not requested_command and not metadata_command
+                base_command = build_harness_command(selected_harness, command, metadata)
                 run_cwd = _safe_cwd(cwd, thread.cwd or project.root_path)
+                model_config = thread_model_config(db, thread)
+                launch_plan = build_coding_agent_launch_plan(
+                    harness_id=selected_harness,
+                    base_command=base_command,
+                    model=model_config.get("model") or thread.model,
+                    endpoint_url=model_config.get("endpoint_url") or "",
+                    run_dir=run_dir,
+                    default_harness_command=default_harness_command,
+                )
+                built_command = launch_plan.command
                 run_metadata = {
                     "requested_command": command or "",
                     "harness_metadata": metadata,
+                    "agent_launch": launch_plan.metadata,
+                    "model_config": {
+                        "endpoint_id": model_config.get("endpoint_id") or "",
+                        "endpoint_url": model_config.get("endpoint_url") or "",
+                        "model": model_config.get("model") or "",
+                        "source": model_config.get("source") or "",
+                    },
                     "state_path": str(state_path),
                     # Launch the pty at the UI pane's real size so the harness renders at the
                     # right width from the first frame (no 80-col wrap / full-redraw churn).
@@ -280,6 +378,9 @@ class CodingRuntimeService:
                         "harness_id": selected_harness,
                         "command": built_command,
                         "cwd": run_cwd,
+                        "model": model_config.get("model") or "",
+                        "model_endpoint_id": model_config.get("endpoint_id") or "",
+                        "agent_launch": launch_plan.metadata,
                     },
                 )
                 state_path.write_text(
@@ -298,36 +399,114 @@ class CodingRuntimeService:
             finally:
                 db.close()
 
-        await self.pump_queue()
+        await self.pump_queue(owner=owner, project_id=project_id)
         return detached
+
+    def _cancel_run_db(self, db, run: CodingRun, reason: str) -> None:
+        if run.status in FINISHED_STATUSES:
+            self._revoke_run_provider_credentials(run.id)
+            return
+        run.status = "cancelled"
+        run.finished_at = _now()
+        run.error = reason
+        thread = db.query(CodingThread).filter(CodingThread.id == run.thread_id).first()
+        if thread and thread.last_run_id == run.id:
+            thread.status = "idle"
+            thread.updated_at = _now()
+        self._append_event_db(db, run.thread_id, run.id, "cancelled", {"reason": reason})
+        self._revoke_run_provider_credentials(run.id)
 
     async def _stop_run_db(self, db, run: CodingRun, reason: str = "stopped") -> None:
         if run.status in FINISHED_STATUSES:
+            self._revoke_run_provider_credentials(run.id)
             return
         if run.status == "queued":
-            run.status = "cancelled"
-            run.finished_at = _now()
-            run.error = reason
-            thread = db.query(CodingThread).filter(CodingThread.id == run.thread_id).first()
-            if thread and thread.last_run_id == run.id:
-                thread.status = "idle"
-                thread.updated_at = _now()
-            self._append_event_db(db, run.thread_id, run.id, "cancelled", {"reason": reason})
+            self._cancel_run_db(db, run, reason)
             return
         if run.status == "starting" and not run.tmux_session and run.id not in self._active_processes:
-            run.status = "cancelled"
-            run.finished_at = _now()
-            run.error = reason
-            thread = db.query(CodingThread).filter(CodingThread.id == run.thread_id).first()
-            if thread and thread.last_run_id == run.id:
-                thread.status = "idle"
-                thread.updated_at = _now()
-            self._append_event_db(db, run.thread_id, run.id, "cancelled", {"reason": reason})
+            self._cancel_run_db(db, run, reason)
             return
         run.status = "stopping"
         run.error = reason
         self._append_event_db(db, run.thread_id, run.id, "stopping", {"reason": reason})
         await self._signal_stop(run)
+
+    async def _cleanup_run_for_thread_delete_db(self, db, run: CodingRun, reason: str) -> None:
+        if run.status in FINISHED_STATUSES:
+            self._revoke_run_provider_credentials(run.id)
+            return
+        if run.id in self._launching_runs:
+            raise CodingRuntimeError(409, f"Run {run.id} is still launching; retry deletion")
+        if run.status == "queued":
+            self._cancel_run_db(db, run, reason)
+            return
+        if run.status == "starting" and not run.tmux_session and run.id not in self._active_processes:
+            await self._signal_stop(run, strict=True, include_unpersisted_tmux=True)
+            self._cancel_run_db(db, run, reason)
+            return
+        await self._signal_stop(run, strict=True, include_unpersisted_tmux=True)
+        self._cancel_run_db(db, run, reason)
+
+    async def delete_thread(self, thread_id: str, owner: str) -> None:
+        key = self._thread_delete_key(owner, thread_id)
+        async with self._lock:
+            if key in self._deleting_threads:
+                raise CodingRuntimeError(409, "Thread deletion is already in progress")
+            if key in self._launching_runs.values():
+                raise CodingRuntimeError(409, "Thread has a run launching; retry deletion")
+            self._deleting_threads.add(key)
+            db = SessionLocal()
+            try:
+                thread = (
+                    db.query(CodingThread)
+                    .filter(CodingThread.id == thread_id, CodingThread.owner == owner)
+                    .first()
+                )
+                if not thread:
+                    raise CodingRuntimeError(404, "Thread not found")
+                thread.status = "stopping"
+                thread.updated_at = _now()
+                runs = (
+                    db.query(CodingRun)
+                    .filter(
+                        CodingRun.thread_id == thread.id,
+                        CodingRun.status.in_(tuple(BLOCKING_STATUSES)),
+                    )
+                    .order_by(CodingRun.queued_at.asc())
+                    .all()
+                )
+                for run in runs:
+                    await self._cleanup_run_for_thread_delete_db(db, run, "thread deleted")
+                db.delete(thread)
+                db.commit()
+            except Exception:
+                db.rollback()
+                raise
+            finally:
+                db.close()
+                self._deleting_threads.discard(key)
+        await self.pump_queue(owner=owner)
+
+    async def _begin_run_launch(self, run: CodingRun) -> bool:
+        async with self._lock:
+            db = SessionLocal()
+            try:
+                current = db.query(CodingRun).filter(CodingRun.id == run.id).first()
+                if not current or current.status not in {"starting", "running"}:
+                    return False
+                key = self._thread_delete_key(current.owner, current.thread_id)
+                if key in self._deleting_threads:
+                    self._cancel_run_db(db, current, "thread deletion in progress")
+                    db.commit()
+                    return False
+                self._launching_runs[current.id] = key
+                return True
+            finally:
+                db.close()
+
+    async def _end_run_launch(self, run_id: str) -> None:
+        async with self._lock:
+            self._launching_runs.pop(run_id, None)
 
     async def stop_run(self, run_id: str, owner: str, reason: str = "stopped") -> CodingRun:
         async with self._lock:
@@ -345,7 +524,7 @@ class CodingRuntimeService:
                 detached = self._detach_run(db, run.id)
             finally:
                 db.close()
-        await self.pump_queue()
+        await self.pump_queue(owner=owner)
         return detached
 
     async def send_stdin(self, run_id: str, owner: str, data: str) -> CodingRun:
@@ -388,36 +567,72 @@ class CodingRuntimeService:
         await self.append_event(run.thread_id, run.id, "resize", {"cols": cols, "rows": rows})
         return await self._get_owned_run(run_id, owner)
 
-    async def pump_queue(self) -> None:
+    def _scoped_run_query(self, db, *, owner: str | None = None, project_id: str | None = None):
+        query = db.query(CodingRun).join(CodingThread, CodingThread.id == CodingRun.thread_id)
+        if owner is not None:
+            query = query.filter(CodingRun.owner == owner, CodingThread.owner == owner)
+        if project_id is not None:
+            query = query.filter(CodingThread.project_id == project_id)
+        return query
+
+    def _queued_owners_db(self, db, *, owner: str | None = None) -> list[str]:
+        # Owners that have queued work, oldest queue entry first. Concurrency is a
+        # single per-owner pool shared across ALL of that owner's projects, so we
+        # budget by owner (not by project): a queued run in any project competes for
+        # the same slots, and global FIFO order decides which one starts next.
+        query = (
+            db.query(CodingRun.owner)
+            .join(CodingThread, CodingThread.id == CodingRun.thread_id)
+            .filter(CodingRun.status == "queued")
+        )
+        if owner is not None:
+            query = query.filter(CodingRun.owner == owner, CodingThread.owner == owner)
+        rows = (
+            query.group_by(CodingRun.owner)
+            .order_by(func.min(CodingRun.queued_at).asc())
+            .all()
+        )
+        return [row[0] for row in rows if row[0] is not None]
+
+    async def pump_queue(self, *, owner: str | None = None, project_id: str | None = None) -> None:
         launch_ids: list[str] = []
         async with self._lock:
             db = SessionLocal()
             try:
-                active_count = (
-                    db.query(CodingRun)
-                    .filter(CodingRun.status.in_(tuple(ACTIVE_STATUSES)))
-                    .count()
-                )
-                slots = max(0, self.max_concurrent_runs() - active_count)
-                if slots <= 0:
-                    return
-                queued = (
-                    db.query(CodingRun)
-                    .filter(CodingRun.status == "queued")
-                    .order_by(CodingRun.queued_at.asc())
-                    .limit(slots)
-                    .all()
-                )
-                for run in queued:
-                    run.status = "starting"
-                    run.started_at = _now()
-                    thread = db.query(CodingThread).filter(CodingThread.id == run.thread_id).first()
-                    if thread:
-                        thread.status = "starting"
-                        thread.last_run_id = run.id
-                        thread.updated_at = _now()
-                    self._append_event_db(db, run.thread_id, run.id, "starting", {"run_id": run.id})
-                    launch_ids.append(run.id)
+                await self._reconcile_stale_active_runs_db(db, owner=owner, project_id=project_id)
+                db.flush()
+                max_concurrent = self.max_concurrent_runs()
+                # One shared pool per owner across all their projects: count the owner's
+                # total active runs (any project) and fill free slots from the owner's
+                # oldest queued runs, regardless of which project they belong to.
+                for scope_owner in self._queued_owners_db(db, owner=owner):
+                    active_count = (
+                        self._scoped_run_query(db, owner=scope_owner)
+                        .filter(CodingRun.status.in_(tuple(ACTIVE_STATUSES)))
+                        .count()
+                    )
+                    slots = max(0, max_concurrent - active_count)
+                    if slots <= 0:
+                        continue
+                    queued = (
+                        self._scoped_run_query(db, owner=scope_owner)
+                        .filter(CodingRun.status == "queued")
+                        .order_by(CodingRun.queued_at.asc())
+                        .limit(slots)
+                        .all()
+                    )
+                    for run in queued:
+                        thread = db.query(CodingThread).filter(CodingThread.id == run.thread_id).first()
+                        if thread and self._thread_delete_key(run.owner, thread.id) in self._deleting_threads:
+                            continue
+                        run.status = "starting"
+                        run.started_at = _now()
+                        if thread:
+                            thread.status = "starting"
+                            thread.last_run_id = run.id
+                            thread.updated_at = _now()
+                        self._append_event_db(db, run.thread_id, run.id, "starting", {"run_id": run.id})
+                        launch_ids.append(run.id)
                 db.commit()
             finally:
                 db.close()
@@ -458,9 +673,14 @@ class CodingRuntimeService:
                         self._append_event_db(db, run.thread_id, run.id, "recovered", {"run_id": run.id})
                         recoverable_ids.append(run.id)
                     else:
+                        if not run.tmux_session:
+                            derived_session = self._tmux_session_name(run.id)
+                            if await self._tmux_has_session(derived_session):
+                                await self._tmux_exec("kill-session", "-t", derived_session, check=False)
                         run.status = "cancelled" if run.status == "stopping" else "failed"
                         run.finished_at = _now()
                         run.error = "Run was active during startup and no recoverable tmux session was found"
+                        self._revoke_run_provider_credentials(run.id)
                         thread = db.query(CodingThread).filter(CodingThread.id == run.thread_id).first()
                         if thread and thread.last_run_id == run.id:
                             thread.status = "idle"
@@ -483,6 +703,67 @@ class CodingRuntimeService:
                 task.add_done_callback(lambda _task, _rid=run_id: self._active_tasks.pop(_rid, None))
         await self.pump_queue()
 
+    async def reconcile_stale_active_runs(
+        self,
+        owner: str | None = None,
+        project_id: str | None = None,
+    ) -> list[str]:
+        async with self._lock:
+            db = SessionLocal()
+            try:
+                stale_ids = await self._reconcile_stale_active_runs_db(db, owner=owner, project_id=project_id)
+                db.commit()
+                return stale_ids
+            except Exception:
+                db.rollback()
+                raise
+            finally:
+                db.close()
+
+    async def _reconcile_stale_active_runs_db(
+        self,
+        db,
+        owner: str | None = None,
+        project_id: str | None = None,
+    ) -> list[str]:
+        query = self._scoped_run_query(db, owner=owner, project_id=project_id).filter(
+            CodingRun.status.in_(tuple(ACTIVE_STATUSES))
+        )
+        active_runs = query.all()
+        stale_ids: list[str] = []
+        for run in active_runs:
+            if run.id in self._launching_runs or run.id in self._active_tasks or run.id in self._active_processes:
+                continue
+
+            has_runtime_resource = False
+            if run.tmux_session:
+                has_runtime_resource = self.tmux_available() and await self._tmux_has_session(run.tmux_session)
+            if has_runtime_resource:
+                continue
+
+            final_status = "cancelled" if run.status == "stopping" else "failed"
+            run.status = final_status
+            run.finished_at = _now()
+            run.error = (
+                "Run was marked active but no live runtime resource was found"
+                if not run.tmux_session
+                else f"Run was marked active but tmux session {run.tmux_session} no longer exists"
+            )
+            self._revoke_run_provider_credentials(run.id)
+            thread = db.query(CodingThread).filter(CodingThread.id == run.thread_id).first()
+            if thread and thread.last_run_id == run.id:
+                thread.status = "idle"
+                thread.updated_at = _now()
+            self._append_event_db(
+                db,
+                run.thread_id,
+                run.id,
+                final_status,
+                {"error": run.error, "reconciled": True},
+            )
+            stale_ids.append(run.id)
+        return stale_ids
+
     async def shutdown(self) -> None:
         for task in list(self._active_tasks.values()):
             task.cancel()
@@ -491,6 +772,8 @@ class CodingRuntimeService:
                 proc.terminate()
             except ProcessLookupError:
                 pass
+        for run_id in set(self._active_tasks) | set(self._active_processes):
+            self._revoke_run_provider_credentials(run_id)
         self._active_tasks.clear()
         self._active_processes.clear()
 
@@ -504,7 +787,7 @@ class CodingRuntimeService:
             await self._launch_subprocess_run(run)
 
     async def _launch_tmux_run(self, run: CodingRun) -> None:
-        session = f"ody-code-{run.id.replace('-', '')[:16]}"
+        session = self._tmux_session_name(run.id)
         run_dir = Path(run.run_dir or self.run_dir(run.id))
         log_path = Path(run.log_path or (run_dir / "raw.log"))
         exit_path = run_dir / "exit_code"
@@ -523,13 +806,16 @@ class CodingRuntimeService:
         #
         # The short sleep lets pipe-pane attach before the program emits its first byte.
         user_shell = _user_login_shell()
+        script_dir = str(scripts_dir())
+        launch_command = f"export PATH={shlex.quote(script_dir)}:$PATH; {run.command}"
         script_path.write_text(
             "#!/bin/bash\n"
             "set +e\n"
             f"cd {shlex.quote(run.cwd)}\n"
             "export TERM=\"${TERM:-xterm-256color}\"\n"
+            f"export PATH={shlex.quote(script_dir)}:\"$PATH\"\n"
             "sleep 0.2\n"
-            f"{shlex.quote(user_shell)} -ilc {shlex.quote(run.command)}\n"
+            f"{shlex.quote(user_shell)} -ilc {shlex.quote(launch_command)}\n"
             "EC=$?\n"
             f"printf '%s' \"$EC\" > {shlex.quote(str(exit_path))}\n"
             "exit \"$EC\"\n",
@@ -537,105 +823,128 @@ class CodingRuntimeService:
         )
         script_path.chmod(0o700)
 
-        db = SessionLocal()
-        try:
-            current = db.query(CodingRun).filter(CodingRun.id == run.id).first()
-            thread = db.query(CodingThread).filter(CodingThread.id == run.thread_id).first()
-            if not current or current.status not in {"starting", "running"}:
-                return
-            env = os.environ.copy()
-            if thread:
-                env.update(build_launch_env(db, current.owner, thread.model_endpoint_id, thread.model))
-            run_meta = _json_loads(current.metadata_json, {})
-            init_cols = int(run_meta.get("cols") or 120)
-            init_rows = int(run_meta.get("rows") or 40)
-            # Size the detached session to the UI pane up front.
-            args = ["new-session", "-d", "-s", session, "-c", run.cwd, "-x", str(init_cols), "-y", str(init_rows)]
-            for key, value in sorted(env.items()):
-                if key.startswith(("OPENAI_", "OLLAMA_", "ANTHROPIC_")):
-                    args.extend(["-e", f"{key}={value}"])
-            # tmux runs the new-session command via `/bin/sh -c`, so the script path MUST be
-            # shell-quoted — otherwise a space in the path (e.g. the packaged app's data dir
-            # "~/Library/Application Support/Odysseus/…") word-splits and the pane dies
-            # instantly with no output (run never executes).
-            args.append(shlex.quote(str(script_path)))
-        finally:
-            db.close()
-
-        proc = await self._tmux_exec(*args, check=False)
-        if proc.returncode != 0:
-            stderr = (proc.stderr or b"").decode(errors="replace").strip()
-            await self._mark_failed(run.id, f"Failed to start tmux: {stderr or proc.returncode}")
-            await self.pump_queue()
+        if not await self._begin_run_launch(run):
             return
-
-        # Fix the window size to what we set (a detached session otherwise auto-sizes to
-        # clients / a default) so resize-window from the UI takes effect.
-        await self._tmux_exec("set-option", "-t", session, "window-size", "manual", check=False)
-
-        # Capture the pane's raw output to the log (out-of-band, preserves the program's TTY).
-        await self._start_pane_capture(session, log_path)
-
-        async with self._lock:
+        try:
             db = SessionLocal()
             try:
                 current = db.query(CodingRun).filter(CodingRun.id == run.id).first()
                 thread = db.query(CodingThread).filter(CodingThread.id == run.thread_id).first()
-                if not current:
+                if not current or current.status not in {"starting", "running"}:
                     return
-                metadata = _json_loads(current.metadata_json, {})
-                metadata.update(
-                    {
-                        "tmux_available": True,
-                        "stdin_supported": True,
-                        "resize_supported": True,
-                        "exit_path": str(exit_path),
-                    }
-                )
-                current.status = "running"
-                current.tmux_session = session
-                current.metadata_json = _json_dumps(metadata)
-                if thread:
-                    thread.status = "running"
-                    thread.last_run_id = current.id
-                    thread.updated_at = _now()
-                self._append_event_db(
-                    db,
-                    current.thread_id,
-                    current.id,
-                    "started",
-                    {
-                        "run_id": current.id,
-                        "tmux_session": session,
-                        "tmux_available": True,
-                        "stdin_supported": True,
-                        "resize_supported": True,
-                    },
-                )
+                env, provider_metadata = self._build_launch_environment(db, current, thread)
+                run_meta = _json_loads(current.metadata_json, {})
+                run_meta["provider_bridge"] = provider_metadata
+                current.metadata_json = _json_dumps(run_meta)
                 db.commit()
+                logger.info(
+                    "Coding run %s launch configured: harness=%s model=%s tools=%s",
+                    current.id,
+                    current.harness_id,
+                    (run_meta.get("agent_launch") or {}).get("configured_model") or "",
+                    ((run_meta.get("agent_launch") or {}).get("provider_tools") or {}).get("mode") or "",
+                )
+                init_cols = int(run_meta.get("cols") or 120)
+                init_rows = int(run_meta.get("rows") or 40)
+                # Size the detached session to the UI pane up front.
+                args = ["new-session", "-d", "-s", session, "-c", run.cwd, "-x", str(init_cols), "-y", str(init_rows)]
+                for key, value in self._tmux_launch_env_items(env):
+                    args.extend(["-e", f"{key}={value}"])
+                # tmux runs the new-session command via `/bin/sh -c`, so the script path MUST be
+                # shell-quoted — otherwise a space in the path (e.g. the packaged app's data dir
+                # "~/Library/Application Support/Odysseus/…") word-splits and the pane dies
+                # instantly with no output (run never executes).
+                args.append(shlex.quote(str(script_path)))
             finally:
                 db.close()
+
+            # Deep scrollback so the user can scroll back through terminal history with the
+            # mouse wheel (tmux copy-mode). Must be set BEFORE the pane is created — pane
+            # history is allocated at creation time. (`set -g` auto-starts the socket server.)
+            await self._tmux_exec("set-option", "-g", "history-limit", "50000", check=False)
+
+            proc = await self._tmux_exec(*args, check=False)
+            if proc.returncode != 0:
+                stderr = (proc.stderr or b"").decode(errors="replace").strip()
+                await self._mark_failed(run.id, f"Failed to start tmux: {stderr or proc.returncode}")
+                await self.pump_queue()
+                return
+
+            # Make the session a TRANSPARENT, low-latency passthrough for the PTY/WebSocket
+            # client (xterm.js): no status bar, no prefix key interception, instant ESC, and
+            # extended keys forwarded. window-size follows the attached client (the UI pane),
+            # so resizing the pane resizes the harness via SIGWINCH. Mouse on + alternate-scroll
+            # so the wheel scrolls history (copy-mode) / scrolls inside full-screen apps.
+            await self._tmux_exec("set-option", "-s", "extended-keys", "on", check=False)
+            await self._tmux_exec("set-option", "-g", "mouse", "on", check=False)
+            await self._tmux_exec("set-option", "-g", "alternate-scroll", "on", check=False)
+            await self._tmux_exec("set-option", "-g", "escape-time", "0", check=False)
+            await self._tmux_exec("set-option", "-t", session, "status", "off", check=False)
+            await self._tmux_exec("set-option", "-t", session, "prefix", "None", check=False)
+            await self._tmux_exec("set-option", "-t", session, "prefix2", "None", check=False)
+            await self._tmux_exec("set-option", "-t", session, "window-size", "latest", check=False)
+            await self._tmux_exec("set-option", "-t", session, "aggressive-resize", "on", check=False)
+
+            # Capture the pane's raw output to the log (out-of-band, preserves the program's TTY).
+            await self._start_pane_capture(session, log_path)
+
+            async with self._lock:
+                db = SessionLocal()
+                try:
+                    current = db.query(CodingRun).filter(CodingRun.id == run.id).first()
+                    thread = db.query(CodingThread).filter(CodingThread.id == run.thread_id).first()
+                    if not current:
+                        raise RuntimeError("Run disappeared during tmux launch")
+                    metadata = _json_loads(current.metadata_json, {})
+                    metadata.update(
+                        {
+                            "tmux_available": True,
+                            "stdin_supported": True,
+                            "resize_supported": True,
+                            "exit_path": str(exit_path),
+                        }
+                    )
+                    current.status = "running"
+                    current.tmux_session = session
+                    current.metadata_json = _json_dumps(metadata)
+                    if thread:
+                        thread.status = "running"
+                        thread.last_run_id = current.id
+                        thread.updated_at = _now()
+                    self._append_event_db(
+                        db,
+                        current.thread_id,
+                        current.id,
+                        "started",
+                        {
+                            "run_id": current.id,
+                            "tmux_session": session,
+                            "tmux_available": True,
+                            "stdin_supported": True,
+                            "resize_supported": True,
+                            "provider_bridge": metadata.get("provider_bridge") or {},
+                            "agent_launch": metadata.get("agent_launch") or {},
+                        },
+                    )
+                    db.commit()
+                finally:
+                    db.close()
+        except Exception as exc:
+            try:
+                if await self._tmux_has_session(session):
+                    await self._tmux_exec("kill-session", "-t", session, check=False)
+            except Exception:
+                logger.debug("Failed to clean up tmux session after launch error", exc_info=True)
+            await self._mark_failed(run.id, f"Failed to start tmux: {exc}")
+            await self.pump_queue()
+            return
+        finally:
+            await self._end_run_launch(run.id)
 
         await self._tail_tmux_run(run.id, session, log_path, exit_path)
 
     async def _start_pane_capture(self, session: str, log_path: Path) -> None:
-        """Mirror a tmux pane's raw output to ``log_path`` via ``pipe-pane``.
-
-        This taps the pane's output stream (the program's stdout/stderr bytes, ANSI
-        and all) without redirecting the program's own stdout — so the harness keeps a
-        real TTY while we still stream everything to the UI.
-        """
-        try:
-            log_path.parent.mkdir(parents=True, exist_ok=True)
-        except Exception:
-            pass
-        await self._tmux_exec(
-            "pipe-pane",
-            "-t",
-            session,
-            f"cat >> {shlex.quote(str(log_path))}",
-            check=False,
-        )
+        await self._pty_bridge.start_pane_capture(session, log_path)
 
     async def _tail_recovered_tmux_run(self, run_id: str) -> None:
         run = await self._get_run(run_id)
@@ -649,16 +958,16 @@ class CodingRuntimeService:
         await self._tail_tmux_run(run.id, run.tmux_session, Path(run.log_path), exit_path)
 
     async def _tail_tmux_run(self, run_id: str, session: str, log_path: Path, exit_path: Path) -> None:
-        offset = 0
+        # Pure exit watcher: live output now streams over the PTY/WebSocket (attach_pty)
+        # and history is captured to raw.log by pipe-pane, so there's no log-draining /
+        # per-chunk DB events here anymore — just detect completion and finalize.
         try:
             while True:
-                offset = await self._drain_log(run_id, log_path, offset)
                 if exit_path.exists():
                     break
                 if not await self._tmux_has_session(session):
                     break
-                await asyncio.sleep(0.05)  # tight loop → low keystroke-echo latency
-            offset = await self._drain_log(run_id, log_path, offset)
+                await asyncio.sleep(0.2)
             exit_code = None
             if exit_path.exists():
                 try:
@@ -705,62 +1014,88 @@ class CodingRuntimeService:
                 "runtime_note": "tmux unavailable; stdin and resize are unsupported for this run",
             }
         )
-        db = SessionLocal()
-        try:
-            current = db.query(CodingRun).filter(CodingRun.id == run.id).first()
-            thread = db.query(CodingThread).filter(CodingThread.id == run.thread_id).first()
-            if not current or current.status not in {"starting", "running"}:
-                return
-            env = os.environ.copy()
-            if thread:
-                env.update(build_launch_env(db, current.owner, thread.model_endpoint_id, thread.model))
-        finally:
-            db.close()
 
-        try:
-            proc = await asyncio.create_subprocess_shell(
-                run.command,
-                cwd=run.cwd,
-                env=env,
-                stdin=asyncio.subprocess.DEVNULL,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                executable="/bin/bash" if Path("/bin/bash").exists() else None,
-            )
-        except Exception as exc:
-            await self._mark_failed(run.id, f"Failed to start subprocess: {exc}")
-            await self.pump_queue()
+        if not await self._begin_run_launch(run):
             return
-
-        self._active_processes[run.id] = proc
-        async with self._lock:
+        try:
             db = SessionLocal()
             try:
                 current = db.query(CodingRun).filter(CodingRun.id == run.id).first()
                 thread = db.query(CodingThread).filter(CodingThread.id == run.thread_id).first()
-                if not current:
+                if not current or current.status not in {"starting", "running"}:
                     return
-                current.status = "running"
+                env, provider_metadata = self._build_launch_environment(db, current, thread)
+                metadata["provider_bridge"] = provider_metadata
                 current.metadata_json = _json_dumps(metadata)
-                if thread:
-                    thread.status = "running"
-                    thread.last_run_id = current.id
-                    thread.updated_at = _now()
-                self._append_event_db(
-                    db,
-                    current.thread_id,
-                    current.id,
-                    "started",
-                    {
-                        "run_id": current.id,
-                        "tmux_available": False,
-                        "stdin_supported": False,
-                        "resize_supported": False,
-                    },
-                )
                 db.commit()
+                logger.info(
+                    "Coding run %s launch configured: harness=%s model=%s tools=%s",
+                    current.id,
+                    current.harness_id,
+                    (metadata.get("agent_launch") or {}).get("configured_model") or "",
+                    ((metadata.get("agent_launch") or {}).get("provider_tools") or {}).get("mode") or "",
+                )
             finally:
                 db.close()
+
+            try:
+                proc = await asyncio.create_subprocess_shell(
+                    run.command,
+                    cwd=run.cwd,
+                    env=env,
+                    stdin=asyncio.subprocess.DEVNULL,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    executable="/bin/bash" if Path("/bin/bash").exists() else None,
+                )
+            except Exception as exc:
+                await self._mark_failed(run.id, f"Failed to start subprocess: {exc}")
+                await self.pump_queue()
+                return
+
+            self._active_processes[run.id] = proc
+            async with self._lock:
+                db = SessionLocal()
+                try:
+                    current = db.query(CodingRun).filter(CodingRun.id == run.id).first()
+                    thread = db.query(CodingThread).filter(CodingThread.id == run.thread_id).first()
+                    if not current:
+                        raise RuntimeError("Run disappeared during subprocess launch")
+                    current.status = "running"
+                    current.metadata_json = _json_dumps(metadata)
+                    if thread:
+                        thread.status = "running"
+                        thread.last_run_id = current.id
+                        thread.updated_at = _now()
+                    self._append_event_db(
+                        db,
+                        current.thread_id,
+                        current.id,
+                        "started",
+                        {
+                            "run_id": current.id,
+                            "tmux_available": False,
+                            "stdin_supported": False,
+                            "resize_supported": False,
+                            "provider_bridge": metadata.get("provider_bridge") or {},
+                            "agent_launch": metadata.get("agent_launch") or {},
+                        },
+                    )
+                    db.commit()
+                finally:
+                    db.close()
+        except Exception as exc:
+            proc = self._active_processes.pop(run.id, None)
+            if proc and proc.returncode is None:
+                try:
+                    proc.terminate()
+                except ProcessLookupError:
+                    pass
+            await self._mark_failed(run.id, f"Failed to start subprocess: {exc}")
+            await self.pump_queue()
+            return
+        finally:
+            await self._end_run_launch(run.id)
 
         async def _reader(stream: asyncio.StreamReader | None, name: str) -> None:
             if stream is None:
@@ -799,6 +1134,7 @@ class CodingRuntimeService:
             await self.pump_queue()
 
     async def _finalize_run(self, run_id: str, exit_code: int | None) -> None:
+        self._revoke_run_provider_credentials(run_id)
         async with self._lock:
             db = SessionLocal()
             try:
@@ -825,6 +1161,7 @@ class CodingRuntimeService:
                 db.close()
 
     async def _mark_failed(self, run_id: str, error: str) -> None:
+        self._revoke_run_provider_credentials(run_id)
         async with self._lock:
             db = SessionLocal()
             try:
@@ -843,40 +1180,65 @@ class CodingRuntimeService:
             finally:
                 db.close()
 
-    async def _signal_stop(self, run: CodingRun) -> None:
-        if run.tmux_session:
+    async def _signal_stop(
+        self,
+        run: CodingRun,
+        *,
+        strict: bool = False,
+        include_unpersisted_tmux: bool = False,
+    ) -> None:
+        tmux_session = run.tmux_session
+        derived_tmux_session = False
+        if not tmux_session and include_unpersisted_tmux and run.id not in self._active_processes:
+            tmux_session = self._tmux_session_name(run.id)
+            derived_tmux_session = True
+
+        if tmux_session:
             if not self.tmux_available():
-                return
-            await self._tmux_exec("send-keys", "-t", run.tmux_session, "C-c", check=False)
-            await asyncio.sleep(0.5)
-            if await self._tmux_has_session(run.tmux_session):
-                await self._tmux_exec("kill-session", "-t", run.tmux_session, check=False)
+                if strict and not derived_tmux_session:
+                    raise CodingRuntimeError(500, f"Cannot stop tmux run {run.id}: tmux is unavailable")
+            elif await self._tmux_has_session(tmux_session):
+                if not derived_tmux_session:
+                    await self._tmux_exec("send-keys", "-t", tmux_session, "C-c", check=False)
+                    await asyncio.sleep(0.5)
+                if await self._tmux_has_session(tmux_session):
+                    await self._tmux_exec("kill-session", "-t", tmux_session, check=False)
+                if strict and await self._tmux_has_session(tmux_session):
+                    raise CodingRuntimeError(500, f"Failed to stop tmux session for run {run.id}")
             return
         proc = self._active_processes.get(run.id)
-        if proc and proc.returncode is None:
-            try:
-                proc.terminate()
-            except ProcessLookupError:
-                pass
+        if proc:
+            if proc.returncode is None:
+                try:
+                    proc.terminate()
+                except ProcessLookupError:
+                    pass
+                if strict:
+                    try:
+                        await asyncio.wait_for(proc.wait(), timeout=2.0)
+                    except asyncio.TimeoutError:
+                        try:
+                            proc.kill()
+                        except ProcessLookupError:
+                            pass
+                        try:
+                            await asyncio.wait_for(proc.wait(), timeout=2.0)
+                        except asyncio.TimeoutError as exc:
+                            raise CodingRuntimeError(500, f"Failed to stop subprocess for run {run.id}") from exc
+            if strict:
+                self._active_processes.pop(run.id, None)
+            return
+        if strict and run.status == "running":
+            raise CodingRuntimeError(409, f"Cannot clean up active run {run.id}: no runtime resource is tracked")
 
     async def _tmux_has_session(self, session: str) -> bool:
-        if not session or not self.tmux_available():
-            return False
-        result = await self._tmux_exec("has-session", "-t", session, check=False)
-        return result.returncode == 0
+        return await self._pty_bridge.tmux_has_session(session)
+
+    async def attach_pty(self, websocket, run_id: str, owner: str, cols: int = 120, rows: int = 40) -> None:
+        await self._pty_bridge.attach_pty(websocket, run_id, owner, cols, rows)
 
     async def _tmux_exec(self, *args: str, check: bool = True):
-        proc = await asyncio.create_subprocess_exec(
-            "tmux",
-            *args,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, stderr = await proc.communicate()
-        result = type("TmuxResult", (), {"returncode": proc.returncode, "stdout": stdout, "stderr": stderr})()
-        if check and proc.returncode != 0:
-            raise RuntimeError(stderr.decode(errors="replace") or f"tmux exited {proc.returncode}")
-        return result
+        return await self._pty_bridge.tmux_exec(*args, check=check)
 
     async def _get_run(self, run_id: str) -> CodingRun | None:
         db = SessionLocal()
@@ -1003,23 +1365,27 @@ class CodingRuntimeService:
                 idle_ticks += 1
             await asyncio.sleep(0.05)  # tight SSE poll → low output latency for live typing
 
-    def queue_snapshot(self, owner: str) -> dict[str, Any]:
+    def queue_snapshot(self, owner: str, project_id: str | None = None) -> dict[str, Any]:
         db = SessionLocal()
         try:
+            # Counts are owner-global: the concurrency budget is one pool shared across
+            # all of the owner's projects. project_id is accepted for callers but does
+            # not narrow the totals (per-project attribution lives in the queue route).
             queued = (
-                db.query(CodingRun)
-                .filter(CodingRun.owner == owner, CodingRun.status == "queued")
+                self._scoped_run_query(db, owner=owner)
+                .filter(CodingRun.status == "queued")
                 .order_by(CodingRun.queued_at.asc())
                 .all()
             )
             active = (
-                db.query(CodingRun)
-                .filter(CodingRun.owner == owner, CodingRun.status.in_(tuple(ACTIVE_STATUSES)))
+                self._scoped_run_query(db, owner=owner)
+                .filter(CodingRun.status.in_(tuple(ACTIVE_STATUSES)))
                 .order_by(CodingRun.started_at.asc())
                 .all()
             )
             return {
                 "max_concurrent": self.max_concurrent_runs(),
+                "project_id": project_id,
                 "tmux_available": self.tmux_available(),
                 "queued": [run.id for run in queued],
                 "active": [run.id for run in active],

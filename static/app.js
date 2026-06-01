@@ -2339,6 +2339,7 @@ function initializeEventListeners() {
     'sessions-section':    '#sessions-section',
     'email-section':       '#email-section',
     'models-section':      '#models-section',
+    'coding-section':      '#coding-section',
     'tools-section':       '#tools-section',
     // Per-tool visibility — fine-grained control over which entries show
     // inside the Tools section in the sidebar.
@@ -3451,6 +3452,15 @@ function startOdysseusApp() {
   if (railCodeBtn) railCodeBtn.addEventListener('click', openCodeStation);
   const toolCodeBtn = el('tool-code-btn');
   if (toolCodeBtn) toolCodeBtn.addEventListener('click', openCodeStation);
+
+  // Navigating to the chat space (new chat / search / chats / delete) leaves the Code
+  // Station workspace. Tool modals (calendar, email, settings, …) intentionally overlay
+  // it instead, so they're not wired here.
+  const _exitCodeSpace = () => { if (codeStationModule && codeStationModule.hide) codeStationModule.hide(); };
+  ['rail-new-session', 'rail-search-btn', 'rail-chats', 'rail-delete-session'].forEach((id) => {
+    const b = el(id);
+    if (b) b.addEventListener('click', _exitCodeSpace);
+  });
 
   // Rail tool buttons — delegate to sidebar tool buttons
   const _railToolMap = {

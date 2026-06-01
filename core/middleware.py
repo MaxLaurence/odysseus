@@ -94,7 +94,11 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
                 "font-src 'self' https://cdn.jsdelivr.net; "
                 "img-src 'self' data: blob:; "
                 "media-src 'self' blob:; "
-                "connect-src 'self'; "
+                # `ws: wss:` is required for the Code Station terminal WebSocket: WebKit/Safari
+                # (the packaged app's WKWebView) does NOT treat `connect-src 'self'` as covering
+                # WebSocket connections, so the scheme must be listed explicitly or the socket
+                # is silently blocked.
+                "connect-src 'self' ws: wss:; "
                 "frame-src 'self'; "
                 "frame-ancestors 'none'"
             )

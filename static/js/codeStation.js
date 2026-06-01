@@ -1,7 +1,14 @@
 // static/js/codeStation.js
 // Dynamic Code Station surface for /api/coding.
 
-import * as Modals from './modalManager.js';
+import { createProviderTools } from './codeStationProviderTools.js';
+import { renderThreadDetail as renderThreadDetailView } from './codeStationThreadDetail.js';
+import {
+  closePaneWs,
+  connectPaneWs as connectPaneTransport,
+  sendPaneInput,
+  sendPaneResize,
+} from './codeStationTerminalTransport.js';
 
 const MODAL_ID = 'code-station-modal';
 const DEFAULT_HARNESSES = ['generic', 'pi', 'codex', 'claude', 'opencode', 'omp', 'hermes', 'custom'];
@@ -30,11 +37,11 @@ const STREAM_EVENT_NAMES = [
   'status',
   'error',
 ];
-
 let API_BASE = '';
 let sessionModule = null;
 let uiModule = null;
 let modelsModule = null;
+let providerToolsModule = null;
 
 const state = {
   initialized: false,
@@ -50,6 +57,9 @@ const state = {
   harnesses: DEFAULT_HARNESSES.slice(),
   modelConfig: null,
   queue: [],
+  queueLoaded: false,
+  queueByProject: [],
+  queueMax: 0,
   activeMobileTab: 'projects',
   source: null,
   lastSeq: 0,
@@ -64,6 +74,7 @@ const state = {
   panes: new Map(),   // paneId -> PaneSession (live xterm + SSE)
   drag: null,         // { type:'thread'|'pane', threadId?, leafId? } during a drag
   _nodeEls: new Map(), // node id -> DOM element (keyed reconciliation)
+  stoppingRuns: new Map(),
 };
 
 function apiPath(path) {
@@ -95,7 +106,10 @@ async function api(path, options = {}) {
   }
   if (!res.ok) {
     const detail = data?.detail || data?.error || data?.message || data?.text || `${res.status} ${res.statusText}`;
-    throw new Error(detail);
+    const error = new Error(detail);
+    error.status = res.status;
+    error.data = data;
+    throw error;
   }
   return data;
 }
@@ -260,6 +274,18 @@ function q(selector) {
   return state.modal?.querySelector(selector) || null;
 }
 
+function esc(value) {
+  const text = value == null ? '' : String(value);
+  if (uiModule?.esc) return uiModule.esc(text);
+  return text.replace(/[&<>"']/g, (ch) => ({
+    '&': '&amp;',
+    '<': '&lt;',
+    '>': '&gt;',
+    '"': '&quot;',
+    "'": '&#39;',
+  })[ch]);
+}
+
 function selectedProjectExists() {
   return state.projects.some((project) => project.id === state.selectedProjectId);
 }
@@ -284,6 +310,45 @@ function setButtonBusy(button, busy) {
   button.classList.toggle('is-busy', busy);
 }
 
+function providerScopeForModule() {
+  return {
+    projectId: asId(state.selectedProjectId || state.selectedProject?.id || state.selectedThread?.project_id),
+    threadId: asId(state.selectedThreadId || state.selectedThread?.id),
+    runId: asId(state.selectedRunId || state.selectedRun?.id || state.selectedThread?.run_id),
+    threadTitle: state.selectedThread?.title || 'Coding thread',
+  };
+}
+
+function ensureProviderToolsModule() {
+  if (providerToolsModule) return providerToolsModule;
+  providerToolsModule = createProviderTools({
+    getApiBase: () => API_BASE,
+    getScope: providerScopeForModule,
+    getPanel: () => q('#code-provider-tools-panel'),
+    setButtonBusy,
+    toast,
+    confirm: (message, options) => (
+      uiModule?.styledConfirm
+        ? uiModule.styledConfirm(message, options)
+        : Promise.resolve(window.confirm(message))
+    ),
+    copyToClipboard: uiModule?.copyToClipboard ? (text) => uiModule.copyToClipboard(text) : null,
+  });
+  return providerToolsModule;
+}
+
+function syncProviderTools(options = {}) {
+  const pending = ensureProviderToolsModule().sync(options);
+  pending.catch((error) => {
+    console.debug('Provider permissions refresh failed', error);
+  });
+  return pending;
+}
+
+function connectPaneWs(session) {
+  connectPaneTransport(session, { apiBase: API_BASE, statusLabel, setPaneStatus });
+}
+
 function ensureModal() {
   let modal = document.getElementById(MODAL_ID);
   if (modal) {
@@ -293,11 +358,19 @@ function ensureModal() {
 
   modal = document.createElement('div');
   modal.id = MODAL_ID;
-  modal.className = 'modal code-station-modal hidden';
+  // Top-level workspace (peer to the chat space), not a modal overlay. Keep the
+  // `code-station-modal` class so the `--cs-*` design tokens still apply.
+  modal.className = 'code-station-modal code-space';
   modal.dataset.mobileTab = state.activeMobileTab;
   modal.innerHTML = `
-    <div class="modal-content code-station-content" role="dialog" aria-modal="true" aria-labelledby="code-station-title">
-      <div class="modal-header code-station-header">
+    <div class="code-station-content" role="region" aria-label="Code Station">
+      <div class="code-station-header">
+        <button type="button" class="cs-back-btn" data-code-action="back-to-chat" title="Back to chat" aria-label="Back to chat">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 18 9 12 15 6"/></svg>
+        </button>
+        <button type="button" class="code-station-icon-btn cs-tree-toggle" data-code-action="toggle-tree" title="Toggle project menu" aria-label="Toggle project menu">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="1.5"/><line x1="9" y1="4" x2="9" y2="20"/></svg>
+        </button>
         <div class="code-station-title-wrap">
           <svg class="code-station-title-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/><line x1="13" y1="4" x2="11" y2="20"/></svg>
           <div class="code-station-title-text">
@@ -306,11 +379,11 @@ function ensureModal() {
           </div>
         </div>
         <div class="code-station-header-actions">
-          <span id="code-station-queue-badge" class="code-station-pill muted">0 active</span>
+          <button type="button" id="code-station-queue-badge" class="code-station-pill muted" data-code-action="toggle-queue" aria-haspopup="true" aria-expanded="false" title="No coding runs active">0 active</button>
+          <div id="cs-queue-popover" class="cs-queue-popover" hidden></div>
           <button type="button" class="code-station-icon-btn" data-code-action="refresh" title="Refresh Code Station" aria-label="Refresh Code Station">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 0 1-15.5 6.3"/><path d="M3 12A9 9 0 0 1 18.5 5.7"/><path d="M3 18v-6h6"/><path d="M21 6v6h-6"/></svg>
           </button>
-          <button type="button" class="close-btn" data-code-action="close" aria-label="Close Code Station">x</button>
         </div>
       </div>
       <div class="code-station-mobile-tabs" role="tablist" aria-label="Code Station views">
@@ -401,24 +474,19 @@ function ensureModal() {
   document.body.appendChild(modal);
   state.modal = modal;
   wireModal(modal);
-  Modals.register(MODAL_ID, {
-    railBtnId: 'rail-code',
-    sidebarBtnId: 'tool-code-btn',
-    label: 'Code',
-    icon: 'M16 18 22 12 16 6M8 6 2 12 8 18M13 4 11 20',
-    restoreFn: () => {
-      state.modal = document.getElementById(MODAL_ID);
-      renderAll();
-      refitAll();
-    },
-    closeFn: destroyModal,
-  });
-  Modals.injectMinimizeButton(modal, MODAL_ID);
   return modal;
 }
 
 function wireModal(modal) {
   modal.addEventListener('click', async (event) => {
+    // Dismiss the queue breakdown popover on any click outside it (the badge itself
+    // is excluded so its own toggle action still fires below).
+    const queuePop = modal.querySelector('#cs-queue-popover');
+    if (queuePop && !queuePop.hidden
+        && !event.target.closest('#cs-queue-popover')
+        && !event.target.closest('#code-station-queue-badge')) {
+      toggleQueuePopover(false);
+    }
     const tab = event.target.closest('[data-code-tab]');
     if (tab) {
       setMobileTab(tab.dataset.codeTab);
@@ -462,12 +530,30 @@ function wireModal(modal) {
 
 async function handleAction(action, button) {
   const id = button.dataset.id;
-  if (action === 'close') {
-    Modals.close(MODAL_ID);
+  if (action === 'close' || action === 'back-to-chat') {
+    hideCodeSpace();
+    return;
+  }
+  if (action === 'toggle-tree') {
+    if (state.modal) state.modal.classList.toggle('cs-tree-collapsed');
+    refitAll();
+    return;
+  }
+  const providerTools = ensureProviderToolsModule();
+  if (providerTools.canHandleAction(action)) {
+    await providerTools.handleAction(action, button);
+    return;
+  }
+  if (action === 'delete-thread') {
+    await deleteThread(id, button);
     return;
   }
   if (action === 'refresh') {
     await refreshAll();
+    return;
+  }
+  if (action === 'toggle-queue') {
+    toggleQueuePopover();
     return;
   }
   if (action === 'toggle-projects') {
@@ -554,14 +640,14 @@ async function handleAction(action, button) {
     return;
   }
   if (action === 'ws-close-focused') {
-    closeFocused();
+    await closeFocused();
   }
 }
 
 async function handlePaneAction(action, nodeId) {
   if (!nodeId) return;
   if (action === 'close') {
-    closeLeaf(nodeId);
+    await closeLeaf(nodeId);
     return;
   }
   if (action === 'split-h') {
@@ -607,6 +693,7 @@ async function refreshAll() {
     state.selectedThread = null;
     state.selectedThreadId = null;
     renderAll();
+    syncProviderTools({ reset: true, load: false });
   }
 }
 
@@ -725,6 +812,8 @@ async function selectProject(projectId, options = {}) {
   renderProjects();
   await Promise.allSettled([loadProject(projectId), loadThreads(projectId)]);
   renderAll();
+  await refreshBadges();
+  syncProviderTools({ reset: true, force: true });
   if (!options.keepTab) setMobileTab('threads');
 }
 
@@ -774,9 +863,10 @@ async function selectThread(threadId, options = {}) {
   state.selectedRunId = state.selectedThread?.run_id || '';
   state.selectedRun = normalizeRun(state.selectedThread?.run) || null;
   renderAll();
+  syncProviderTools({ reset: true, force: true });
   if (options.open !== false) {
     if (!options.keepTab) setMobileTab('terminal');
-    const openedLeafId = openThreadAsPane(state.selectedThread, options.target || null);
+    const openedLeafId = await openThreadAsPane(state.selectedThread, options.target || null);
     if (openedLeafId && options.autoLaunch !== false) await autoLaunchThread(state.selectedThread, openedLeafId);
   }
   refreshBadges();
@@ -793,6 +883,35 @@ async function setThreadPinned(threadId, pinned, button) {
     if (state.selectedProjectId) await loadThreads(state.selectedProjectId);
     if (state.selectedThread?.id === threadId) state.selectedThread.pinned = pinned;
     renderAll();
+  } finally {
+    setButtonBusy(button, false);
+  }
+}
+
+async function deleteThread(threadId, button) {
+  if (!threadId) return;
+  const thread = state.threads.find((t) => t.id === threadId);
+  const name = thread?.title || 'this thread';
+  const ok = uiModule?.styledConfirm
+    ? await uiModule.styledConfirm(`Delete "${name}"? This stops any run and removes its history. This cannot be undone.`, { danger: true })
+    : window.confirm(`Delete "${name}"? This cannot be undone.`);
+  if (!ok) return;
+  setButtonBusy(button, true);
+  try {
+    await api(`/api/coding/threads/${encodeURIComponent(threadId)}`, { method: 'DELETE' });
+    // Close any open panes bound to this thread (tears down their terminals + sockets).
+    const leafIds = [];
+    eachLeaf(state.workspace.root, (leaf) => { if (leaf.threadId === threadId) leafIds.push(leaf.id); });
+    for (const lid of leafIds) await closeLeaf(lid, { stopRun: false });
+    if (state.selectedThreadId === threadId) {
+      state.selectedThreadId = null;
+      state.selectedThread = null;
+      state.selectedRunId = '';
+      state.selectedRun = null;
+    }
+    if (state.selectedProjectId) await loadThreads(state.selectedProjectId).catch(() => {});
+    renderAll();
+    toast('Thread deleted');
   } finally {
     setButtonBusy(button, false);
   }
@@ -894,8 +1013,8 @@ async function runSelectedThread(button) {
         session.runId = runId;
         session.status = state.selectedRun.status || 'queued';
         setPaneStatus(session);
-        // Refresh the live stream promptly so the new run's output appears at once.
-        attachStream(session, { replay: false, forceLive: true });
+        // Attach the pane's PTY WebSocket to the new run (live, low-latency).
+        connectPaneWs(session);
         refitAll();
       }
     } else {
@@ -1082,6 +1201,70 @@ function focusedSession() {
   return state.panes.get(loc.node.paneId) || null;
 }
 
+function queueStatusForRun(runId) {
+  if (!runId) return '';
+  const id = asId(runId);
+  const item = state.queue.find((run) => asId(run?.id ?? run?.run_id) === id);
+  return item?.status || '';
+}
+
+function isActiveRunStatus(status) {
+  return ACTIVE_STATUSES.has(statusClass(status));
+}
+
+function paneRunInfo(leaf) {
+  if (!leaf || leaf.kind !== 'leaf') return null;
+  const session = state.panes.get(leaf.paneId);
+  const runId = asId(session?.runId || leaf.runId);
+  if (!runId) return null;
+  const queueStatus = queueStatusForRun(runId);
+  const status = session?.status || leaf.status || queueStatus || '';
+  return {
+    leaf,
+    session,
+    runId,
+    status,
+    active: isActiveRunStatus(status) || isActiveRunStatus(queueStatus),
+  };
+}
+
+async function stopPaneRunIfActive(leaf) {
+  const info = paneRunInfo(leaf);
+  if (!info || !info.active) return false;
+  const existing = state.stoppingRuns.get(info.runId);
+  if (existing) {
+    const result = await existing;
+    return !result?.missing;
+  }
+  const stopPromise = api(`/api/coding/runs/${encodeURIComponent(info.runId)}/stop`, { method: 'POST', body: {} })
+    .then(() => ({ missing: false }))
+    .catch((error) => {
+      if (error?.status === 404) return { missing: true };
+      throw error;
+    });
+  state.stoppingRuns.set(info.runId, stopPromise);
+  try {
+    const result = await stopPromise;
+    const nextStatus = result?.missing ? 'stopped' : 'stopping';
+    if (info.session) {
+      info.session.status = nextStatus;
+      setPaneStatus(info.session);
+    } else {
+      info.leaf.status = nextStatus;
+    }
+    if (state.selectedRunId === info.runId && state.selectedRun) state.selectedRun.status = nextStatus;
+    if (state.selectedThreadId === info.leaf.threadId && state.selectedThread) state.selectedThread.status = nextStatus;
+    const thread = state.threads.find((item) => item.id === info.leaf.threadId);
+    if (thread) thread.status = nextStatus;
+    renderThreadDetail();
+    renderThreads();
+    await refreshBadges();
+    return !result?.missing;
+  } finally {
+    state.stoppingRuns.delete(info.runId);
+  }
+}
+
 function edgeToDir(edge) {
   return (edge === 'left' || edge === 'right') ? 'row' : 'col';
 }
@@ -1117,10 +1300,12 @@ function splitFocused(dir) {
   if (state.workspace.focusId) splitLeaf(state.workspace.focusId, dir);
 }
 
-function closeLeaf(leafId) {
+async function closeLeaf(leafId, options = {}) {
+  const stopRun = options.stopRun !== false;
   const root = state.workspace.root;
   const loc = locate(root, leafId);
   if (!loc) return;
+  if (stopRun && loc.node.kind === 'leaf') await stopPaneRunIfActive(loc.node);
   if (loc.node.kind === 'leaf' && loc.node.threadId && state.panes.has(loc.node.paneId)) {
     teardownPane(loc.node.paneId);
   }
@@ -1137,15 +1322,19 @@ function closeLeaf(leafId) {
   if (state.workspace.focusId) focusLeaf(state.workspace.focusId);
 }
 
-function closeFocused() {
-  if (state.workspace.focusId) closeLeaf(state.workspace.focusId);
+async function closeFocused() {
+  if (state.workspace.focusId) await closeLeaf(state.workspace.focusId);
 }
 
-function moveLeaf(sourceLeafId, targetLeafId, edge) {
+async function moveLeaf(sourceLeafId, targetLeafId, edge) {
   if (!sourceLeafId || sourceLeafId === targetLeafId) return;
   const root = state.workspace.root;
   const sloc = locate(root, sourceLeafId);
   if (!sloc || !sloc.parent) return; // can't move the root pane
+  if (edge === 'center') {
+    const targetLoc = locate(root, targetLeafId);
+    if (targetLoc?.node?.kind === 'leaf') await stopPaneRunIfActive(targetLoc.node);
+  }
   const srcNode = sloc.node;
   // Detach the source by collapsing its parent into the sibling — WITHOUT teardown,
   // so the live xterm/SSE/WebGL travels with the node.
@@ -1175,7 +1364,7 @@ function moveLeaf(sourceLeafId, targetLeafId, edge) {
 
 // Returns the id of the newly-opened leaf, or null when an already-open pane was
 // just focused (so callers can auto-launch the harness only on a fresh open).
-function openThreadAsPane(thread, target) {
+async function openThreadAsPane(thread, target) {
   if (!thread || !thread.id) return null;
   const root = state.workspace.root;
   if (!target) {
@@ -1203,6 +1392,7 @@ function openThreadAsPane(thread, target) {
   if (target.edge === 'center') {
     const leaf = loc.node;
     if (leaf.threadId !== thread.id) {
+      await stopPaneRunIfActive(leaf);
       if (leaf.threadId && state.panes.has(leaf.paneId)) teardownPane(leaf.paneId);
       leaf.threadId = thread.id;
       leaf.runId = thread.run_id || '';
@@ -1221,17 +1411,22 @@ function openThreadAsPane(thread, target) {
 
 // Open an agent into a live session: drop you straight into pi/codex/claude/shell.
 // We start a fresh run UNLESS one is already active (running/queued/starting) — in which
-// case attaching shows the live one. Either way mountPane's attachStream replays the
-// thread's full history first, so prior output is preserved above the new session.
+// case the pane's WebSocket attaches to the live one. mountPane first connects to the
+// thread's last run (live attach, or raw.log history replay if it has finished).
 async function autoLaunchThread(thread, leafId) {
   if (!thread || !thread.id || !leafId) return;
   const loc = locate(state.workspace.root, leafId);
   if (!loc || loc.node.kind !== 'leaf' || loc.node.threadId !== thread.id) return;
   const session = state.panes.get(loc.node.paneId);
   if (!session) return;
-  // Skip only if a run is ALREADY active (the backend also 409s a duplicate, so a race
-  // here is harmless). A finished/idle thread auto-starts a new run.
-  if (ACTIVE_STATUSES.has(statusClass(session.status)) || ACTIVE_STATUSES.has(statusClass(thread.status))) return;
+  const active = ACTIVE_STATUSES.has(statusClass(session.status)) || ACTIVE_STATUSES.has(statusClass(thread.status));
+  if (active) {
+    // A run is already live — attach to it (no fresh launch, no history replay).
+    session.runId = thread.run_id || session.runId || '';
+    if (session.runId && !session.ws) connectPaneWs(session);
+    return;
+  }
+  // No active run → start a fresh, clean session (runSelectedThread sets runId + connects).
   focusLeaf(leafId);
   try {
     await runSelectedThread(null);
@@ -1321,6 +1516,7 @@ function mountPane(leaf, leafEl) {
     fitAddon,
     webgl,
     ro: null,
+    ws: null,
     source: null,
     lastSeq: 0,
     status: leaf.status || 'idle',
@@ -1352,30 +1548,30 @@ function mountPane(leaf, leafEl) {
     });
   }
 
-  // Input lives INSIDE the terminal: stream each keystroke/paste chunk straight to
-  // stdin (one POST per onData chunk; no appended newline — Enter arrives as \r).
-  // Gate on an ACTIVE run so keystrokes after a run exits aren't POSTed to a dead run.
+  // Input lives INSIDE the terminal: send each keystroke/paste chunk as RAW BYTES over
+  // the pane WebSocket → straight to the pty (no HTTP round-trip, no send-keys mangling).
   session.disposers.push(term.onData((d) => {
-    if (!session.runId || !ACTIVE_STATUSES.has(statusClass(session.status))) return;
-    api(`/api/coding/runs/${encodeURIComponent(session.runId)}/stdin`, { method: 'POST', body: { data: d } }).catch(() => {});
+    sendPaneInput(session, d);
   }));
   session.disposers.push(term.onResize(({ cols, rows }) => {
     updatePaneDims(session, cols, rows);
-    if (!session.runId || !ACTIVE_STATUSES.has(statusClass(session.status))) return;
-    clearTimeout(session._rz);
-    session._rz = setTimeout(() => {
-      api(`/api/coding/runs/${encodeURIComponent(session.runId)}/resize`, { method: 'POST', body: { cols, rows } }).catch(() => {});
-    }, 200);
+    sendPaneResize(session); // pty winsize follows the pane → SIGWINCH → harness reflows
   }));
 
   leafEl.__mounted = true;
   state.panes.set(leaf.paneId, session);
-  attachStream(session, { replay: true });
+  // Only auto-attach an ALREADY-ACTIVE run (e.g. reopening the modal mid-session). For
+  // idle/finished threads we don't replay stale history here — the open flow
+  // (autoLaunchThread) starts a clean fresh run instead.
+  if (session.runId && ACTIVE_STATUSES.has(statusClass(session.status))) {
+    connectPaneWs(session);
+  }
 }
 
 function teardownPane(paneId) {
   const session = state.panes.get(paneId);
   if (!session) return;
+  closePaneWs(session);
   if (session.source) { try { session.source.close(); } catch (_) { /* noop */ } session.source = null; }
   clearTimeout(session._ft);
   clearTimeout(session._rz);
@@ -1552,10 +1748,15 @@ function updatePaneDims(session, cols, rows) {
 }
 
 function refitAll() {
-  if (typeof requestAnimationFrame === 'undefined') return;
-  requestAnimationFrame(() => {
-    state.panes.forEach((session) => { try { session.fit && session.fit(); } catch (_) { /* noop */ } });
+  const doAll = () => state.panes.forEach((session) => {
+    try {
+      session.fit && session.fit();      // recompute cols/rows for the current box
+      sendPaneResize(session);           // push the new size to the pty so the harness reflows
+    } catch (_) { /* noop */ }
   });
+  if (typeof requestAnimationFrame !== 'undefined') requestAnimationFrame(doAll);
+  // Run again after layout/animation settles (space open, tree collapse, splitter drag).
+  setTimeout(doAll, 90);
 }
 
 // ---- keyed reconciliation: render the DOM from the tree, reusing live elements ----
@@ -1833,7 +2034,7 @@ function wireWorkspace(modal) {
     updateDropGhost(ws, paneEl, event.clientX, event.clientY);
   });
 
-  modal.addEventListener('drop', (event) => {
+  modal.addEventListener('drop', async (event) => {
     if (!state.drag) return;
     const ws = event.target.closest('#cs-ws-root');
     if (!ws) return;
@@ -1846,14 +2047,18 @@ function wireWorkspace(modal) {
     state.drag = null;
     document.body.classList.remove('cs-dragging');
     clearDropGhost();
-    if (drag.type === 'thread') {
-      const thread = state.threads.find((t) => t.id === drag.threadId);
-      if (thread) {
-        const openedLeafId = openThreadAsPane(thread, target);
-        if (openedLeafId) autoLaunchThread(thread, openedLeafId);
+    try {
+      if (drag.type === 'thread') {
+        const thread = state.threads.find((t) => t.id === drag.threadId);
+        if (thread) {
+          const openedLeafId = await openThreadAsPane(thread, target);
+          if (openedLeafId) autoLaunchThread(thread, openedLeafId);
+        }
+      } else if (drag.type === 'pane' && drag.leafId && target && target.leafId !== drag.leafId) {
+        await moveLeaf(drag.leafId, target.leafId, target.edge);
       }
-    } else if (drag.type === 'pane' && drag.leafId && target && target.leafId !== drag.leafId) {
-      moveLeaf(drag.leafId, target.leafId, target.edge);
+    } catch (error) {
+      showError('Workspace drop failed', error);
     }
   });
 
@@ -1972,6 +2177,7 @@ function renderProjects() {
   for (const project of ordered) {
     const row = document.createElement('div');
     row.className = `code-station-row project-row${project.id === state.selectedProjectId ? ' selected' : ''}${project.archived ? ' archived' : ''}`;
+    row.dataset.projectId = project.id;
     const main = document.createElement('button');
     main.type = 'button';
     main.className = 'code-station-row-main';
@@ -1984,15 +2190,20 @@ function renderProjects() {
     meta.className = 'code-station-row-meta';
     meta.textContent = project.root_path || 'No root path';
     main.append(title, meta);
+    // Per-project usage of the shared concurrency pool (filled by updateProjectQueuePills).
+    const pill = document.createElement('span');
+    pill.className = 'cs-project-pill';
+    pill.hidden = true;
     const action = document.createElement('button');
     action.type = 'button';
     action.className = 'code-station-mini-btn';
     action.dataset.codeAction = project.archived ? 'restore-project' : 'archive-project';
     action.dataset.id = project.id;
     action.textContent = project.archived ? 'Restore' : 'Archive';
-    row.append(main, action);
+    row.append(main, pill, action);
     list.appendChild(row);
   }
+  updateProjectQueuePills();
 }
 
 function renderThreadCreateForm() {
@@ -2088,7 +2299,15 @@ function threadRow(thread) {
   pin.title = thread.pinned ? 'Unpin thread' : 'Pin thread';
   pin.setAttribute('aria-label', pin.title);
   pin.innerHTML = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><path d="M12 17v5"/><path d="M5 17h14"/><path d="M15 3l6 6"/><path d="M9 3 3 9l5 5L3 19l2 2 5-5 5 5 2-2-5-5 5-5z"/></svg>';
-  row.append(grip, dot, main, pin);
+  const del = document.createElement('button');
+  del.type = 'button';
+  del.className = 'code-station-icon-btn small cs-row-delete';
+  del.dataset.codeAction = 'delete-thread';
+  del.dataset.id = thread.id;
+  del.title = 'Delete thread';
+  del.setAttribute('aria-label', 'Delete thread');
+  del.innerHTML = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><line x1="10" y1="11" x2="10" y2="17"/><line x1="14" y1="11" x2="14" y2="17"/></svg>';
+  row.append(grip, dot, main, pin, del);
   return row;
 }
 
@@ -2096,84 +2315,16 @@ function renderThreadDetail() {
   const detail = q('#code-thread-detail');
   if (!detail) return;
   const thread = state.selectedThread;
-  if (!thread) {
-    detail.innerHTML = '<div class="code-station-empty large">Select or create a coding thread.</div>';
-    setTerminalControls(false);
-    return;
-  }
-  const current = currentModelInfo();
-  const backendSummary = compactJson(state.modelConfig, 'No backend model config loaded');
-  const threadModelSummary = compactJson(thread.model_config, 'No thread model config');
-  detail.innerHTML = `
-    <div class="code-station-toolbar">
-      <div class="code-station-toolbar-main">
-        <span id="code-thread-status-pill" class="code-station-pill muted"></span>
-        <span id="code-thread-id-label" class="code-station-muted ellipsis"></span>
-      </div>
-      <div class="code-station-toolbar-actions">
-        <button type="button" id="code-thread-pin-action" class="code-station-text-btn"></button>
-        <button type="button" id="code-thread-open-chat" class="code-station-text-btn" data-code-action="open-chat">Open Chat</button>
-      </div>
-    </div>
-    <div class="code-station-fields">
-      <label>Title<input id="code-thread-title" autocomplete="off"></label>
-      <label>CWD<input id="code-thread-cwd" autocomplete="off"></label>
-      <label>Harness<select id="code-thread-harness"></select></label>
-      <label>Model<input id="code-thread-model" autocomplete="off" placeholder="Model override"></label>
-    </div>
-    <div class="code-station-action-row">
-      <button type="button" data-code-action="save-thread">Save Thread</button>
-    </div>
-    <div class="code-station-model-band">
-      <div>
-        <span class="code-station-label">Current Odysseus model</span>
-        <strong id="code-current-model" class="ellipsis"></strong>
-      </div>
-      <div>
-        <span class="code-station-label">Backend model config</span>
-        <code id="code-backend-model-config"></code>
-      </div>
-      <div>
-        <span class="code-station-label">Thread config</span>
-        <code id="code-thread-model-config"></code>
-      </div>
-      <div class="code-station-action-row">
-        <button type="button" data-code-action="use-current-model">Use current model</button>
-        <button type="button" data-code-action="restore-config">Restore config</button>
-      </div>
-    </div>
-    <div class="code-station-run-band">
-      <label>Optional command<textarea id="code-run-command" rows="3" placeholder="Optional command for the harness"></textarea></label>
-      <div class="code-station-action-row">
-        <button type="button" data-code-action="run-thread">Run</button>
-        <button type="button" data-code-action="stop-run" ${state.selectedRunId ? '' : 'disabled'}>Stop</button>
-      </div>
-    </div>
-  `;
-  const status = q('#code-thread-status-pill');
-  if (status) {
-    status.textContent = thread.status || 'idle';
-    status.className = `code-station-pill ${statusClass(thread.status)}`;
-  }
-  const idLabel = q('#code-thread-id-label');
-  if (idLabel) idLabel.textContent = thread.id;
-  const pinAction = q('#code-thread-pin-action');
-  if (pinAction) {
-    pinAction.textContent = thread.pinned ? 'Unpin' : 'Pin';
-    pinAction.dataset.codeAction = thread.pinned ? 'unpin-thread' : 'pin-thread';
-    pinAction.dataset.id = thread.id;
-  }
-  const chatAction = q('#code-thread-open-chat');
-  if (chatAction) chatAction.disabled = !thread.session_id;
-  q('#code-thread-title').value = thread.title || '';
-  q('#code-thread-cwd').value = thread.cwd || '';
-  q('#code-thread-model').value = thread.model || '';
-  fillHarnessSelect(q('#code-thread-harness'), thread.harness || 'generic');
-  const currentLabel = [current.model || 'No current model', current.endpoint_url].filter(Boolean).join(' @ ');
-  q('#code-current-model').textContent = currentLabel;
-  q('#code-backend-model-config').textContent = backendSummary;
-  q('#code-thread-model-config').textContent = threadModelSummary;
-  setTerminalControls(Boolean(state.selectedRunId));
+  renderThreadDetailView(detail, {
+    thread,
+    selectedRunId: state.selectedRunId,
+    currentModel: thread ? currentModelInfo() : {},
+    backendModelConfig: state.modelConfig,
+    harnesses: state.harnesses,
+    statusClass,
+  });
+  syncProviderTools({ load: false });
+  setTerminalControls(Boolean(thread && state.selectedRunId));
 }
 
 function renderRunStatus() {
@@ -2243,8 +2394,11 @@ function renderMobileTabs() {
 
 function activeRunCount() {
   const ids = new Set();
-  for (const item of state.queue) {
-    if (ACTIVE_STATUSES.has(statusClass(item.status))) ids.add(item.id || `queue-${ids.size}`);
+  if (state.queueLoaded) {
+    state.queue.forEach((item, idx) => {
+      if (ACTIVE_STATUSES.has(statusClass(item.status))) ids.add(item.id || `queue-${idx}`);
+    });
+    return ids.size;
   }
   for (const thread of state.threads) {
     if (ACTIVE_STATUSES.has(statusClass(thread.status))) ids.add(thread.run_id || thread.id || `thread-${ids.size}`);
@@ -2255,7 +2409,46 @@ function activeRunCount() {
   return ids.size;
 }
 
+function queueActivityLabel(count) {
+  if (!count) return '0 queued/running';
+  if (!state.queueLoaded) return `${count} queued/running`;
+  const queued = new Set();
+  const running = new Set();
+  state.queue.forEach((item, idx) => {
+    const status = statusClass(item.status);
+    if (!ACTIVE_STATUSES.has(status)) return;
+    const id = item.id || `queue-${idx}`;
+    if (status === 'running') {
+      running.add(id);
+      queued.delete(id);
+    } else if (!running.has(id)) {
+      queued.add(id);
+    }
+  });
+  const parts = [];
+  if (running.size) parts.push(`${running.size} running`);
+  if (queued.size) parts.push(`${queued.size} queued`);
+  return parts.length ? parts.join(', ') : `${count} queued/running`;
+}
+
+// "Metalheart: 1 running · Odysseus: 1 queued" — names the projects consuming the
+// shared pool so a count here is never a mystery, even with no threads open locally.
+function queueBreakdownLabel() {
+  const groups = (Array.isArray(state.queueByProject) ? state.queueByProject : [])
+    .filter((g) => (Number(g?.active) || 0) + (Number(g?.queued) || 0) > 0);
+  if (!groups.length) return '';
+  return groups.map((g) => {
+    const parts = [];
+    if (g.active) parts.push(`${g.active} running`);
+    if (g.queued) parts.push(`${g.queued} queued`);
+    return `${g.project_name || 'Untitled project'}: ${parts.join(', ')}`;
+  }).join(' · ');
+}
+
 function renderLauncherBadges(count) {
+  const label = queueActivityLabel(count);
+  const breakdown = queueBreakdownLabel();
+  const tip = breakdown || label;
   const rail = document.getElementById('rail-code-count');
   const sidebar = document.getElementById('code-sidebar-badge');
   for (const el of [rail, sidebar]) {
@@ -2263,7 +2456,7 @@ function renderLauncherBadges(count) {
     if (count > 0) {
       el.hidden = false;
       el.textContent = String(count);
-      el.title = `${count} queued or running`;
+      el.title = tip;
     } else {
       el.hidden = true;
       el.textContent = '';
@@ -2272,22 +2465,134 @@ function renderLauncherBadges(count) {
   }
   const header = q('#code-station-queue-badge');
   if (header) {
-    header.textContent = count ? `${count} active` : '0 active';
+    header.textContent = label;
     header.className = `code-station-pill ${count ? 'queued' : 'muted'}`;
+    header.title = breakdown ? `${breakdown} — click for details` : 'No coding runs active';
   }
   const foot = q('#code-station-queue-foot');
-  if (foot) foot.textContent = count ? `${count} active` : '0 active';
+  if (foot) foot.textContent = label;
 }
 
 export async function refreshBadges() {
   if (!API_BASE) return;
+  // Coding concurrency is one global pool shared across all of this owner's
+  // projects, so the count is owner-global (not scoped to the open project). The
+  // per-project breakdown rides along so the UI can show WHERE threads are used.
   try {
     const data = await api('/api/coding/queue');
+    const queue = (data && data.queue && typeof data.queue === 'object') ? data.queue : (data || {});
     state.queue = normalizeQueue(data);
+    state.queueByProject = Array.isArray(queue.by_project) ? queue.by_project : [];
+    state.queueMax = Number(queue.max_concurrent) || 0;
+    state.queueLoaded = true;
   } catch (_) {
     state.queue = [];
+    state.queueByProject = [];
+    state.queueMax = 0;
+    state.queueLoaded = false;
   }
   renderLauncherBadges(activeRunCount());
+  updateProjectQueuePills();
+  renderQueuePopover();
+}
+
+// Per-project pills on the project rows: a glance shows which projects are eating
+// the shared pool, so the global header count is always attributable.
+function updateProjectQueuePills() {
+  const list = q('#code-project-list');
+  if (!list) return;
+  const byId = new Map(
+    (Array.isArray(state.queueByProject) ? state.queueByProject : []).map((g) => [asId(g.project_id), g]),
+  );
+  list.querySelectorAll('.project-row').forEach((row) => {
+    const pill = row.querySelector('.cs-project-pill');
+    if (!pill) return;
+    const g = byId.get(asId(row.dataset.projectId));
+    const active = g ? (Number(g.active) || 0) : 0;
+    const queued = g ? (Number(g.queued) || 0) : 0;
+    if (!active && !queued) {
+      pill.hidden = true;
+      pill.textContent = '';
+      pill.removeAttribute('title');
+      pill.removeAttribute('data-kind');
+      return;
+    }
+    pill.hidden = false;
+    pill.dataset.kind = active ? 'running' : 'queued';
+    pill.textContent = active ? String(active) : String(queued);
+    const parts = [];
+    if (active) parts.push(`${active} running`);
+    if (queued) parts.push(`${queued} queued`);
+    pill.title = parts.join(', ');
+  });
+}
+
+function toggleQueuePopover(force) {
+  const pop = q('#cs-queue-popover');
+  const badge = q('#code-station-queue-badge');
+  if (!pop) return;
+  const show = typeof force === 'boolean' ? force : pop.hidden;
+  pop.hidden = !show;
+  if (badge) badge.setAttribute('aria-expanded', String(show));
+  if (show) renderQueuePopover();
+}
+
+// The "queue panel grouped by project": active + queued runs across all projects,
+// bucketed under their project so the shared pool's usage is fully legible.
+function renderQueuePopover() {
+  const pop = q('#cs-queue-popover');
+  if (!pop) return;
+  const runs = (Array.isArray(state.queue) ? state.queue : []).filter(
+    (run) => ACTIVE_STATUSES.has(statusClass(run.status)),
+  );
+  pop.replaceChildren();
+
+  const head = document.createElement('div');
+  head.className = 'cs-queue-pop-head';
+  const running = runs.filter((r) => statusClass(r.status) === 'running').length;
+  head.textContent = state.queueMax
+    ? `${running} of ${state.queueMax} slots in use`
+    : `${running} running`;
+  pop.appendChild(head);
+
+  if (!runs.length) {
+    const empty = document.createElement('div');
+    empty.className = 'cs-queue-pop-empty';
+    empty.textContent = 'No coding runs active.';
+    pop.appendChild(empty);
+    return;
+  }
+
+  const groups = new Map();
+  for (const run of runs) {
+    const pid = asId(run.project_id) || 'unknown';
+    if (!groups.has(pid)) groups.set(pid, { name: run.project_name || 'Untitled project', runs: [] });
+    groups.get(pid).runs.push(run);
+  }
+  for (const group of groups.values()) {
+    const section = document.createElement('div');
+    section.className = 'cs-queue-pop-group';
+    const title = document.createElement('div');
+    title.className = 'cs-queue-pop-project';
+    title.textContent = `${group.name} · ${group.runs.length}`;
+    section.appendChild(title);
+    for (const run of group.runs) {
+      const rowEl = document.createElement('div');
+      rowEl.className = 'cs-queue-pop-run';
+      const dot = document.createElement('span');
+      dot.className = 'cs-thread-dot';
+      dot.dataset.status = statusClass(run.status);
+      const name = document.createElement('span');
+      name.className = 'cs-queue-pop-run-title';
+      name.textContent = run.thread_title || run.id || 'run';
+      const status = document.createElement('span');
+      status.className = 'cs-queue-pop-run-status';
+      status.textContent = statusClass(run.status);
+      rowEl.append(dot, name, status);
+      section.appendChild(rowEl);
+    }
+    pop.appendChild(section);
+  }
 }
 
 export function init(apiBase, options = {}) {
@@ -2308,15 +2613,58 @@ export function init(apiBase, options = {}) {
   });
 }
 
+function isCodeSpaceActive() {
+  return typeof document !== 'undefined' && document.body.classList.contains('code-space-active');
+}
+
+function syncRailActive() {
+  const btn = typeof document !== 'undefined' && document.getElementById('rail-code');
+  if (btn) btn.classList.toggle('rail-active', isCodeSpaceActive());
+}
+
+function syncAppSidebarLayout() {
+  try {
+    if (typeof window !== 'undefined' && typeof window.syncRailSide === 'function') {
+      window.syncRailSide();
+    }
+  } catch (_) {
+    // Sidebar layout is optional for isolated/static Code Station tests.
+  }
+}
+
+function showCodeSpace() {
+  ensureModal();
+  document.body.classList.add('code-space-active');
+  if (state.modal) state.modal.classList.remove('hidden');
+  syncRailActive();
+  syncAppSidebarLayout();
+  refitAll(); // panes were display:none while away → recompute cols/rows
+}
+
+// Switch back to the chat space. Panes (and their WebSockets) stay alive so returning
+// resumes instantly — this is a view switch, not a teardown.
+function hideCodeSpace() {
+  if (typeof document !== 'undefined') document.body.classList.remove('code-space-active');
+  syncRailActive();
+  syncAppSidebarLayout();
+}
+
+// Public alias used by app.js (chat-nav rail buttons call codeStationModule.hide()).
+export function hide() {
+  hideCodeSpace();
+}
+
+// Open the Code Station workspace, or toggle back to chat if it's already showing
+// (the rail button acts as a space switch).
 export async function open() {
   if (!state.initialized) init(window.location.origin, {});
-  if (Modals.toggle(MODAL_ID)) {
-    state.modal = document.getElementById(MODAL_ID);
+  if (isCodeSpaceActive()) {
+    hide();
     return;
   }
-  const modal = ensureModal();
-  modal.classList.remove('hidden', 'modal-minimized');
+  showCodeSpace();
   renderAll();
+  syncProviderTools();
   if (!state.booting) {
     state.booting = true;
     try {
@@ -2333,5 +2681,6 @@ export async function open() {
 export default {
   init,
   open,
+  hide,
   refreshBadges,
 };

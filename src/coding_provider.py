@@ -1,0 +1,110 @@
+"""Compatibility facade for the Coding Station provider bridge."""
+
+from __future__ import annotations
+
+from core.database import SessionLocal
+from src.coding_provider_coding import (
+    call_coding_tool,
+    call_model_config_tool,
+    handle_coding_tool,
+    handle_model_config_tool,
+)
+from src.coding_provider_memory import call_memory_tool, handle_memory_tool
+from src.coding_provider_terminal import (
+    call_terminal_tool,
+    handle_terminal_tool,
+    run_id_for_terminal_action,
+)
+from src.coding_provider_thread_messages import (
+    call_thread_messages_tool,
+    handle_thread_messages_tool,
+    message_dict,
+    thread_session_id,
+)
+from src.coding_provider_tool_common import (
+    INTERNAL_RUN_KEYS,
+    INTERNAL_RESULT_TERMS,
+    MAX_MEMORY_TEXT,
+    MAX_MESSAGE_TEXT,
+    SAFE_RESULT_KEYS,
+    SECRET_RESULT_KEYS,
+    SECRET_RESULT_TERMS,
+    int_arg,
+    is_sensitive_result_key,
+    manage_coding,
+    sanitize_result,
+    session_local,
+)
+from src.coding_provider_tokens import (
+    ALL_CAPABILITIES,
+    CAPABILITY_ALIASES,
+    CAPABILITY_GROUPS,
+    READ_ONLY_CAPABILITIES,
+    TOKEN_LOOKUP_PREFIX_LEN,
+    TOKEN_PREFIX,
+    CodingProviderError,
+    ProviderContext,
+    authenticate_provider_token,
+    list_provider_tokens,
+    mint_provider_token,
+    normalize_capabilities,
+    require_capability,
+    revoke_provider_token,
+)
+from src.coding_provider_tools import (
+    PROVIDER_TOOL_CATALOG,
+    TOOL_ALIASES,
+    TOOL_HANDLERS,
+    ProviderToolServices,
+    call_provider_tool,
+    provider_capabilities_response,
+)
+
+__all__ = [
+    "ALL_CAPABILITIES",
+    "CAPABILITY_ALIASES",
+    "CAPABILITY_GROUPS",
+    "INTERNAL_RESULT_TERMS",
+    "INTERNAL_RUN_KEYS",
+    "MAX_MEMORY_TEXT",
+    "MAX_MESSAGE_TEXT",
+    "PROVIDER_TOOL_CATALOG",
+    "READ_ONLY_CAPABILITIES",
+    "SAFE_RESULT_KEYS",
+    "SECRET_RESULT_KEYS",
+    "SECRET_RESULT_TERMS",
+    "SessionLocal",
+    "TOKEN_LOOKUP_PREFIX_LEN",
+    "TOKEN_PREFIX",
+    "TOOL_ALIASES",
+    "TOOL_HANDLERS",
+    "CodingProviderError",
+    "ProviderContext",
+    "ProviderToolServices",
+    "authenticate_provider_token",
+    "call_coding_tool",
+    "call_memory_tool",
+    "call_model_config_tool",
+    "call_provider_tool",
+    "call_terminal_tool",
+    "call_thread_messages_tool",
+    "handle_coding_tool",
+    "handle_memory_tool",
+    "handle_model_config_tool",
+    "handle_terminal_tool",
+    "handle_thread_messages_tool",
+    "int_arg",
+    "is_sensitive_result_key",
+    "list_provider_tokens",
+    "manage_coding",
+    "message_dict",
+    "mint_provider_token",
+    "normalize_capabilities",
+    "provider_capabilities_response",
+    "require_capability",
+    "revoke_provider_token",
+    "run_id_for_terminal_action",
+    "sanitize_result",
+    "session_local",
+    "thread_session_id",
+]

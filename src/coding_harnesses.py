@@ -17,6 +17,9 @@ class HarnessDefinition:
     name: str
     description: str
     default_command: str
+    # Stable UI/API hint for the implemented provider-tool transport.
+    # Use "mcp" only after a harness has a real MCP provider adapter.
+    provider_tools: str = "cli"
     stdin_supported: bool = True
     resize_supported: bool = True
 
@@ -26,6 +29,7 @@ class HarnessDefinition:
             "name": self.name,
             "description": self.description,
             "default_command": self.default_command,
+            "provider_tools": self.provider_tools,
             "stdin_supported": self.stdin_supported,
             "resize_supported": self.resize_supported,
         }
@@ -43,12 +47,14 @@ _HARNESS_REGISTRY: dict[str, HarnessDefinition] = {
         name="Pi",
         description="Run the pi CLI in a coding terminal.",
         default_command="pi",
+        provider_tools="extension",
     ),
     "codex": HarnessDefinition(
         id="codex",
         name="Codex",
         description="Run the Codex CLI in a coding terminal.",
         default_command="codex",
+        provider_tools="mcp",
     ),
     "claude": HarnessDefinition(
         id="claude",
@@ -104,8 +110,10 @@ def build_harness_command(
 ) -> str:
     """Build the shell command for a run.
 
-    `command` always wins. For custom harnesses, callers may also provide
-    `metadata.command`; other harnesses fall back to their registered CLI.
+    `command` is the base command when present. For custom harnesses, callers
+    may also provide `metadata.command`; other harnesses fall back to their
+    registered CLI. The runtime injects provider-tool environment and PATH, so
+    harness commands can call `odysseus-tool` directly without command wrapping.
     """
     definition = get_harness(harness_id)
     explicit = (command or "").strip()

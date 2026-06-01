@@ -1528,6 +1528,62 @@ async function initAgentSettings() {
   msg.textContent = cur > 0 ? 'Limit: ' + cur + ' tool calls per message' : 'Unlimited';
 }
 
+/* ── Coding Agent Settings (Coding Agents tab) ── */
+async function initCodingAgentSettings() {
+  var agentsInput = el('set-codingMaxConcurrentAgents');
+  var msg = el('set-codingAgentMsg');
+  if (!agentsInput) return;
+
+  function readMaxConcurrent(payload) {
+    var settings = payload && payload.settings ? payload.settings : payload;
+    var raw = settings ? settings.max_concurrent_agents : undefined;
+    var parsed = parseInt(raw, 10);
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : '';
+  }
+
+  function setStatus(value, failed) {
+    if (!msg) return;
+    if (failed) {
+      msg.textContent = 'Failed to save';
+      msg.style.color = 'var(--red)';
+      return;
+    }
+    msg.textContent = value ? 'Limit: ' + value + ' concurrent coding agents' : 'Using backend default';
+    msg.style.color = 'var(--fg)';
+  }
+
+  try {
+    var res = await fetch('/api/coding/settings', { credentials: 'same-origin' });
+    if (!res.ok) throw new Error(String(res.status));
+    var payload = await res.json();
+    var current = readMaxConcurrent(payload);
+    if (current) agentsInput.value = current;
+    setStatus(current, false);
+  } catch (e) {
+    setStatus('', false);
+  }
+
+  async function save() {
+    var val = parseInt(agentsInput.value, 10);
+    if (!Number.isFinite(val) || val < 1) {
+      val = 1;
+      agentsInput.value = String(val);
+    }
+    try {
+      var res = await fetch('/api/coding/settings', { method: 'PATCH', credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ max_concurrent_agents: val })
+      });
+      if (!res.ok) throw new Error(String(res.status));
+      setStatus(val, false);
+    } catch (e) {
+      setStatus(val, true);
+    }
+  }
+
+  agentsInput.addEventListener('change', save);
+}
+
 /* ═══════════════════════════════════════════
    APPEARANCE TAB
    ═══════════════════════════════════════════ */
@@ -2113,6 +2169,7 @@ function initAll() {
   initResearchSettings();
   initResearchSearchSettings();
   initAgentSettings();
+  initCodingAgentSettings();
   initAppearance();
   initShortcuts();
   initAccount();

@@ -567,9 +567,11 @@ body.bg-pattern-sparkles {
     #sessions-section {
       margin-top: -1px;
     }
+    #coding-section,
     #tools-section {
       margin-top: 1px;
     }
+    #coding-section .list-item,
     #tools-section .list-item {
       padding: 8px 8px;
     }
@@ -35056,6 +35058,7 @@ body.theme-frosted .modal {
   margin-left: auto;
   gap: 6px;
   flex: 0 0 auto;
+  position: relative;
 }
 
 .code-station-mobile-tabs {
@@ -35377,6 +35380,108 @@ body.theme-frosted .modal {
   border-color: color-mix(in srgb, var(--cs-info) 32%, transparent);
 }
 
+/* Queue badge is now a button that opens the per-project breakdown popover. */
+button.code-station-pill {
+  cursor: pointer;
+  font-family: inherit;
+  -webkit-appearance: none;
+  appearance: none;
+}
+button.code-station-pill:hover {
+  border-color: color-mix(in srgb, var(--cs-accent) 50%, var(--border));
+}
+
+/* "Queue panel grouped by project" — active + queued runs across the shared pool. */
+.cs-queue-popover {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  z-index: 40;
+  min-width: 220px;
+  max-width: 300px;
+  max-height: 320px;
+  overflow-y: auto;
+  padding: 8px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--panel) 92%, var(--bg));
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.32);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.cs-queue-popover[hidden] { display: none; }
+
+.cs-queue-pop-head {
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+  color: color-mix(in srgb, var(--fg) 60%, transparent);
+}
+.cs-queue-pop-empty {
+  font-size: 11.5px;
+  color: color-mix(in srgb, var(--fg) 55%, transparent);
+}
+.cs-queue-pop-group {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.cs-queue-pop-project {
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--cs-accent);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.cs-queue-pop-run {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 2px 0 2px 6px;
+}
+.cs-queue-pop-run-title {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: 11.5px;
+  color: var(--fg);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.cs-queue-pop-run-status {
+  flex: 0 0 auto;
+  font-size: 10px;
+  color: color-mix(in srgb, var(--fg) 55%, transparent);
+  text-transform: capitalize;
+}
+
+/* Per-project usage of the shared concurrency pool, shown on each project row. */
+.cs-project-pill {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 16px;
+  height: 16px;
+  padding: 0 6px;
+  border-radius: 999px;
+  font-size: 9.5px;
+  font-weight: 700;
+  line-height: 1;
+}
+.cs-project-pill[hidden] { display: none; }
+.cs-project-pill[data-kind="running"] {
+  color: #061b0c;
+  background: var(--cs-ok);
+}
+.cs-project-pill[data-kind="queued"] {
+  color: #241a02;
+  background: var(--cs-warn);
+}
+
 .code-station-thread-detail {
   flex: 0 0 auto;
   max-height: 48%;
@@ -35444,6 +35549,198 @@ body.theme-frosted .modal {
   background: color-mix(in srgb, var(--fg) 6%, transparent);
   border-radius: 5px;
   padding: 4px 6px;
+}
+
+.cs-provider-panel {
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px solid color-mix(in srgb, var(--border) 80%, transparent);
+  display: grid;
+  gap: 8px;
+}
+.cs-provider-head,
+.cs-provider-head-actions,
+.cs-provider-section-head,
+.cs-provider-token-top,
+.cs-provider-token-actions,
+.cs-provider-copy-row {
+  display: flex;
+  align-items: center;
+}
+.cs-provider-head {
+  justify-content: space-between;
+  gap: 10px;
+}
+.cs-provider-title {
+  min-width: 0;
+  display: grid;
+  gap: 2px;
+}
+.cs-provider-title strong {
+  font-size: 12px;
+  line-height: 1.2;
+  color: var(--fg);
+}
+.cs-provider-title small {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: color-mix(in srgb, var(--fg) 48%, transparent);
+  font-size: 10px;
+}
+.cs-provider-head-actions {
+  flex: 0 0 auto;
+  gap: 6px;
+}
+.cs-provider-status {
+  padding: 6px 8px;
+  border: 1px solid color-mix(in srgb, var(--fg) 10%, transparent);
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--fg) 5%, transparent);
+  color: color-mix(in srgb, var(--fg) 62%, transparent);
+  font-size: 10.5px;
+  line-height: 1.35;
+}
+.cs-provider-status.error {
+  color: color-mix(in srgb, var(--cs-bad) 88%, white);
+  border-color: color-mix(in srgb, var(--cs-bad) 35%, transparent);
+  background: color-mix(in srgb, var(--cs-bad) 9%, transparent);
+}
+.cs-provider-sections {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 0.9fr);
+  gap: 8px;
+}
+.cs-provider-section {
+  min-width: 0;
+  display: grid;
+  gap: 6px;
+  padding: 8px;
+  border: 1px solid color-mix(in srgb, var(--border) 72%, transparent);
+  border-radius: 7px;
+  background: color-mix(in srgb, var(--panel) 48%, var(--bg));
+}
+.cs-provider-section-head {
+  justify-content: space-between;
+  gap: 8px;
+  color: color-mix(in srgb, var(--fg) 62%, transparent);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+.cs-provider-toggle-list {
+  display: grid;
+  gap: 5px;
+}
+.cs-provider-toggle {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: 30px minmax(0, 1fr);
+  align-items: center;
+  gap: 7px;
+  padding: 6px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--fg) 4%, transparent);
+}
+.cs-provider-toggle.enabled {
+  border-color: color-mix(in srgb, var(--cs-ok) 34%, transparent);
+  background: color-mix(in srgb, var(--cs-ok) 8%, transparent);
+}
+.cs-provider-toggle.is-disabled {
+  opacity: 0.58;
+}
+.cs-provider-toggle input {
+  width: 16px;
+  height: 16px;
+  accent-color: var(--cs-accent);
+  justify-self: center;
+}
+.cs-provider-toggle-copy {
+  min-width: 0;
+  display: grid;
+  gap: 2px;
+}
+.cs-provider-toggle-copy strong {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--fg);
+  font-size: 11px;
+  line-height: 1.2;
+}
+.cs-provider-toggle-copy small {
+  color: color-mix(in srgb, var(--fg) 50%, transparent);
+  font-size: 9.5px;
+  line-height: 1.25;
+}
+.cs-provider-token {
+  display: grid;
+  gap: 7px;
+  padding: 8px;
+  border: 1px solid color-mix(in srgb, var(--border) 72%, transparent);
+  border-radius: 7px;
+  background: color-mix(in srgb, var(--panel) 42%, var(--bg));
+}
+.cs-provider-token-top {
+  justify-content: space-between;
+  gap: 10px;
+}
+.cs-provider-token-top p {
+  margin: 2px 0 0;
+  color: color-mix(in srgb, var(--fg) 58%, transparent);
+  font-size: 10.5px;
+  line-height: 1.35;
+}
+.cs-provider-token-actions,
+.cs-provider-copy-row {
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.cs-provider-token-actions button,
+.cs-provider-copy-row button {
+  min-height: 28px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--panel) 72%, var(--bg));
+  color: var(--fg);
+  font: inherit;
+  font-size: 11px;
+  line-height: 1;
+  cursor: pointer;
+}
+.cs-provider-token-actions button {
+  padding: 0 10px;
+}
+.cs-provider-copy-row button {
+  flex: 1 1 86px;
+  padding: 0 8px;
+}
+.cs-provider-token-actions button:hover,
+.cs-provider-copy-row button:hover {
+  border-color: color-mix(in srgb, var(--cs-accent) 60%, var(--border));
+  background: color-mix(in srgb, var(--cs-accent) 12%, var(--panel));
+}
+.cs-provider-token-actions button:disabled,
+.cs-provider-copy-row button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+.cs-provider-snippet {
+  margin: 0;
+  max-height: 72px;
+  overflow: auto;
+  padding: 6px 7px;
+  border: 1px solid color-mix(in srgb, var(--fg) 10%, transparent);
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--cs-terminal) 82%, var(--panel));
+  color: color-mix(in srgb, var(--cs-terminal-fg) 88%, transparent);
+  font: 10px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 
 .code-station-terminal-band {
@@ -35544,6 +35841,10 @@ body.theme-frosted .modal {
   }
 
   .code-station-fields {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .cs-provider-sections {
     grid-template-columns: minmax(0, 1fr);
   }
 }
@@ -36154,3 +36455,79 @@ body.cs-resizing * { user-select: none; }
   background: color-mix(in srgb, var(--cs-accent) 12%, transparent);
 }
 .cs-tree .code-station-row-title { font-size: 12.5px; }
+
+/* =============================================================================
+ * Code Station as a TOP-LEVEL WORKSPACE (peer to the chat space), not a modal.
+ * It's a flex sibling of #chat-container; activating it hides chat while the
+ * normal app sidebar remains available/collapsible.
+ * ========================================================================== */
+.code-space {
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 0;
+  display: none;
+  flex-direction: column;
+  background: var(--bg);
+}
+body.code-space-active > .code-space { display: flex; }
+body.code-space-active > #chat-container { display: none !important; }
+
+.code-space .code-station-content {
+  flex: 1 1 auto;
+  width: 100%;
+  height: 100%;            /* override the modal's min(820px,…) cap so it fills the space */
+  min-height: 0;
+  max-height: none;
+  border: 0;
+  border-radius: 0;
+  box-shadow: none;
+}
+/* xterm fills its pane container (FitAddon then computes cols/rows from the full box). */
+.cs-pane-term .xterm { width: 100%; height: 100%; }
+/* The header no longer rides on `.modal-header`, so give it the flex layout itself. */
+.code-space .code-station-header {
+  display: flex;
+  align-items: center;
+  cursor: default;
+}
+.cs-back-btn {
+  flex: 0 0 auto;
+  width: 28px;
+  height: 28px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--panel) 72%, var(--bg));
+  color: var(--fg);
+  cursor: pointer;
+  margin-right: 4px;
+}
+.cs-back-btn:hover {
+  border-color: color-mix(in srgb, var(--cs-accent) 60%, var(--border));
+  background: color-mix(in srgb, var(--cs-accent) 12%, var(--panel));
+}
+/* Rail button reflects the active space. */
+.icon-rail-btn.rail-active {
+  background: color-mix(in srgb, var(--cs-accent, #d19a66) 24%, transparent);
+  color: var(--cs-accent, #d19a66);
+}
+
+/* Collapse the in-space project/thread tree to give the terminal workspace full width. */
+.code-space.cs-tree-collapsed .cs-tree { display: none; }
+.cs-tree-toggle { flex: 0 0 auto; }
+.code-space.cs-tree-collapsed .cs-tree-toggle {
+  border-color: color-mix(in srgb, var(--cs-accent) 55%, var(--border));
+  color: var(--cs-accent);
+}
+
+/* Per-thread delete: muted by default, red on hover. */
+.cs-row-delete { opacity: 0.4; }
+.code-station-row:hover .cs-row-delete { opacity: 0.7; }
+.cs-row-delete:hover {
+  opacity: 1;
+  color: var(--cs-bad, #e06c75);
+  border-color: color-mix(in srgb, var(--cs-bad, #e06c75) 55%, var(--border));
+  background: color-mix(in srgb, var(--cs-bad, #e06c75) 12%, var(--panel));
+}

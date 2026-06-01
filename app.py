@@ -60,6 +60,7 @@ from core.exceptions import (
     SessionNotFoundError, InvalidFileUploadError,
     LLMServiceError, WebSearchError,
 )
+from src.coding_provider_tokens import is_provider_tool_bearer
 
 import bcrypt as _bcrypt
 
@@ -95,6 +96,9 @@ app.add_middleware(
         "X-Auth-Token",
         "X-Odysseus-Internal-Token",
         "X-Odysseus-Owner",
+        "X-Odysseus-Project-ID",
+        "X-Odysseus-Run-ID",
+        "X-Odysseus-Thread-ID",
         "X-Requested-With",
         "X-TZ-Offset",
     ],
@@ -287,8 +291,13 @@ if AUTH_ENABLED:
                     return RedirectResponse(url="/login", status_code=302)
                 return JSONResponse(status_code=401, content={"error": "Setup required"})
 
-            # --- Bearer token auth (API tokens for external integrations) ---
             auth_header = request.headers.get("authorization", "")
+            # Thread-scoped coding-provider tokens are validated inside the
+            # provider tool route so they never become app-wide API tokens.
+            if is_provider_tool_bearer(path, auth_header):
+                return await call_next(request)
+
+            # --- Bearer token auth (API tokens for external integrations) ---
             if auth_header.startswith("Bearer ody_"):
                 raw_token = auth_header[7:]
                 # Sanity check: tokens are "ody_" + 43 chars of base64
@@ -636,6 +645,8 @@ coding_runtime_service = get_coding_runtime_service()
 app.state.coding_runtime_service = coding_runtime_service
 from routes.coding_routes import setup_coding_routes
 app.include_router(setup_coding_routes())
+from routes.coding_provider_routes import setup_coding_provider_routes
+app.include_router(setup_coding_provider_routes(memory_manager, session_manager, memory_vector=memory_vector))
 
 # Cookbook (model download/serve/cache, cookbook state sync)
 from routes.cookbook_routes import setup_cookbook_routes

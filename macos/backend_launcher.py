@@ -6,7 +6,7 @@ import os
 import sys
 from pathlib import Path
 
-import uvicorn
+ODYSSEUS_TOOL_DISPATCH_ARG = "--odysseus-tool"
 
 
 def _bundle_root() -> Path:
@@ -16,8 +16,15 @@ def _bundle_root() -> Path:
     return Path(__file__).resolve().parent.parent
 
 
-def main() -> None:
-    root = _bundle_root()
+def _provider_cli_args(argv: list[str]) -> list[str] | None:
+    if len(argv) >= 2 and argv[1] == ODYSSEUS_TOOL_DISPATCH_ARG:
+        return argv[2:]
+    if len(argv) >= 3 and Path(argv[1]).name == "odysseus-tool":
+        return argv[2:]
+    return None
+
+
+def _configure_runtime(root: Path) -> Path:
     os.environ.setdefault("ODYSSEUS_BASE_DIR", str(root))
     os.environ.setdefault("DATA_DIR", str(Path.home() / "Library/Application Support/Odysseus/data"))
     os.environ.setdefault("CHROMADB_PERSIST_PATH", str(Path(os.environ["DATA_DIR"]) / "chroma"))
@@ -30,10 +37,29 @@ def main() -> None:
     if str(root) not in sys.path:
         sys.path.insert(0, str(root))
 
+    return app_support_root
+
+
+def _run_provider_cli(args: list[str]) -> None:
+    from src.coding_provider_cli import main as provider_cli_main
+
+    sys.argv = ["odysseus-tool", *args]
+    raise SystemExit(provider_cli_main(args))
+
+
+def main() -> None:
+    root = _bundle_root()
+    app_support_root = _configure_runtime(root)
+    provider_args = _provider_cli_args(sys.argv)
+    if provider_args is not None:
+        _run_provider_cli(provider_args)
+
     os.chdir(app_support_root)
 
     host = os.environ.get("ODYSSEUS_HOST", "127.0.0.1")
     port = int(os.environ.get("ODYSSEUS_PORT", "7001"))
+
+    import uvicorn
 
     from app import app
 

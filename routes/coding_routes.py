@@ -9,9 +9,11 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi import APIRouter, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
+
+from routes.auth_routes import SESSION_COOKIE
 
 from core.database import (
     CodingModelConfigSnapshot,
@@ -21,7 +23,7 @@ from core.database import (
     CodingThreadEvent,
     SessionLocal,
 )
-from core.middleware import require_admin
+from core.middleware import INTERNAL_TOOL_HEADER, INTERNAL_TOOL_TOKEN, require_admin
 from src.auth_helpers import require_user
 from src.coding_harnesses import get_harness, list_harnesses
 from src.coding_model_config import (
@@ -31,6 +33,7 @@ from src.coding_model_config import (
     thread_model_config,
 )
 from src.coding_runtime import CodingRuntimeError, get_coding_runtime_service
+from src.settings import DEFAULT_SETTINGS, load_settings, save_settings
 
 
 def _json_loads(value: str | None, fallback: Any) -> Any:
@@ -51,6 +54,48 @@ def _owner(request: Request) -> str:
     if user == "api":
         return (getattr(request.state, "api_token_owner", None) or "").strip()
     return user or ""
+
+
+def _websocket_client_host(websocket: WebSocket) -> str:
+    client = getattr(websocket, "client", None)
+    return (client.host if client else "") or ""
+
+
+def _websocket_internal_owner(websocket: WebSocket) -> str | None:
+    try:
+        if websocket.headers.get(INTERNAL_TOOL_HEADER) != INTERNAL_TOOL_TOKEN:
+            return None
+        return (websocket.headers.get("X-Odysseus-Owner") or "").strip() or "internal-tool"
+    except Exception:
+        return None
+
+
+def _websocket_owner(websocket: WebSocket) -> str | None:
+    internal_owner = _websocket_internal_owner(websocket)
+    if internal_owner is not None:
+        return internal_owner
+
+    auth_manager = getattr(websocket.app.state, "auth_manager", None)
+    token = websocket.cookies.get(SESSION_COOKIE)
+    if auth_manager is not None and getattr(auth_manager, "is_configured", False):
+        if not auth_manager.validate_token(token):
+            return None
+        return auth_manager.get_username_for_token(token) or ""
+
+    if _websocket_client_host(websocket) not in ("127.0.0.1", "::1", "localhost"):
+        return None
+    return ""
+
+
+def _websocket_admin_allowed(websocket: WebSocket, owner: str) -> bool:
+    if _websocket_internal_owner(websocket) is not None:
+        return True
+    if os.getenv("AUTH_ENABLED", "true").lower() == "false":
+        return True
+    auth_manager = getattr(websocket.app.state, "auth_manager", None)
+    if not auth_manager or not getattr(auth_manager, "is_configured", False):
+        return False
+    return bool(owner and auth_manager.is_admin(owner))
 
 
 def _not_found(name: str):
@@ -149,6 +194,26 @@ def _snapshot_dict(snapshot: CodingModelConfigSnapshot) -> dict[str, Any]:
     }
 
 
+def _coerce_max_concurrent_agents(value: Any) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        parsed = int(DEFAULT_SETTINGS.get("coding_max_concurrent_threads", 2) or 2)
+    return max(1, min(parsed, 64))
+
+
+def _coding_settings_dict() -> dict[str, Any]:
+    settings = load_settings()
+    value = _coerce_max_concurrent_agents(
+        settings.get("coding_max_concurrent_threads", DEFAULT_SETTINGS.get("coding_max_concurrent_threads", 2))
+    )
+    return {
+        "max_concurrent_agents": value,
+        "max_concurrent_runs": value,
+        "coding_max_concurrent_threads": value,
+    }
+
+
 def _project_query(db, owner: str):
     return db.query(CodingProject).filter(CodingProject.owner == owner)
 
@@ -159,6 +224,14 @@ def _thread_query(db, owner: str):
 
 def _run_query(db, owner: str):
     return db.query(CodingRun).filter(CodingRun.owner == owner)
+
+
+def _scoped_run_query(db, owner: str, project_id: str | None = None):
+    query = _run_query(db, owner).join(CodingThread, CodingThread.id == CodingRun.thread_id)
+    query = query.filter(CodingThread.owner == owner)
+    if project_id is not None:
+        query = query.filter(CodingThread.project_id == project_id)
+    return query
 
 
 def _validate_harness(harness_id: str | None) -> str:
@@ -225,6 +298,12 @@ class StdinRequest(BaseModel):
 class ResizeRequest(BaseModel):
     cols: int
     rows: int
+
+
+class CodingSettingsPatch(BaseModel):
+    max_concurrent_agents: int | None = None
+    max_concurrent_runs: int | None = None
+    coding_max_concurrent_threads: int | None = None
 
 
 def setup_coding_routes() -> APIRouter:
@@ -506,6 +585,16 @@ def setup_coding_routes() -> APIRouter:
         finally:
             db.close()
 
+    @router.delete("/threads/{thread_id}")
+    async def delete_thread(request: Request, thread_id: str):
+        require_admin(request)
+        owner = _owner(request)
+        try:
+            await runtime.delete_thread(thread_id, owner)
+            return {"ok": True, "deleted": thread_id}
+        except CodingRuntimeError as exc:
+            _runtime_error(exc)
+
     @router.post("/threads/{thread_id}/run")
     async def run_thread(request: Request, thread_id: str, body: RunCreate):
         require_admin(request)
@@ -593,6 +682,41 @@ def setup_coding_routes() -> APIRouter:
 
         return StreamingResponse(generate(), media_type="text/event-stream")
 
+    @router.websocket("/runs/{run_id}/pty")
+    async def run_pty(websocket: WebSocket, run_id: str):
+        # WebSocket auth: BaseHTTPMiddleware does not run for websockets, so validate the
+        # session cookie here (mirrors the HTTP AuthMiddleware + require_user fallback).
+        owner = _websocket_owner(websocket)
+        if owner is None or not _websocket_admin_allowed(websocket, owner):
+            await websocket.close(code=1008)
+            return
+
+        def _int_param(name: str, default: int) -> int:
+            try:
+                return int(websocket.query_params.get(name, default))
+            except (TypeError, ValueError):
+                return default
+
+        cols = _int_param("cols", 120)
+        rows = _int_param("rows", 40)
+        await websocket.accept()
+        try:
+            await runtime.attach_pty(websocket, run_id, owner, cols, rows)
+        except CodingRuntimeError as exc:
+            try:
+                await websocket.send_json({"type": "error", "detail": exc.detail})
+            except Exception:
+                pass
+        except WebSocketDisconnect:
+            pass
+        except Exception:
+            pass
+        finally:
+            try:
+                await websocket.close()
+            except Exception:
+                pass
+
     @router.post("/runs/{run_id}/stdin")
     async def send_stdin(request: Request, run_id: str, body: StdinRequest):
         require_admin(request)
@@ -624,32 +748,93 @@ def setup_coding_routes() -> APIRouter:
             _runtime_error(exc)
 
     @router.get("/queue")
-    async def get_queue(request: Request):
+    async def get_queue(request: Request, project_id: str | None = Query(None)):
         owner = _owner(request)
+        project_scope = (project_id or "").strip() or None
         db = SessionLocal()
         try:
-            queued = (
-                _run_query(db, owner)
-                .filter(CodingRun.status == "queued")
+            if project_scope:
+                project = _project_query(db, owner).filter(CodingProject.id == project_scope).first()
+                if not project:
+                    _not_found("Project")
+        finally:
+            db.close()
+
+        # Concurrency is a single owner-wide pool shared across projects; pump globally.
+        await runtime.pump_queue(owner=owner)
+        db = SessionLocal()
+        try:
+            # Owner-global rows joined with thread + project so the UI can attribute
+            # each run (and the pool totals) to the project that is consuming it.
+            rows = (
+                db.query(CodingRun, CodingThread, CodingProject)
+                .join(CodingThread, CodingThread.id == CodingRun.thread_id)
+                .join(CodingProject, CodingProject.id == CodingThread.project_id)
+                .filter(CodingRun.owner == owner, CodingThread.owner == owner)
+                .filter(CodingRun.status.in_(("queued", "starting", "running", "stopping")))
                 .order_by(CodingRun.queued_at.asc())
                 .all()
             )
-            active = (
-                _run_query(db, owner)
-                .filter(CodingRun.status.in_(("starting", "running", "stopping")))
-                .order_by(CodingRun.started_at.asc())
-                .all()
-            )
-            queue = runtime.queue_snapshot(owner)
+            active_runs: list[dict[str, Any]] = []
+            queued_runs: list[dict[str, Any]] = []
+            by_project: dict[str, dict[str, Any]] = {}
+            for run, thread, project in rows:
+                bucket = by_project.setdefault(
+                    project.id,
+                    {"project_id": project.id, "project_name": project.name, "active": 0, "queued": 0},
+                )
+                entry = _run_dict(run)
+                entry["project_id"] = project.id
+                entry["project_name"] = project.name
+                entry["thread_title"] = thread.title
+                if run.status == "queued":
+                    queued_runs.append(entry)
+                    bucket["queued"] += 1
+                else:
+                    active_runs.append(entry)
+                    bucket["active"] += 1
+            # Totals are owner-global; project_scope is only echoed back so the client
+            # knows which project it asked about (it does not narrow the counts).
+            queue = runtime.queue_snapshot(owner, project_id=project_scope)
             queue.update(
                 {
-                    "queued_runs": [_run_dict(run) for run in queued],
-                    "active_runs": [_run_dict(run) for run in active],
+                    "queued_runs": queued_runs,
+                    "active_runs": active_runs,
+                    "by_project": sorted(
+                        by_project.values(), key=lambda b: (b["project_name"] or "").lower()
+                    ),
                 }
             )
             return {"queue": queue}
         finally:
             db.close()
+
+    @router.get("/settings")
+    async def get_coding_settings(request: Request):
+        _owner(request)
+        return {"settings": _coding_settings_dict()}
+
+    @router.patch("/settings")
+    async def patch_coding_settings(request: Request, body: CodingSettingsPatch):
+        require_admin(request)
+        _owner(request)
+        raw_value = (
+            body.max_concurrent_agents
+            if body.max_concurrent_agents is not None
+            else body.max_concurrent_runs
+            if body.max_concurrent_runs is not None
+            else body.coding_max_concurrent_threads
+        )
+        if raw_value is None:
+            raise HTTPException(400, "max_concurrent_agents is required")
+        settings = load_settings()
+        settings["coding_max_concurrent_threads"] = _coerce_max_concurrent_agents(raw_value)
+        save_settings(settings)
+        return {"settings": _coding_settings_dict()}
+
+    @router.post("/settings")
+    async def post_coding_settings(request: Request, body: CodingSettingsPatch):
+        return await patch_coding_settings(request, body)
 
     @router.get("/harnesses")
     async def get_harnesses(request: Request):

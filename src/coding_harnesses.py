@@ -22,6 +22,9 @@ class HarnessDefinition:
     provider_tools: str = "cli"
     stdin_supported: bool = True
     resize_supported: bool = True
+    # Whether odysseus can inject a hook that gates this harness's LLM calls on a
+    # per-endpoint task slot (see src/coding_task_slots.py + coding_provider_launch).
+    task_hooks: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -32,6 +35,7 @@ class HarnessDefinition:
             "provider_tools": self.provider_tools,
             "stdin_supported": self.stdin_supported,
             "resize_supported": self.resize_supported,
+            "task_hooks": self.task_hooks,
         }
 
 
@@ -48,6 +52,7 @@ _HARNESS_REGISTRY: dict[str, HarnessDefinition] = {
         description="Run the pi CLI in a coding terminal.",
         default_command="pi",
         provider_tools="extension",
+        task_hooks=True,
     ),
     "codex": HarnessDefinition(
         id="codex",
@@ -55,12 +60,14 @@ _HARNESS_REGISTRY: dict[str, HarnessDefinition] = {
         description="Run the Codex CLI in a coding terminal.",
         default_command="codex",
         provider_tools="mcp",
+        task_hooks=True,
     ),
     "claude": HarnessDefinition(
         id="claude",
         name="Claude",
         description="Run the Claude CLI in a coding terminal.",
         default_command="claude",
+        task_hooks=True,
     ),
     "opencode": HarnessDefinition(
         id="opencode",
@@ -73,6 +80,8 @@ _HARNESS_REGISTRY: dict[str, HarnessDefinition] = {
         name="OMP",
         description="Run the OMP CLI in a coding terminal.",
         default_command="omp",
+        provider_tools="extension",
+        task_hooks=True,
     ),
     "hermes": HarnessDefinition(
         id="hermes",

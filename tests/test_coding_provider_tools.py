@@ -764,6 +764,7 @@ def _clear_provider_url_env(monkeypatch):
         "ODYSSEUS_BASE_URL",
         "APP_BASE_URL",
         "PUBLIC_BASE_URL",
+        "ODYSSEUS_PORT",
         "APP_PORT",
     ):
         monkeypatch.delenv(key, raising=False)
@@ -824,6 +825,20 @@ def test_provider_tool_url_falls_back_to_app_port_then_default(monkeypatch):
 
     monkeypatch.delenv("APP_PORT")
     assert provider_bridge.provider_tool_url() == "http://localhost:7000/api/coding/provider/tool"
+
+
+def test_provider_tool_url_prefers_odysseus_port_over_default(monkeypatch):
+    # Regression: the macOS launcher binds a dynamic free port and exports it as
+    # ODYSSEUS_PORT. Defaulting to :7000 points the harness at AirPlay Receiver.
+    import src.coding_provider_bridge as provider_bridge
+
+    _clear_provider_url_env(monkeypatch)
+    monkeypatch.setenv("ODYSSEUS_PORT", "54321")
+    assert provider_bridge.provider_tool_url() == "http://localhost:54321/api/coding/provider/tool"
+
+    # ODYSSEUS_PORT (the real bound port) wins over APP_PORT.
+    monkeypatch.setenv("APP_PORT", "8123")
+    assert provider_bridge.provider_tool_url() == "http://localhost:54321/api/coding/provider/tool"
 
 
 @pytest.mark.parametrize(
@@ -1364,3 +1379,77 @@ def test_backend_mint_failure_does_not_inject_unusable_odyt_http_token(monkeypat
     assert not token.startswith("odyt_")
     if token:
         assert token.startswith("ody_cp_")
+
+
+def test_run_provider_task_acquire_and_release(
+    provider_coding_client,
+    isolated_provider_coding_store,
+):
+    from src.coding_provider_tokens import mint_run_provider_token
+    from src.coding_task_slots import get_task_slot_service
+
+    # Isolate the process-singleton slot service from any other test's state.
+    svc = get_task_slot_service()
+    svc._holders.clear()
+    svc._waiters.clear()
+    svc._limits.clear()
+
+    client, _runtime = provider_coding_client
+    project_id, thread_id = _seed_project_and_thread(isolated_provider_coding_store)
+    run_id = _seed_run(isolated_provider_coding_store, thread_id=thread_id)
+    minted = mint_run_provider_token(
+        owner="tester",
+        project_id=project_id,
+        thread_id=thread_id,
+        run_id=run_id,
+        capabilities=["task.acquire", "task.release", "task.heartbeat"],
+    )
+    headers = _run_auth(minted["token"], project_id=project_id, thread_id=thread_id, run_id=run_id)
+
+    acquired = client.post(
+        "/api/coding/provider/tool",
+        headers=headers,
+        json={"tool": "task", "action": "acquire", "args": {"wait_seconds": 2}},
+    )
+    assert acquired.status_code == 200
+    result = acquired.json()["result"]
+    assert result["granted"] is True
+    slot_id = result["slot_id"]
+    assert slot_id
+
+    released = client.post(
+        "/api/coding/provider/tool",
+        headers=headers,
+        json={"tool": "task", "action": "release", "args": {"slot_id": slot_id}},
+    )
+    assert released.status_code == 200
+    assert released.json()["result"]["released"] is True
+
+    svc._holders.clear()
+    svc._waiters.clear()
+
+
+def test_run_provider_task_acquire_requires_capability(
+    provider_coding_client,
+    isolated_provider_coding_store,
+):
+    from src.coding_provider_tokens import mint_run_provider_token
+
+    client, _runtime = provider_coding_client
+    project_id, thread_id = _seed_project_and_thread(isolated_provider_coding_store)
+    run_id = _seed_run(isolated_provider_coding_store, thread_id=thread_id)
+    minted = mint_run_provider_token(
+        owner="tester",
+        project_id=project_id,
+        thread_id=thread_id,
+        run_id=run_id,
+        capabilities=["terminal.read"],  # no task.* capability
+    )
+
+    response = client.post(
+        "/api/coding/provider/tool",
+        headers=_run_auth(minted["token"], project_id=project_id, thread_id=thread_id, run_id=run_id),
+        json={"tool": "task", "action": "acquire", "args": {}},
+    )
+    assert response.status_code == 403
+    assert "task.acquire" in response.json()["detail"]

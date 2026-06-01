@@ -21,6 +21,7 @@ from core.database import (
     CodingRun,
     CodingThread,
     CodingThreadEvent,
+    ModelEndpoint,
     SessionLocal,
 )
 from core.middleware import INTERNAL_TOOL_HEADER, INTERNAL_TOOL_TOKEN, require_admin
@@ -33,6 +34,7 @@ from src.coding_model_config import (
     thread_model_config,
 )
 from src.coding_runtime import CodingRuntimeError, get_coding_runtime_service
+from src.coding_task_slots import get_task_slot_service
 from src.settings import DEFAULT_SETTINGS, load_settings, save_settings
 
 
@@ -198,16 +200,26 @@ def _coerce_max_concurrent_agents(value: Any) -> int:
     try:
         parsed = int(value)
     except (TypeError, ValueError):
-        parsed = int(DEFAULT_SETTINGS.get("coding_max_concurrent_threads", 2) or 2)
+        parsed = int(DEFAULT_SETTINGS.get("coding_max_concurrent_tasks", 2) or 2)
     return max(1, min(parsed, 64))
 
 
 def _coding_settings_dict() -> dict[str, Any]:
     settings = load_settings()
-    value = _coerce_max_concurrent_agents(
-        settings.get("coding_max_concurrent_threads", DEFAULT_SETTINGS.get("coding_max_concurrent_threads", 2))
+    # The limit now governs concurrent *tasks* (LLM calls) per endpoint. Read the
+    # new key, falling back to the legacy terminal-cap key, then the default.
+    raw = settings.get(
+        "coding_max_concurrent_tasks",
+        settings.get(
+            "coding_max_concurrent_threads",
+            DEFAULT_SETTINGS.get("coding_max_concurrent_tasks", 2),
+        ),
     )
+    value = _coerce_max_concurrent_agents(raw)
     return {
+        "max_concurrent_tasks": value,
+        "coding_max_concurrent_tasks": value,
+        # Legacy aliases (the current UI still sends/reads max_concurrent_agents).
         "max_concurrent_agents": value,
         "max_concurrent_runs": value,
         "coding_max_concurrent_threads": value,
@@ -301,6 +313,9 @@ class ResizeRequest(BaseModel):
 
 
 class CodingSettingsPatch(BaseModel):
+    max_concurrent_tasks: int | None = None
+    coding_max_concurrent_tasks: int | None = None
+    # Legacy aliases (still accepted from the current UI), mapped to the task limit.
     max_concurrent_agents: int | None = None
     max_concurrent_runs: int | None = None
     coding_max_concurrent_threads: int | None = None
@@ -795,6 +810,19 @@ def setup_coding_routes() -> APIRouter:
                     bucket["active"] += 1
             # Totals are owner-global; project_scope is only echoed back so the client
             # knows which project it asked about (it does not narrow the counts).
+            # Live per-endpoint LLM-call (task) slot usage — the real concurrency
+            # limit now that terminals are uncapped. Resolve friendly endpoint names.
+            task_slots = get_task_slot_service().snapshot(owner)
+            for ep in task_slots.get("endpoints", []):
+                key = ep.get("endpoint") or ""
+                if key.startswith("model:"):
+                    ep["endpoint_name"] = key.split("model:", 1)[1] or "Model"
+                elif key and key != "default":
+                    row = db.query(ModelEndpoint).filter(ModelEndpoint.id == key).first()
+                    ep["endpoint_name"] = row.name if (row and row.name) else "Endpoint"
+                else:
+                    ep["endpoint_name"] = "Default endpoint"
+
             queue = runtime.queue_snapshot(owner, project_id=project_scope)
             queue.update(
                 {
@@ -803,6 +831,7 @@ def setup_coding_routes() -> APIRouter:
                     "by_project": sorted(
                         by_project.values(), key=lambda b: (b["project_name"] or "").lower()
                     ),
+                    "task_slots": task_slots,
                 }
             )
             return {"queue": queue}
@@ -818,17 +847,27 @@ def setup_coding_routes() -> APIRouter:
     async def patch_coding_settings(request: Request, body: CodingSettingsPatch):
         require_admin(request)
         _owner(request)
-        raw_value = (
-            body.max_concurrent_agents
-            if body.max_concurrent_agents is not None
-            else body.max_concurrent_runs
-            if body.max_concurrent_runs is not None
-            else body.coding_max_concurrent_threads
+        raw_value = next(
+            (
+                v
+                for v in (
+                    body.max_concurrent_tasks,
+                    body.coding_max_concurrent_tasks,
+                    body.max_concurrent_agents,
+                    body.max_concurrent_runs,
+                    body.coding_max_concurrent_threads,
+                )
+                if v is not None
+            ),
+            None,
         )
         if raw_value is None:
-            raise HTTPException(400, "max_concurrent_agents is required")
+            raise HTTPException(400, "max_concurrent_tasks is required")
+        coerced = _coerce_max_concurrent_agents(raw_value)
         settings = load_settings()
-        settings["coding_max_concurrent_threads"] = _coerce_max_concurrent_agents(raw_value)
+        settings["coding_max_concurrent_tasks"] = coerced
+        # Keep the legacy key in sync so anything still reading it agrees.
+        settings["coding_max_concurrent_threads"] = coerced
         save_settings(settings)
         return {"settings": _coding_settings_dict()}
 

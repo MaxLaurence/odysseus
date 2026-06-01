@@ -123,6 +123,11 @@ class CodingPtyBridge:
                 pass
             return
 
+        # Size the tmux window to THIS client up front (window-size is manual), so the
+        # harness renders at the real pane width from the first frame instead of staying
+        # at the session's creation size → wrapped/garbled output until a later resize.
+        await self.tmux_exec("resize-window", "-t", session, "-x", str(cols), "-y", str(rows), check=False)
+
         master, slave = pty.openpty()
         self._set_winsize(master, rows, cols)
 
@@ -188,7 +193,14 @@ class CodingPtyBridge:
                     if not isinstance(ctrl, dict):
                         continue
                     if ctrl.get("type") == "resize":
-                        self._set_winsize(master, int(ctrl.get("rows") or rows), int(ctrl.get("cols") or cols))
+                        new_cols = max(20, min(int(ctrl.get("cols") or cols), 400))
+                        new_rows = max(5, min(int(ctrl.get("rows") or rows), 120))
+                        self._set_winsize(master, new_rows, new_cols)
+                        # window-size is manual, so the PTY winsize alone won't move the
+                        # tmux window — resize it explicitly to keep the harness in sync.
+                        await self.tmux_exec(
+                            "resize-window", "-t", session, "-x", str(new_cols), "-y", str(new_rows), check=False
+                        )
                     elif ctrl.get("type") == "input" and ctrl.get("data") is not None:
                         os.write(master, str(ctrl["data"]).encode("utf-8"))
 

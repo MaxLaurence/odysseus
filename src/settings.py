@@ -94,6 +94,10 @@ DEFAULT_SETTINGS = {
     "agent_max_tool_calls": 0,
     "agent_input_token_budget": 6000,
     "agent_stream_timeout_seconds": 300,
+    # Max concurrent coding *tasks* (LLM calls) per model endpoint. Terminals are
+    # unlimited; harness hooks acquire a slot per LLM call. (coding_max_concurrent_threads
+    # is the legacy terminal cap, kept only as a back-compat alias — no longer gates.)
+    "coding_max_concurrent_tasks": 2,
     "coding_max_concurrent_threads": 2,
     "task_endpoint_id": "",
     "task_model": "",

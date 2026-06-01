@@ -1536,7 +1536,7 @@ async function initCodingAgentSettings() {
 
   function readMaxConcurrent(payload) {
     var settings = payload && payload.settings ? payload.settings : payload;
-    var raw = settings ? settings.max_concurrent_agents : undefined;
+    var raw = settings ? (settings.max_concurrent_tasks != null ? settings.max_concurrent_tasks : settings.max_concurrent_agents) : undefined;
     var parsed = parseInt(raw, 10);
     return Number.isFinite(parsed) && parsed > 0 ? parsed : '';
   }
@@ -1548,7 +1548,7 @@ async function initCodingAgentSettings() {
       msg.style.color = 'var(--red)';
       return;
     }
-    msg.textContent = value ? 'Limit: ' + value + ' concurrent coding agents' : 'Using backend default';
+    msg.textContent = value ? 'Limit: ' + value + ' concurrent LLM calls per endpoint' : 'Using backend default';
     msg.style.color = 'var(--fg)';
   }
 
@@ -1572,7 +1572,7 @@ async function initCodingAgentSettings() {
     try {
       var res = await fetch('/api/coding/settings', { method: 'PATCH', credentials: 'same-origin',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ max_concurrent_agents: val })
+        body: JSON.stringify({ max_concurrent_tasks: val })
       });
       if (!res.ok) throw new Error(String(res.status));
       setStatus(val, false);

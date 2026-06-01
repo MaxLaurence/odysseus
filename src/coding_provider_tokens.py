@@ -49,6 +49,9 @@ ALL_CAPABILITIES = {
     "model_config.read",
     "model_config.derive",
     "model_config.restore",
+    "task.acquire",
+    "task.release",
+    "task.heartbeat",
 }
 
 READ_ONLY_CAPABILITIES = {
@@ -78,9 +81,13 @@ CAPABILITY_GROUPS = {
         "thread.messages.write",
         "model_config.derive",
         "model_config.restore",
+        "task.acquire",
+        "task.release",
+        "task.heartbeat",
     },
     "terminal.write": {"terminal.start", "terminal.stdin", "terminal.resize"},
     "model_config.write": {"model_config.derive", "model_config.restore"},
+    "task.write": {"task.acquire", "task.release", "task.heartbeat"},
 }
 
 CAPABILITY_ALIASES = {

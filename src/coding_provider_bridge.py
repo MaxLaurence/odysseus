@@ -164,7 +164,10 @@ def provider_tool_url() -> str:
         if base_url:
             return _normalize_provider_tool_url(base_url, treat_as_app_base=True)
 
-    port = _env_value("APP_PORT") or DEFAULT_APP_PORT
+    # ODYSSEUS_PORT is the real port the backend bound to (the macOS launcher picks
+    # a free port dynamically and sets it). Prefer it — defaulting to 7000 points
+    # the harness at macOS AirPlay Receiver, which squats on :7000 and 403s.
+    port = _env_value("ODYSSEUS_PORT") or _env_value("APP_PORT") or DEFAULT_APP_PORT
     return _normalize_provider_tool_url(f"http://localhost:{port}")
 
 

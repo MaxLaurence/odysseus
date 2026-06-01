@@ -6,6 +6,8 @@ import argparse
 import json
 import os
 import sys
+import tempfile
+import time
 import urllib.error
 import urllib.request
 from typing import Any
@@ -86,6 +88,70 @@ def cmd_call(args: argparse.Namespace) -> None:
         "run_id": os.environ.get("ODYSSEUS_RUN_ID", ""),
     }
     _emit(_request(_tool_call_url(), payload), args.pretty)
+
+
+def _gate_store_path(store: str | None) -> str:
+    if store:
+        return store
+    run_id = (os.environ.get("ODYSSEUS_RUN_ID", "") or "default").replace("/", "_")
+    return os.path.join(tempfile.gettempdir(), f"odysseus-task-slot-{run_id}")
+
+
+def _gate_payload(action: str, args: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "tool": "task",
+        "action": action,
+        "args": args,
+        "arguments": args,
+        "thread_id": os.environ.get("ODYSSEUS_THREAD_ID", ""),
+        "project_id": os.environ.get("ODYSSEUS_PROJECT_ID", ""),
+        "run_id": os.environ.get("ODYSSEUS_RUN_ID", ""),
+    }
+
+
+def cmd_gate(args: argparse.Namespace) -> None:
+    """Block a harness hook on a per-endpoint task slot.
+
+    `acquire` long-polls the task tool until a slot is granted (then records it),
+    or gives up after --max-wait and proceeds ungated (best-effort: never wedge the
+    agent). `release` frees the recorded slot. Emits nothing on stdout so harness
+    hook parsers see a clean "proceed" (no decision).
+    """
+    store = _gate_store_path(args.store)
+    url = _tool_call_url()
+    if args.gate_action == "acquire":
+        deadline = time.monotonic() + max(1.0, float(args.max_wait))
+        while time.monotonic() < deadline:
+            try:
+                resp = _request(url, _gate_payload("acquire", {"wait_seconds": 15}))
+            except SystemExit:
+                return  # bridge unreachable → proceed without gating
+            result = (resp or {}).get("result") or resp or {}
+            if result.get("granted") and result.get("slot_id"):
+                try:
+                    with open(store, "w", encoding="utf-8") as handle:
+                        handle.write(str(result["slot_id"]))
+                except OSError:
+                    pass
+                return
+            # queued → loop and re-acquire (the server already blocked ~15s)
+        return  # timed out waiting → proceed ungated
+    if args.gate_action == "release":
+        try:
+            with open(store, "r", encoding="utf-8") as handle:
+                slot_id = handle.read().strip()
+        except OSError:
+            slot_id = ""
+        if slot_id:
+            try:
+                _request(url, _gate_payload("release", {"slot_id": slot_id}))
+            except SystemExit:
+                pass
+        try:
+            os.remove(store)
+        except OSError:
+            pass
+        return
 
 
 MCP_SERVER_NAME = "odysseus-provider-tools"
@@ -177,6 +243,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     mcp_cmd = sub.add_parser("mcp-server", parents=[common], help="Run Odysseus provider tools as a stdio MCP server")
     mcp_cmd.set_defaults(func=cmd_mcp_server)
+
+    gate_cmd = sub.add_parser(
+        "gate", parents=[common], help="Acquire/release a per-endpoint task slot (for harness hooks)"
+    )
+    gate_cmd.add_argument("gate_action", choices=["acquire", "release"])
+    gate_cmd.add_argument("--store", default="", help="Slot-id store file (default: temp file keyed by ODYSSEUS_RUN_ID)")
+    gate_cmd.add_argument("--max-wait", type=float, default=28.0, help="Max seconds to block on acquire before proceeding ungated")
+    gate_cmd.set_defaults(func=cmd_gate)
 
     return parser
 

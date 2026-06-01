@@ -34,6 +34,7 @@ from src.coding_provider_bridge import (
     with_scripts_on_path,
 )
 from src.coding_pty_bridge import CodingPtyBridge
+from src.coding_task_slots import get_task_slot_service
 from src.settings import get_setting
 
 logger = logging.getLogger(__name__)
@@ -175,6 +176,13 @@ class CodingRuntimeService:
             self._provider_bridge.revoke_run_token(run_id=run_id)
         except Exception:
             logger.debug("Failed to revoke provider bridge token for coding run %s", run_id, exc_info=True)
+        # A finished/failed run must never strand its task slots (the harness may
+        # die mid-call before its release hook fires). release_run is synchronous
+        # and safe to call from this teardown path on the event loop.
+        try:
+            get_task_slot_service().release_run(run_id)
+        except Exception:
+            logger.debug("Failed to release task slots for coding run %s", run_id, exc_info=True)
 
     def _append_event_db(
         self,
@@ -601,24 +609,14 @@ class CodingRuntimeService:
             try:
                 await self._reconcile_stale_active_runs_db(db, owner=owner, project_id=project_id)
                 db.flush()
-                max_concurrent = self.max_concurrent_runs()
-                # One shared pool per owner across all their projects: count the owner's
-                # total active runs (any project) and fill free slots from the owner's
-                # oldest queued runs, regardless of which project they belong to.
+                # Terminals are no longer capped — concurrency is enforced per LLM
+                # *task* via per-endpoint task slots (src/coding_task_slots.py), not by
+                # limiting how many terminals run. So launch every queued run immediately.
                 for scope_owner in self._queued_owners_db(db, owner=owner):
-                    active_count = (
-                        self._scoped_run_query(db, owner=scope_owner)
-                        .filter(CodingRun.status.in_(tuple(ACTIVE_STATUSES)))
-                        .count()
-                    )
-                    slots = max(0, max_concurrent - active_count)
-                    if slots <= 0:
-                        continue
                     queued = (
                         self._scoped_run_query(db, owner=scope_owner)
                         .filter(CodingRun.status == "queued")
                         .order_by(CodingRun.queued_at.asc())
-                        .limit(slots)
                         .all()
                     )
                     for run in queued:
@@ -872,18 +870,25 @@ class CodingRuntimeService:
 
             # Make the session a TRANSPARENT, low-latency passthrough for the PTY/WebSocket
             # client (xterm.js): no status bar, no prefix key interception, instant ESC, and
-            # extended keys forwarded. window-size follows the attached client (the UI pane),
-            # so resizing the pane resizes the harness via SIGWINCH. Mouse on + alternate-scroll
-            # so the wheel scrolls history (copy-mode) / scrolls inside full-screen apps.
+            # extended keys forwarded. window-size is MANUAL — the PTY bridge explicitly
+            # resize-windows to the xterm pane on attach and on every resize, so the harness
+            # width always matches what xterm renders (no client-size heuristics fighting it,
+            # which caused wrapped/garbled output). Mouse on + alternate-scroll so the wheel
+            # scrolls history (copy-mode) / scrolls inside full-screen apps.
             await self._tmux_exec("set-option", "-s", "extended-keys", "on", check=False)
-            await self._tmux_exec("set-option", "-g", "mouse", "on", check=False)
-            await self._tmux_exec("set-option", "-g", "alternate-scroll", "on", check=False)
+            # Pi/harnesses negotiate modified keys best with the csi-u encoding (Pi warns
+            # otherwise); set it so key handling is correct.
+            await self._tmux_exec("set-option", "-s", "extended-keys-format", "csi-u", check=False)
+            # Mouse OFF so the wheel scrolls xterm.js's OWN scrollback (native-terminal
+            # scrolling). With mouse on, tmux captured the wheel into copy-mode, which
+            # garbled the pane on scroll. xterm owns selection + scrollback; tmux just
+            # streams the live screen, and lines that scroll off feed xterm's buffer.
+            await self._tmux_exec("set-option", "-g", "mouse", "off", check=False)
             await self._tmux_exec("set-option", "-g", "escape-time", "0", check=False)
             await self._tmux_exec("set-option", "-t", session, "status", "off", check=False)
             await self._tmux_exec("set-option", "-t", session, "prefix", "None", check=False)
             await self._tmux_exec("set-option", "-t", session, "prefix2", "None", check=False)
-            await self._tmux_exec("set-option", "-t", session, "window-size", "latest", check=False)
-            await self._tmux_exec("set-option", "-t", session, "aggressive-resize", "on", check=False)
+            await self._tmux_exec("set-option", "-t", session, "window-size", "manual", check=False)
 
             # Capture the pane's raw output to the log (out-of-band, preserves the program's TTY).
             await self._start_pane_capture(session, log_path)

@@ -678,36 +678,39 @@ def test_pin_and_unpin_persist_through_routes(coding_client, isolated_coding_sto
         db.close()
 
 
-def test_coding_settings_persist_max_concurrent_agents_and_drive_queue_limit(
+def test_coding_settings_persist_max_concurrent_tasks(
     monkeypatch,
     coding_client,
     isolated_coding_store,
 ):
     import src.settings as settings
+    from src.coding_task_slots import get_task_slot_service
 
     settings_path = isolated_coding_store.data_dir / "settings.json"
     monkeypatch.setattr(settings, "SETTINGS_FILE", str(settings_path))
     settings._invalidate_caches()
 
-    client, runtime = coding_client
+    client, _runtime = coding_client
 
     initial = client.get("/api/coding/settings")
     assert initial.status_code == 200
-    assert initial.json()["settings"]["max_concurrent_agents"] == 2
+    assert initial.json()["settings"]["max_concurrent_tasks"] == 2
 
+    # The current UI still sends the legacy alias; it maps to the task limit.
     updated = client.patch("/api/coding/settings", json={"max_concurrent_agents": 1})
     assert updated.status_code == 200
-    assert updated.json()["settings"] == {
-        "max_concurrent_agents": 1,
-        "max_concurrent_runs": 1,
-        "coding_max_concurrent_threads": 1,
-    }
-    assert json.loads(settings_path.read_text(encoding="utf-8"))["coding_max_concurrent_threads"] == 1
-    assert runtime.max_concurrent_runs() == 1
+    body = updated.json()["settings"]
+    assert body["max_concurrent_tasks"] == 1
+    assert body["coding_max_concurrent_tasks"] == 1
+    assert body["max_concurrent_agents"] == 1  # legacy alias mirrors the value
+    assert json.loads(settings_path.read_text(encoding="utf-8"))["coding_max_concurrent_tasks"] == 1
 
-    queue = client.get("/api/coding/queue")
-    assert queue.status_code == 200
-    assert queue.json()["queue"]["max_concurrent"] == 1
+    # The canonical key is accepted too, and drives the per-endpoint slot limit.
+    updated2 = client.patch("/api/coding/settings", json={"max_concurrent_tasks": 3})
+    assert updated2.status_code == 200
+    assert updated2.json()["settings"]["max_concurrent_tasks"] == 3
+    settings._invalidate_caches()
+    assert get_task_slot_service().default_limit() == 3
     settings._invalidate_caches()
 
 
@@ -902,14 +905,17 @@ def test_queue_is_owner_global_with_project_attribution(
 
 
 @pytest.mark.asyncio
-async def test_runtime_concurrency_is_a_global_pool_across_projects(monkeypatch, isolated_coding_store):
+async def test_terminals_are_not_capped_runs_launch_immediately(monkeypatch, isolated_coding_store):
+    # Concurrency now lives at the LLM-call (task-slot) layer, not the terminal
+    # layer: pump_queue launches every queued run immediately, even with the
+    # legacy cap pinned to 1.
     import src.coding_runtime as coding_runtime
     from src.coding_runtime import CodingRuntimeService
 
     monkeypatch.setattr(
         coding_runtime,
         "get_setting",
-        lambda key, default=None: 1 if key == "coding_max_concurrent_threads" else default,
+        lambda key, default=None: 1 if key in ("coding_max_concurrent_threads", "coding_max_concurrent_tasks") else default,
     )
     service = CodingRuntimeService()
 
@@ -971,18 +977,13 @@ async def test_runtime_concurrency_is_a_global_pool_across_projects(monkeypatch,
         await service.pump_queue(owner="tester")
 
         statuses = _run_statuses(isolated_coding_store, run_a_id, run_b_id)
-        # The pool (size 1) is already full with run_a in project A, so the queued run
-        # in project B must NOT start — slots are shared across all the owner's projects.
-        assert statuses == {run_a_id: "running", run_b_id: "queued"}
+        # No terminal cap: the queued run in project B starts immediately even though
+        # run_a is already running (and the legacy cap is 1).
+        assert statuses == {run_a_id: "running", run_b_id: "starting"}
         snapshot = service.queue_snapshot("tester")
-        assert snapshot["active_count"] == 1
-        assert snapshot["queued_count"] == 1
-        assert snapshot["active"] == [run_a_id]
-        assert snapshot["queued"] == [run_b_id]
-        # project_id is accepted by queue_snapshot but does not narrow the global totals.
-        project_b_queue = service.queue_snapshot("tester", project_id=project_b_id)
-        assert project_b_queue["active_count"] == 1
-        assert project_b_queue["queued_count"] == 1
+        assert snapshot["active_count"] == 2
+        assert snapshot["queued_count"] == 0
+        assert set(snapshot["active"]) == {run_a_id, run_b_id}
     finally:
         service._active_tasks.pop(run_a_id, None)
 
@@ -1306,7 +1307,9 @@ async def test_event_persistence_replays_from_db_and_mirrors_run_dir(isolated_co
 
 
 @pytest.mark.asyncio
-async def test_runtime_max_concurrency_one_drains_queued_runs(monkeypatch, isolated_coding_store):
+async def test_terminals_launch_concurrently_without_a_cap(monkeypatch, isolated_coding_store):
+    # With the terminal cap removed, a second run launches immediately rather than
+    # queueing behind the first — even with the legacy cap pinned to 1.
     import src.coding_runtime as coding_runtime
     from src.coding_runtime import CodingRuntimeService
 
@@ -1350,8 +1353,12 @@ async def test_runtime_max_concurrency_one_drains_queued_runs(monkeypatch, isola
         command=fast_command,
         cwd=str(isolated_coding_store.workspace),
     )
-    assert _run_statuses(isolated_coding_store, second_run.id)[second_run.id] == "queued"
-    assert service.queue_snapshot("tester")["max_concurrent"] == 1
+    # Launches right away (not held in "queued") while the first run is still going.
+    await _wait_for(
+        lambda: _run_statuses(isolated_coding_store, second_run.id).get(second_run.id)
+        in {"starting", "running", "exited"}
+    )
+    assert _run_statuses(isolated_coding_store, second_run.id)[second_run.id] != "queued"
 
     await _wait_for(
         lambda: _run_statuses(isolated_coding_store, first_run.id, second_run.id)
@@ -1367,7 +1374,8 @@ async def test_runtime_max_concurrency_one_drains_queued_runs(monkeypatch, isola
     second_reloaded = _load_run(isolated_coding_store, second_run.id)
     assert first_reloaded.exit_code == 0
     assert second_reloaded.exit_code == 0
-    assert first_reloaded.finished_at <= second_reloaded.started_at
+    # Concurrency, not queueing: the second run started before the first finished.
+    assert second_reloaded.started_at < first_reloaded.finished_at
 
     first_events = [event.kind for event in service.get_events(first_thread_id, "tester")]
     second_events = [event.kind for event in service.get_events(second_thread_id, "tester")]
@@ -1507,3 +1515,22 @@ async def test_manage_coding_runs_thread_and_reads_events(monkeypatch, isolated_
     queue = await do_manage_coding(json.dumps({"action": "queue"}), owner="tester")
     assert queue["queue"]["queued_count"] == 0
     assert queue["queue"]["active_count"] == 0
+
+
+def test_queue_response_includes_task_slot_snapshot(coding_client, isolated_coding_store):
+    from src.coding_task_slots import get_task_slot_service
+
+    svc = get_task_slot_service()  # process singleton — isolate from other tests
+    svc._holders.clear()
+    svc._waiters.clear()
+    svc._limits.clear()
+
+    client, _runtime = coding_client
+    response = client.get("/api/coding/queue")
+    assert response.status_code == 200
+    task_slots = response.json()["queue"]["task_slots"]
+    # Shape the UI relies on for the badge/popover (idle owner → empty, zeroed).
+    assert task_slots["active_total"] == 0
+    assert task_slots["waiting_total"] == 0
+    assert task_slots["endpoints"] == []
+    assert "default_limit" in task_slots

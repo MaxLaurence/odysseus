@@ -60,6 +60,7 @@ const state = {
   queueLoaded: false,
   queueByProject: [],
   queueMax: 0,
+  taskSlots: null,
   activeMobileTab: 'projects',
   source: null,
   lastSeq: 0,
@@ -1500,13 +1501,12 @@ function mountPane(leaf, leafEl) {
   try { term.loadAddon(new window.ClipboardAddon.ClipboardAddon()); } catch (_) { /* optional */ }
   term.open(termEl);
 
-  let webgl = null;
-  try {
-    webgl = new window.WebglAddon.WebglAddon();
-    term.loadAddon(webgl);
-  } catch (_) {
-    webgl = null; // no WebGL2 → xterm keeps its DOM renderer
-  }
+  // Intentionally NOT using the WebGL renderer. A browser keeps only a handful of
+  // live WebGL contexts, so with several terminal panes the inactive ones lose their
+  // context and render garbage (rows of dots) — and per-pane context churn on
+  // focus/resize made it worse. xterm's default DOM renderer has no context limit
+  // and is plenty fast for agent output, so every pane renders reliably.
+  const webgl = null;
 
   const session = {
     paneId: leaf.paneId,
@@ -2132,7 +2132,7 @@ function renderAll() {
   renderThreadDetail();
   renderRunStatus();
   renderMobileTabs();
-  renderLauncherBadges(activeRunCount());
+  renderLauncherBadges(launcherCount());
 }
 
 function renderProjectEditForm() {
@@ -2157,12 +2157,9 @@ function renderHeader() {
     const project = state.selectedProject || state.projects.find((item) => item.id === state.selectedProjectId);
     meta.textContent = project ? `${project.name} - ${state.threads.length} thread${state.threads.length === 1 ? '' : 's'}` : 'Coding workspace';
   }
-  const badge = q('#code-station-queue-badge');
-  if (badge) {
-    const count = activeRunCount();
-    badge.textContent = count ? `${count} active` : '0 active';
-    badge.className = `code-station-pill ${count ? 'queued' : 'muted'}`;
-  }
+  // The header/rail/sidebar badges all reflect LLM-call (task) activity; delegate
+  // to the single renderer so they stay consistent.
+  renderLauncherBadges(launcherCount());
 }
 
 function renderProjects() {
@@ -2445,9 +2442,53 @@ function queueBreakdownLabel() {
   }).join(' · ');
 }
 
+// Task-slot (LLM-call) view — the real concurrency limit now that terminals are
+// uncapped. Returns null when no LLM-call activity is tracked (e.g. non-hooked
+// harnesses), so the badge falls back to terminal-run activity.
+function taskSlotSummary() {
+  const ts = state.taskSlots;
+  if (!ts) return null;
+  const active = Number(ts.active_total) || 0;
+  const waiting = Number(ts.waiting_total) || 0;
+  if (!active && !waiting) return null;
+  return { active, waiting, endpoints: Array.isArray(ts.endpoints) ? ts.endpoints : [] };
+}
+
+function launcherCount() {
+  const ts = taskSlotSummary();
+  if (ts) return ts.active + ts.waiting;
+  return activeRunCount();
+}
+
+function launcherLabel(count) {
+  const ts = taskSlotSummary();
+  if (ts) {
+    const parts = [];
+    if (ts.active) parts.push(`${ts.active} running`);
+    if (ts.waiting) parts.push(`${ts.waiting} waiting`);
+    return `${parts.join(', ')} (LLM calls)`;
+  }
+  return queueActivityLabel(count);
+}
+
+// Per-endpoint breakdown for the badge tooltip, e.g. "local-7b: 2/2 · 1 waiting".
+function taskBreakdownLabel() {
+  const ts = taskSlotSummary();
+  if (!ts) return queueBreakdownLabel();
+  return ts.endpoints
+    .filter((e) => (Number(e.active) || 0) + (Number(e.waiting) || 0) > 0)
+    .map((e) => {
+      const name = e.endpoint_name || e.endpoint || 'endpoint';
+      let summary = `${name}: ${e.active || 0}/${e.limit || 0}`;
+      if (e.waiting) summary += ` · ${e.waiting} waiting`;
+      return summary;
+    })
+    .join(' · ');
+}
+
 function renderLauncherBadges(count) {
-  const label = queueActivityLabel(count);
-  const breakdown = queueBreakdownLabel();
+  const label = launcherLabel(count);
+  const breakdown = taskBreakdownLabel();
   const tip = breakdown || label;
   const rail = document.getElementById('rail-code-count');
   const sidebar = document.getElementById('code-sidebar-badge');
@@ -2467,7 +2508,7 @@ function renderLauncherBadges(count) {
   if (header) {
     header.textContent = label;
     header.className = `code-station-pill ${count ? 'queued' : 'muted'}`;
-    header.title = breakdown ? `${breakdown} — click for details` : 'No coding runs active';
+    header.title = breakdown ? `${breakdown} — click for details` : 'No LLM calls active';
   }
   const foot = q('#code-station-queue-foot');
   if (foot) foot.textContent = label;
@@ -2484,14 +2525,16 @@ export async function refreshBadges() {
     state.queue = normalizeQueue(data);
     state.queueByProject = Array.isArray(queue.by_project) ? queue.by_project : [];
     state.queueMax = Number(queue.max_concurrent) || 0;
+    state.taskSlots = (queue.task_slots && typeof queue.task_slots === 'object') ? queue.task_slots : null;
     state.queueLoaded = true;
   } catch (_) {
     state.queue = [];
     state.queueByProject = [];
     state.queueMax = 0;
+    state.taskSlots = null;
     state.queueLoaded = false;
   }
-  renderLauncherBadges(activeRunCount());
+  renderLauncherBadges(launcherCount());
   updateProjectQueuePills();
   renderQueuePopover();
 }
@@ -2539,56 +2582,65 @@ function toggleQueuePopover(force) {
 
 // The "queue panel grouped by project": active + queued runs across all projects,
 // bucketed under their project so the shared pool's usage is fully legible.
+// Grouped by model endpoint: each endpoint's slot usage (active/limit), plus the
+// runs whose LLM call is in flight or waiting for a slot.
 function renderQueuePopover() {
   const pop = q('#cs-queue-popover');
   if (!pop) return;
-  const runs = (Array.isArray(state.queue) ? state.queue : []).filter(
-    (run) => ACTIVE_STATUSES.has(statusClass(run.status)),
-  );
   pop.replaceChildren();
+
+  const ts = state.taskSlots;
+  const endpoints = (ts && Array.isArray(ts.endpoints)) ? ts.endpoints : [];
+  const activeTotal = ts ? (Number(ts.active_total) || 0) : 0;
+  const waitingTotal = ts ? (Number(ts.waiting_total) || 0) : 0;
+  // Map run id → thread title for friendly labels.
+  const titleByRun = new Map(
+    (Array.isArray(state.queue) ? state.queue : []).map(
+      (r) => [asId(r.id ?? r.run_id), r.thread_title || r.project_name || ''],
+    ),
+  );
 
   const head = document.createElement('div');
   head.className = 'cs-queue-pop-head';
-  const running = runs.filter((r) => statusClass(r.status) === 'running').length;
-  head.textContent = state.queueMax
-    ? `${running} of ${state.queueMax} slots in use`
-    : `${running} running`;
+  head.textContent = `${activeTotal} LLM call${activeTotal === 1 ? '' : 's'} in flight`
+    + (waitingTotal ? ` · ${waitingTotal} waiting` : '');
   pop.appendChild(head);
 
-  if (!runs.length) {
+  if (!endpoints.length) {
     const empty = document.createElement('div');
     empty.className = 'cs-queue-pop-empty';
-    empty.textContent = 'No coding runs active.';
+    empty.textContent = 'No LLM calls active.';
     pop.appendChild(empty);
     return;
   }
 
-  const groups = new Map();
-  for (const run of runs) {
-    const pid = asId(run.project_id) || 'unknown';
-    if (!groups.has(pid)) groups.set(pid, { name: run.project_name || 'Untitled project', runs: [] });
-    groups.get(pid).runs.push(run);
-  }
-  for (const group of groups.values()) {
+  for (const ep of endpoints) {
     const section = document.createElement('div');
     section.className = 'cs-queue-pop-group';
     const title = document.createElement('div');
     title.className = 'cs-queue-pop-project';
-    title.textContent = `${group.name} · ${group.runs.length}`;
+    let label = `${ep.endpoint_name || ep.endpoint || 'endpoint'} · ${ep.active || 0}/${ep.limit || 0}`;
+    if (ep.waiting) label += ` · ${ep.waiting} waiting`;
+    title.textContent = label;
     section.appendChild(title);
-    for (const run of group.runs) {
+
+    const rows = [
+      ...(Array.isArray(ep.active_runs) ? ep.active_runs : []).map((rid) => ({ rid, running: true })),
+      ...(Array.isArray(ep.waiting_runs) ? ep.waiting_runs : []).map((rid) => ({ rid, running: false })),
+    ];
+    for (const row of rows) {
       const rowEl = document.createElement('div');
       rowEl.className = 'cs-queue-pop-run';
       const dot = document.createElement('span');
       dot.className = 'cs-thread-dot';
-      dot.dataset.status = statusClass(run.status);
-      const name = document.createElement('span');
-      name.className = 'cs-queue-pop-run-title';
-      name.textContent = run.thread_title || run.id || 'run';
-      const status = document.createElement('span');
-      status.className = 'cs-queue-pop-run-status';
-      status.textContent = statusClass(run.status);
-      rowEl.append(dot, name, status);
+      dot.dataset.status = row.running ? 'running' : 'queued';
+      const titleEl = document.createElement('span');
+      titleEl.className = 'cs-queue-pop-run-title';
+      titleEl.textContent = titleByRun.get(asId(row.rid)) || row.rid;
+      const statusEl = document.createElement('span');
+      statusEl.className = 'cs-queue-pop-run-status';
+      statusEl.textContent = row.running ? 'running' : 'waiting';
+      rowEl.append(dot, titleEl, statusEl);
       section.appendChild(rowEl);
     }
     pop.appendChild(section);

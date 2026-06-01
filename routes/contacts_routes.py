@@ -18,11 +18,12 @@ from fastapi import APIRouter, Query, Depends, Response
 from typing import List, Dict, Optional
 
 from src.auth_helpers import require_user
+from src.constants import DATA_DIR as _APP_DATA_DIR
 from core.middleware import require_admin
 
 logger = logging.getLogger(__name__)
 
-DATA_DIR = Path(__file__).resolve().parent.parent / "data"
+DATA_DIR = Path(_APP_DATA_DIR)
 SETTINGS_FILE = DATA_DIR / "settings.json"
 LOCAL_CONTACTS_FILE = DATA_DIR / "contacts.json"
 

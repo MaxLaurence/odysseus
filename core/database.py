@@ -1,7 +1,7 @@
 import os
 import logging
 from datetime import datetime
-from sqlalchemy import create_engine, Column, String, Text, Boolean, DateTime, Integer, ForeignKey, JSON, Index, func, text
+from sqlalchemy import create_engine, Column, String, Text, Boolean, DateTime, Integer, ForeignKey, JSON, Index, UniqueConstraint, func, text
 from sqlalchemy.types import TypeDecorator
 from sqlalchemy.ext.declarative import declarative_base, declared_attr
 from sqlalchemy.orm import relationship, sessionmaker, backref
@@ -567,6 +567,138 @@ class EditorDraft(TimestampMixin, Base):
 
     __table_args__ = (
         Index('ix_editor_drafts_owner_updated', 'owner', 'is_active', 'updated_at'),
+    )
+
+
+class CodingProject(TimestampMixin, Base):
+    """Root workspace registered for the coding station."""
+    __tablename__ = "coding_projects"
+
+    id                  = Column(String, primary_key=True, index=True)
+    owner               = Column(String, nullable=True, index=True)
+    name                = Column(String, nullable=False)
+    root_path           = Column(Text, nullable=False)
+    description         = Column(Text, nullable=True)
+    default_harness     = Column(String, nullable=False, default="generic")
+    default_endpoint_id = Column(String, nullable=True)
+    default_model       = Column(String, nullable=True)
+    archived            = Column(Boolean, default=False, nullable=False)
+
+    threads = relationship("CodingThread", back_populates="project", cascade="all, delete-orphan")
+
+    __table_args__ = (
+        Index('ix_coding_projects_owner_archived', 'owner', 'archived', 'updated_at'),
+    )
+
+
+class CodingThread(TimestampMixin, Base):
+    """Pinned or resumable terminal/agent thread inside a coding project."""
+    __tablename__ = "coding_threads"
+
+    id                = Column(String, primary_key=True, index=True)
+    project_id        = Column(String, ForeignKey("coding_projects.id", ondelete="CASCADE"), nullable=False, index=True)
+    owner             = Column(String, nullable=True, index=True)
+    session_id        = Column(String, ForeignKey("sessions.id", ondelete="SET NULL"), nullable=True, index=True)
+    title             = Column(String, nullable=False, default="Untitled Thread")
+    cwd               = Column(Text, nullable=False)
+    harness_id        = Column(String, nullable=False, default="generic")
+    model_endpoint_id = Column(String, nullable=True)
+    model             = Column(String, nullable=True)
+    pinned_at         = Column(DateTime, nullable=True, index=True)
+    status            = Column(String, nullable=False, default="idle")
+    last_run_id       = Column(String, nullable=True)
+    metadata_json     = Column(Text, nullable=True)
+
+    project = relationship("CodingProject", back_populates="threads")
+    session = relationship("Session", backref=backref("coding_threads", cascade="save-update, merge"))
+    runs = relationship("CodingRun", back_populates="thread", cascade="all, delete-orphan")
+    events = relationship("CodingThreadEvent", back_populates="thread", cascade="all, delete-orphan")
+    model_config_snapshots = relationship(
+        "CodingModelConfigSnapshot",
+        back_populates="thread",
+        cascade="all, delete-orphan",
+    )
+
+    __table_args__ = (
+        Index('ix_coding_threads_owner_project', 'owner', 'project_id', 'updated_at'),
+        Index('ix_coding_threads_owner_pinned', 'owner', 'pinned_at'),
+        Index('ix_coding_threads_status', 'status'),
+    )
+
+
+class CodingRun(Base):
+    """Single terminal/CLI execution attached to a coding thread."""
+    __tablename__ = "coding_runs"
+
+    id              = Column(String, primary_key=True, index=True)
+    thread_id       = Column(String, ForeignKey("coding_threads.id", ondelete="CASCADE"), nullable=False, index=True)
+    owner           = Column(String, nullable=True, index=True)
+    harness_id      = Column(String, nullable=False, default="generic")
+    status          = Column(String, nullable=False, default="queued")
+    command         = Column(Text, nullable=False)
+    cwd             = Column(Text, nullable=False)
+    tmux_session    = Column(String, nullable=True)
+    run_dir         = Column(Text, nullable=True)
+    log_path        = Column(Text, nullable=True)
+    exit_code       = Column(Integer, nullable=True)
+    error           = Column(Text, nullable=True)
+    queued_at       = Column(DateTime, nullable=False, default=datetime.utcnow, index=True)
+    started_at      = Column(DateTime, nullable=True)
+    finished_at     = Column(DateTime, nullable=True)
+    idempotency_key = Column(String, nullable=True, index=True)
+    metadata_json   = Column(Text, nullable=True)
+
+    thread = relationship("CodingThread", back_populates="runs")
+    events = relationship("CodingThreadEvent", back_populates="run", cascade="all, delete-orphan")
+
+    __table_args__ = (
+        Index('ix_coding_runs_owner_status', 'owner', 'status', 'queued_at'),
+        Index('ix_coding_runs_thread_status', 'thread_id', 'status', 'queued_at'),
+        Index('ix_coding_runs_idempotency', 'thread_id', 'owner', 'idempotency_key'),
+    )
+
+
+class CodingThreadEvent(Base):
+    """Persisted event stream for replayable coding terminals."""
+    __tablename__ = "coding_thread_events"
+
+    id           = Column(Integer, primary_key=True, autoincrement=True)
+    thread_id    = Column(String, ForeignKey("coding_threads.id", ondelete="CASCADE"), nullable=False, index=True)
+    run_id       = Column(String, ForeignKey("coding_runs.id", ondelete="SET NULL"), nullable=True, index=True)
+    seq          = Column(Integer, nullable=False)
+    kind         = Column(String, nullable=False)
+    payload_json = Column(Text, nullable=False, default="{}")
+    created_at   = Column(DateTime, nullable=False, default=datetime.utcnow)
+
+    thread = relationship("CodingThread", back_populates="events")
+    run = relationship("CodingRun", back_populates="events")
+
+    __table_args__ = (
+        UniqueConstraint('thread_id', 'seq', name='uq_coding_thread_events_thread_seq'),
+        Index('ix_coding_thread_events_thread_seq', 'thread_id', 'seq'),
+        Index('ix_coding_thread_events_run_seq', 'run_id', 'seq'),
+    )
+
+
+class CodingModelConfigSnapshot(Base):
+    """Thread-level model config snapshot for derive/restore operations."""
+    __tablename__ = "coding_model_config_snapshots"
+
+    id           = Column(String, primary_key=True, index=True)
+    thread_id    = Column(String, ForeignKey("coding_threads.id", ondelete="CASCADE"), nullable=False, index=True)
+    owner        = Column(String, nullable=True, index=True)
+    source       = Column(String, nullable=False)
+    endpoint_id  = Column(String, nullable=True)
+    model        = Column(String, nullable=True)
+    payload_json = Column(Text, nullable=False, default="{}")
+    created_at   = Column(DateTime, nullable=False, default=datetime.utcnow)
+    restored_at  = Column(DateTime, nullable=True)
+
+    thread = relationship("CodingThread", back_populates="model_config_snapshots")
+
+    __table_args__ = (
+        Index('ix_coding_model_snapshots_thread_created', 'thread_id', 'created_at'),
+        Index('ix_coding_model_snapshots_owner', 'owner', 'created_at'),
     )
 
 

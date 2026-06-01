@@ -236,6 +236,128 @@ def _uid_from_fetch_meta(meta_b: bytes) -> str:
     return m.group(1).decode() if m else ""
 
 
+_IMAP_SEQUENCE_SCAN_CHUNK = 500
+
+
+def _selected_message_count(select_data) -> int:
+    for part in select_data or []:
+        raw = part.decode(errors="ignore") if isinstance(part, (bytes, bytearray)) else str(part)
+        raw = raw.strip()
+        if raw.isdigit():
+            return int(raw)
+    return 0
+
+
+def _status_unseen_count(conn, folder: str) -> int | None:
+    try:
+        status, data = conn.status(_q(folder), "(UNSEEN)")
+        if status != "OK":
+            return None
+        for part in data or []:
+            raw = part.decode(errors="ignore") if isinstance(part, (bytes, bytearray)) else str(part)
+            m = re.search(r"\bUNSEEN\s+(\d+)\b", raw, re.I)
+            if m:
+                return int(m.group(1))
+    except Exception:
+        return None
+    return None
+
+
+def _fetch_sequence_uid_flags(conn, seq_start: int, seq_end: int) -> list[tuple[int, bytes, str]]:
+    if seq_start < 1 or seq_end < seq_start:
+        return []
+    status, data = conn.fetch(f"{seq_start}:{seq_end}", "(UID FLAGS)")
+    if status != "OK":
+        return []
+
+    rows: list[tuple[int, bytes, str]] = []
+    for part in data or []:
+        meta = part[0] if isinstance(part, tuple) else part
+        meta_b = meta if isinstance(meta, (bytes, bytearray)) else str(meta).encode()
+        seq_m = re.match(rb"\s*(\d+)\s+\(", meta_b)
+        uid = _uid_from_fetch_meta(meta_b)
+        if not seq_m or not uid:
+            continue
+        flag_m = re.search(rb"FLAGS \(([^)]*)\)", meta_b)
+        flags = flag_m.group(1).decode(errors="replace") if flag_m else ""
+        rows.append((int(seq_m.group(1)), uid.encode(), flags))
+    return rows
+
+
+def _flags_match_filter(flags: str, filter_: str) -> bool:
+    flags_l = (flags or "").lower()
+    seen = "\\seen" in flags_l
+    answered = "\\answered" in flags_l
+    flagged = "\\flagged" in flags_l
+    if filter_ == "all":
+        return True
+    if filter_ == "unread":
+        return not seen
+    if filter_ == "favorites":
+        return flagged
+    if filter_ == "unanswered":
+        return not seen and not answered
+    if filter_ == "undone":
+        return not answered
+    return False
+
+
+def _recent_uid_candidates_from_sequence(
+    conn,
+    folder: str,
+    selected_count: int,
+    limit: int,
+    offset: int,
+    filter_: str,
+    has_attachments_only: bool,
+) -> tuple[list[bytes], int]:
+    """Return newest-first UID candidates without a giant UID SEARCH response."""
+    selected_count = max(0, int(selected_count or 0))
+    limit = max(0, int(limit or 0))
+    offset = max(0, int(offset or 0))
+    if selected_count <= 0 or limit <= 0:
+        return [], 0 if filter_ != "all" else selected_count
+
+    if filter_ == "all":
+        candidate_count = max(400, offset + limit * 8) if has_attachments_only else limit
+        skip = 0 if has_attachments_only else offset
+        seq_end = selected_count - skip
+        if seq_end < 1:
+            return [], selected_count
+        seq_start = max(1, seq_end - candidate_count + 1)
+        rows = _fetch_sequence_uid_flags(conn, seq_start, seq_end)
+        rows.sort(key=lambda row: row[0], reverse=True)
+        return [uid for _, uid, _ in rows], selected_count
+
+    match_total = _status_unseen_count(conn, folder) if filter_ == "unread" else None
+    needed = max(400, offset + limit * 8) if has_attachments_only else offset + limit
+    matches: list[bytes] = []
+    seq_end = selected_count
+    exhausted = False
+
+    while seq_end >= 1 and len(matches) < needed:
+        seq_start = max(1, seq_end - _IMAP_SEQUENCE_SCAN_CHUNK + 1)
+        rows = _fetch_sequence_uid_flags(conn, seq_start, seq_end)
+        rows.sort(key=lambda row: row[0], reverse=True)
+        for _, uid, flags in rows:
+            if _flags_match_filter(flags, filter_):
+                matches.append(uid)
+                if len(matches) >= needed:
+                    break
+        exhausted = seq_start == 1
+        seq_end = seq_start - 1
+
+    if has_attachments_only:
+        page = matches[:needed]
+    else:
+        page = matches[offset:offset + limit]
+
+    total = match_total if match_total is not None else len(matches)
+    if match_total is None and not exhausted:
+        total = max(total, offset + len(page) + (1 if len(matches) >= needed else 0))
+    return page, total
+
+
 def _smtp_ready(cfg: dict) -> bool:
     return bool(cfg.get("smtp_host") and cfg.get("smtp_user") and cfg.get("smtp_password"))
 
@@ -593,10 +715,11 @@ def setup_email_routes():
         """
         try:
             conn = _imap_connect(account_id, owner=owner)
-            select_status, _ = conn.select(_q(folder), readonly=True)
+            select_status, select_data = conn.select(_q(folder), readonly=True)
             if select_status != "OK":
                 conn.logout()
                 return {"emails": [], "total": 0, "folder": folder, "error": f"Folder not found: {folder}"}
+            selected_count = _selected_message_count(select_data)
 
             from_clause = ""
             if from_addr:
@@ -604,7 +727,19 @@ def setup_email_routes():
                 _safe = from_addr.replace("\\", "\\\\").replace('"', '\\"')
                 from_clause = f' FROM "{_safe}"'
 
-            if filter_ == "unread":
+            uid_list = None
+            if not from_clause and filter_ in {"all", "unread"}:
+                uid_list, total = _recent_uid_candidates_from_sequence(
+                    conn,
+                    folder=folder,
+                    selected_count=selected_count,
+                    limit=limit,
+                    offset=offset,
+                    filter_=filter_,
+                    has_attachments_only=has_attachments_only,
+                )
+                status, data = "OK", []
+            elif filter_ == "unread":
                 status, data = _imap_uid_search(conn, f"(UNSEEN{from_clause})")
             elif filter_ == "favorites":
                 # Flagged/favorited emails (the star toggle sets the \Flagged flag).
@@ -718,22 +853,26 @@ def setup_email_routes():
             else:
                 status, data = _imap_uid_search(conn, "ALL")
 
-            if status != "OK" or not data[0]:
-                conn.logout()
-                return {"emails": [], "total": 0, "folder": folder}
+            if uid_list is None:
+                if status != "OK" or not data[0]:
+                    conn.logout()
+                    return {"emails": [], "total": 0, "folder": folder}
 
-            uid_list = data[0].split()
-            total = len(uid_list)
-            # Reverse for newest first, apply pagination
-            uid_list = list(reversed(uid_list))
-            if has_attachments_only:
-                # Can't filter via IMAP — widen the window so post-filter
-                # still yields enough rows to fill `limit` after dropping
-                # rows without attachments.
-                scan_window = max(400, offset + limit * 8)
-                uid_list = uid_list[:scan_window]
-            else:
-                uid_list = uid_list[offset:offset + limit]
+                uid_list = data[0].split()
+                total = len(uid_list)
+                # Reverse for newest first, apply pagination
+                uid_list = list(reversed(uid_list))
+                if has_attachments_only:
+                    # Can't filter via IMAP — widen the window so post-filter
+                    # still yields enough rows to fill `limit` after dropping
+                    # rows without attachments.
+                    scan_window = max(400, offset + limit * 8)
+                    uid_list = uid_list[:scan_window]
+                else:
+                    uid_list = uid_list[offset:offset + limit]
+            elif not uid_list:
+                conn.logout()
+                return {"emails": [], "total": total, "folder": folder, "offset": offset}
 
             # Preload tag rows once — keyed by uid (as str) for the emails we'll render
             _tag_by_uid = {}

@@ -15,11 +15,12 @@ import time
 from pathlib import Path
 from typing import Optional, Dict
 
+from src.constants import DATA_DIR
 from src.research_utils import strip_thinking, is_low_quality
 
 logger = logging.getLogger(__name__)
 
-RESEARCH_DATA_DIR = Path("data/deep_research")
+RESEARCH_DATA_DIR = Path(DATA_DIR) / "deep_research"
 
 
 def _bounded_int(value, *, default: int, minimum: int, maximum: int) -> int:

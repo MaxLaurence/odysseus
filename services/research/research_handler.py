@@ -14,9 +14,11 @@ import time
 from pathlib import Path
 from typing import Optional, Dict
 
+from src.constants import DATA_DIR
+
 logger = logging.getLogger(__name__)
 
-RESEARCH_DATA_DIR = Path("data/deep_research")
+RESEARCH_DATA_DIR = Path(DATA_DIR) / "deep_research"
 
 
 class ResearchHandler:

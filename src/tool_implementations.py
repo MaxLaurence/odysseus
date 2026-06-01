@@ -1024,6 +1024,619 @@ async def do_manage_tasks(content: str, owner: Optional[str] = None) -> Dict:
 
 
 # ---------------------------------------------------------------------------
+# Coding Station management tool
+# ---------------------------------------------------------------------------
+
+def _coding_json_loads(value: str | None, fallback: Any) -> Any:
+    if not value:
+        return fallback
+    try:
+        return json.loads(value)
+    except Exception:
+        return fallback
+
+
+def _coding_iso(value) -> str | None:
+    return value.isoformat() if value else None
+
+
+def _coding_error(message: str, status_code: int | None = None) -> Dict:
+    result: Dict[str, Any] = {"error": message, "exit_code": 1}
+    if status_code is not None:
+        result["status_code"] = status_code
+    return result
+
+
+def _coding_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _coding_project_dict(project) -> Dict[str, Any]:
+    return {
+        "id": project.id,
+        "owner": project.owner,
+        "name": project.name,
+        "root_path": project.root_path,
+        "description": project.description or "",
+        "default_harness": project.default_harness or "generic",
+        "default_endpoint_id": project.default_endpoint_id or "",
+        "default_model": project.default_model or "",
+        "archived": bool(project.archived),
+        "created_at": _coding_iso(project.created_at),
+        "updated_at": _coding_iso(project.updated_at),
+    }
+
+
+def _coding_thread_dict(thread, model_config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    result = {
+        "id": thread.id,
+        "project_id": thread.project_id,
+        "owner": thread.owner,
+        "session_id": thread.session_id,
+        "title": thread.title,
+        "cwd": thread.cwd,
+        "harness_id": thread.harness_id or "generic",
+        "model_endpoint_id": thread.model_endpoint_id or "",
+        "model": thread.model or "",
+        "pinned_at": _coding_iso(thread.pinned_at),
+        "status": thread.status or "idle",
+        "last_run_id": thread.last_run_id,
+        "metadata": _coding_json_loads(thread.metadata_json, {}),
+        "created_at": _coding_iso(thread.created_at),
+        "updated_at": _coding_iso(thread.updated_at),
+    }
+    if model_config is not None:
+        result["model_config"] = model_config
+    return result
+
+
+def _coding_run_dict(run) -> Dict[str, Any]:
+    return {
+        "id": run.id,
+        "thread_id": run.thread_id,
+        "owner": run.owner,
+        "harness_id": run.harness_id,
+        "status": run.status,
+        "command": run.command,
+        "cwd": run.cwd,
+        "tmux_session": run.tmux_session,
+        "run_dir": run.run_dir,
+        "log_path": run.log_path,
+        "exit_code": run.exit_code,
+        "error": run.error,
+        "queued_at": _coding_iso(run.queued_at),
+        "started_at": _coding_iso(run.started_at),
+        "finished_at": _coding_iso(run.finished_at),
+        "idempotency_key": run.idempotency_key,
+        "metadata": _coding_json_loads(run.metadata_json, {}),
+    }
+
+
+def _coding_event_dict(event) -> Dict[str, Any]:
+    return {
+        "id": event.id,
+        "thread_id": event.thread_id,
+        "run_id": event.run_id,
+        "seq": event.seq,
+        "kind": event.kind,
+        "payload": _coding_json_loads(event.payload_json, {}),
+        "created_at": _coding_iso(event.created_at),
+    }
+
+
+def _coding_snapshot_dict(snapshot) -> Dict[str, Any]:
+    return {
+        "id": snapshot.id,
+        "thread_id": snapshot.thread_id,
+        "owner": snapshot.owner,
+        "source": snapshot.source,
+        "endpoint_id": snapshot.endpoint_id or "",
+        "model": snapshot.model or "",
+        "payload": _coding_json_loads(snapshot.payload_json, {}),
+        "created_at": _coding_iso(snapshot.created_at),
+        "restored_at": _coding_iso(snapshot.restored_at),
+    }
+
+
+def _coding_log_tail(run, chars: int) -> str:
+    if chars <= 0 or not getattr(run, "log_path", None):
+        return ""
+    try:
+        from pathlib import Path
+
+        path = Path(run.log_path)
+        if not path.exists() or not path.is_file():
+            return ""
+        size = path.stat().st_size
+        read_size = min(max(chars, 0), 50_000, size)
+        with path.open("rb") as f:
+            f.seek(max(0, size - read_size))
+            return f.read(read_size).decode("utf-8", errors="replace")
+    except Exception:
+        logger.debug("Failed to read coding run log tail", exc_info=True)
+        return ""
+
+
+async def do_manage_coding(content: str, owner: Optional[str] = None) -> Dict:
+    """Owner-scoped Coding Station tool wrapper.
+
+    This intentionally mirrors routes/coding_routes.py but stays in-process so
+    agent tools do not call back through HTTP. Runtime operations are delegated
+    to src.coding_runtime; harness/model behavior is delegated to the coding
+    harness and model-config modules.
+    """
+    import uuid as _uuid
+    from datetime import datetime
+    from pathlib import Path
+
+    from core.database import (
+        CodingProject,
+        CodingRun,
+        CodingThread,
+        CodingThreadEvent,
+        SessionLocal,
+    )
+    from src.coding_harnesses import get_harness, list_harnesses
+    from src.coding_model_config import (
+        apply_current_model_config,
+        derive_odysseus_model_config,
+        restore_previous_model_config,
+        thread_model_config,
+    )
+    from src.coding_runtime import (
+        BLOCKING_STATUSES,
+        CodingRuntimeError,
+        get_coding_runtime_service,
+    )
+
+    try:
+        args = _parse_tool_args(content)
+    except ValueError:
+        return _coding_error("Invalid JSON arguments")
+
+    action = str(args.get("action") or "list_projects").strip().lower().replace("-", "_")
+    action = {
+        "projects": "list_projects",
+        "project_list": "list_projects",
+        "new_project": "create_project",
+        "read_project": "get_project",
+        "threads": "list_threads",
+        "thread_list": "list_threads",
+        "new_thread": "create_thread",
+        "runs": "queue",
+        "list_runs": "queue",
+        "list_harnesses": "harnesses",
+        "get_model_config": "model_config",
+        "read_model_config": "model_config",
+        "derive_config": "derive_model_config",
+        "restore_model_config": "restore_config",
+    }.get(action, action)
+    owner_key = (owner or "").strip()
+    runtime = get_coding_runtime_service()
+
+    def project_query(db):
+        return db.query(CodingProject).filter(CodingProject.owner == owner_key)
+
+    def thread_query(db):
+        return db.query(CodingThread).filter(CodingThread.owner == owner_key)
+
+    def run_query(db):
+        return db.query(CodingRun).filter(CodingRun.owner == owner_key)
+
+    def require_project(db, project_id: str | None):
+        project_id = (project_id or "").strip()
+        if not project_id:
+            return None, _coding_error("project_id is required")
+        project = project_query(db).filter(CodingProject.id == project_id).first()
+        if not project:
+            return None, _coding_error("Project not found", 404)
+        return project, None
+
+    def require_thread(db, thread_id: str | None):
+        thread_id = (thread_id or "").strip()
+        if not thread_id:
+            return None, _coding_error("thread_id is required")
+        thread = thread_query(db).filter(CodingThread.id == thread_id).first()
+        if not thread:
+            return None, _coding_error("Thread not found", 404)
+        return thread, None
+
+    def require_run(db, run_id: str | None):
+        run_id = (run_id or "").strip()
+        if not run_id:
+            return None, _coding_error("run_id is required")
+        run = run_query(db).filter(CodingRun.id == run_id).first()
+        if not run:
+            return None, _coding_error("Run not found", 404)
+        return run, None
+
+    def thread_events(db, thread_id: str, after_seq: int = 0, run_id: str | None = None):
+        query = (
+            db.query(CodingThreadEvent)
+            .filter(CodingThreadEvent.thread_id == thread_id, CodingThreadEvent.seq > after_seq)
+        )
+        if run_id:
+            query = query.filter(CodingThreadEvent.run_id == run_id)
+        return query.order_by(CodingThreadEvent.seq.asc()).all()
+
+    try:
+        if action == "harnesses":
+            harnesses = list_harnesses()
+            return {"response": f"{len(harnesses)} harnesses", "harnesses": harnesses, "exit_code": 0}
+
+        if action in {"run_thread", "stop_run", "send_stdin", "resize_run"}:
+            try:
+                if action == "run_thread":
+                    run = await runtime.enqueue_run(
+                        thread_id=(args.get("thread_id") or "").strip(),
+                        owner=owner_key,
+                        command=args.get("command"),
+                        cwd=args.get("cwd"),
+                        harness_id=args.get("harness_id"),
+                        model_endpoint_id=args.get("model_endpoint_id"),
+                        model=args.get("model"),
+                        replace=bool(args.get("replace", False)),
+                        idempotency_key=args.get("idempotency_key"),
+                        metadata=args.get("metadata") if isinstance(args.get("metadata"), dict) else None,
+                    )
+                    return {"response": f"Queued coding run {run.id}", "run": _coding_run_dict(run), "exit_code": 0}
+                if action == "stop_run":
+                    run = await runtime.stop_run((args.get("run_id") or "").strip(), owner_key, reason=args.get("reason") or "stopped")
+                    return {"response": f"Stopped coding run {run.id}", "run": _coding_run_dict(run), "exit_code": 0}
+                if action == "send_stdin":
+                    if args.get("data") is None:
+                        return _coding_error("data is required for send_stdin")
+                    run = await runtime.send_stdin((args.get("run_id") or "").strip(), owner_key, str(args.get("data")))
+                    return {"response": f"Sent stdin to coding run {run.id}", "run": _coding_run_dict(run), "exit_code": 0}
+                cols = _coding_int(args.get("cols"), 0)
+                rows = _coding_int(args.get("rows"), 0)
+                if cols <= 0 or rows <= 0:
+                    return _coding_error("cols and rows must be positive integers for resize_run")
+                run = await runtime.resize((args.get("run_id") or "").strip(), owner_key, cols, rows)
+                return {"response": f"Resized coding run {run.id}", "run": _coding_run_dict(run), "exit_code": 0}
+            except CodingRuntimeError as exc:
+                return _coding_error(exc.detail, exc.status_code)
+
+        db = SessionLocal()
+        try:
+            if action == "list_projects":
+                query = project_query(db)
+                if not bool(args.get("include_archived", False)):
+                    query = query.filter(CodingProject.archived == False)  # noqa: E712
+                limit = min(max(_coding_int(args.get("limit"), 50), 1), 200)
+                projects = query.order_by(CodingProject.updated_at.desc()).limit(limit).all()
+                return {
+                    "response": f"Found {len(projects)} coding project(s)",
+                    "projects": [_coding_project_dict(project) for project in projects],
+                    "exit_code": 0,
+                }
+
+            if action == "create_project":
+                name = (args.get("name") or "").strip()
+                if not name:
+                    return _coding_error("name is required for create_project")
+                try:
+                    harness_id = get_harness(args.get("default_harness") or "generic").id
+                except ValueError as exc:
+                    return _coding_error(str(exc), 400)
+                project = CodingProject(
+                    id=str(_uuid.uuid4()),
+                    owner=owner_key,
+                    name=name,
+                    root_path=str(Path(args.get("root_path") or os.getcwd()).expanduser()),
+                    description=args.get("description") or "",
+                    default_harness=harness_id,
+                    default_endpoint_id=(args.get("default_endpoint_id") or "").strip(),
+                    default_model=(args.get("default_model") or "").strip(),
+                    archived=False,
+                )
+                db.add(project)
+                db.commit()
+                db.refresh(project)
+                return {"response": f"Created coding project {project.name}", "project": _coding_project_dict(project), "exit_code": 0}
+
+            if action in {"get_project", "update_project", "delete_project", "archive_project", "restore_project"}:
+                project, error = require_project(db, args.get("project_id"))
+                if error:
+                    return error
+                if action == "get_project":
+                    return {"project": _coding_project_dict(project), "exit_code": 0}
+                if action == "delete_project":
+                    open_count = (
+                        db.query(CodingRun)
+                        .join(CodingThread, CodingRun.thread_id == CodingThread.id)
+                        .filter(
+                            CodingThread.project_id == project.id,
+                            CodingRun.owner == owner_key,
+                            CodingRun.status.in_(tuple(BLOCKING_STATUSES)),
+                        )
+                        .count()
+                    )
+                    if open_count:
+                        return _coding_error("Project has active coding runs; stop them before deleting", 409)
+                    name = project.name
+                    db.delete(project)
+                    db.commit()
+                    return {"response": f"Deleted coding project {name}", "exit_code": 0}
+                if action == "archive_project":
+                    project.archived = True
+                elif action == "restore_project":
+                    project.archived = False
+                else:
+                    if args.get("name") is not None:
+                        name = str(args.get("name") or "").strip()
+                        if not name:
+                            return _coding_error("name cannot be blank")
+                        project.name = name
+                    if args.get("root_path") is not None:
+                        project.root_path = str(Path(str(args.get("root_path"))).expanduser())
+                    if args.get("description") is not None:
+                        project.description = str(args.get("description") or "")
+                    if args.get("default_harness") is not None:
+                        try:
+                            project.default_harness = get_harness(args.get("default_harness")).id
+                        except ValueError as exc:
+                            return _coding_error(str(exc), 400)
+                    if args.get("default_endpoint_id") is not None:
+                        project.default_endpoint_id = str(args.get("default_endpoint_id") or "").strip()
+                    if args.get("default_model") is not None:
+                        project.default_model = str(args.get("default_model") or "").strip()
+                project.updated_at = datetime.utcnow()
+                db.commit()
+                db.refresh(project)
+                return {"response": f"Updated coding project {project.name}", "project": _coding_project_dict(project), "exit_code": 0}
+
+            if action == "list_threads":
+                query = thread_query(db)
+                project_id = (args.get("project_id") or "").strip()
+                if project_id:
+                    project, error = require_project(db, project_id)
+                    if error:
+                        return error
+                    query = query.filter(CodingThread.project_id == project.id)
+                limit = min(max(_coding_int(args.get("limit"), 50), 1), 200)
+                threads = (
+                    query.order_by(
+                        CodingThread.pinned_at.is_(None),
+                        CodingThread.pinned_at.desc(),
+                        CodingThread.updated_at.desc(),
+                    )
+                    .limit(limit)
+                    .all()
+                )
+                return {
+                    "response": f"Found {len(threads)} coding thread(s)",
+                    "threads": [_coding_thread_dict(thread, thread_model_config(db, thread)) for thread in threads],
+                    "exit_code": 0,
+                }
+
+            if action == "create_thread":
+                project, error = require_project(db, args.get("project_id"))
+                if error:
+                    return error
+                if project.archived:
+                    return _coding_error("Project is archived", 409)
+                try:
+                    harness_id = get_harness(args.get("harness_id") or project.default_harness or "generic").id
+                except ValueError as exc:
+                    return _coding_error(str(exc), 400)
+                default_config = derive_odysseus_model_config(db, owner_key)
+                endpoint_id = (
+                    args.get("model_endpoint_id")
+                    if args.get("model_endpoint_id") is not None
+                    else (project.default_endpoint_id or default_config.get("endpoint_id") or "")
+                )
+                model = (
+                    args.get("model")
+                    if args.get("model") is not None
+                    else (project.default_model or default_config.get("model") or "")
+                )
+                metadata = args.get("metadata") if isinstance(args.get("metadata"), dict) else {}
+                title = (args.get("title") or project.name or "Coding Thread").strip()
+                thread = CodingThread(
+                    id=str(_uuid.uuid4()),
+                    project_id=project.id,
+                    owner=owner_key,
+                    session_id=(args.get("session_id") or "").strip() or None,
+                    title=title or "Coding Thread",
+                    cwd=str(Path(args.get("cwd") or project.root_path).expanduser()),
+                    harness_id=harness_id,
+                    model_endpoint_id=(endpoint_id or "").strip(),
+                    model=(model or "").strip(),
+                    pinned_at=datetime.utcnow() if bool(args.get("pinned", False)) else None,
+                    status="idle",
+                    metadata_json=json.dumps(metadata),
+                )
+                db.add(thread)
+                project.updated_at = datetime.utcnow()
+                db.commit()
+                db.refresh(thread)
+                return {"response": f"Created coding thread {thread.title}", "thread": _coding_thread_dict(thread, thread_model_config(db, thread)), "exit_code": 0}
+
+            if action in {"get_thread", "read_thread", "update_thread", "delete_thread", "pin_thread", "unpin_thread", "derive_model_config", "restore_config"}:
+                thread, error = require_thread(db, args.get("thread_id"))
+                if error:
+                    return error
+
+                if action in {"get_thread", "read_thread"}:
+                    payload: Dict[str, Any] = {
+                        "thread": _coding_thread_dict(thread, thread_model_config(db, thread)),
+                        "exit_code": 0,
+                    }
+                    if thread.last_run_id:
+                        run = run_query(db).filter(CodingRun.id == thread.last_run_id).first()
+                        if run:
+                            payload["run"] = _coding_run_dict(run)
+                    include_events = bool(args.get("include_events", action == "read_thread"))
+                    if include_events:
+                        after_seq = max(0, _coding_int(args.get("after_seq"), 0))
+                        events = thread_events(db, thread.id, after_seq)
+                        payload["events"] = [_coding_event_dict(event) for event in events]
+                    return payload
+
+                if action == "delete_thread":
+                    open_count = (
+                        db.query(CodingRun)
+                        .filter(CodingRun.thread_id == thread.id, CodingRun.status.in_(tuple(BLOCKING_STATUSES)))
+                        .count()
+                    )
+                    if open_count:
+                        return _coding_error("Thread has active coding runs; stop them before deleting", 409)
+                    title = thread.title
+                    project = project_query(db).filter(CodingProject.id == thread.project_id).first()
+                    db.delete(thread)
+                    if project:
+                        project.updated_at = datetime.utcnow()
+                    db.commit()
+                    return {"response": f"Deleted coding thread {title}", "exit_code": 0}
+
+                if action == "pin_thread":
+                    thread.pinned_at = datetime.utcnow()
+                elif action == "unpin_thread":
+                    thread.pinned_at = None
+                elif action == "derive_model_config":
+                    model_config, snapshot = apply_current_model_config(db, thread, owner_key)
+                    db.commit()
+                    db.refresh(thread)
+                    db.refresh(snapshot)
+                    await runtime.append_event(
+                        thread.id,
+                        None,
+                        "model_config_derived",
+                        {"model_config": model_config, "snapshot_id": snapshot.id},
+                    )
+                    return {
+                        "response": f"Derived model config for coding thread {thread.id}",
+                        "thread": _coding_thread_dict(thread, thread_model_config(db, thread)),
+                        "model_config": model_config,
+                        "snapshot": _coding_snapshot_dict(snapshot),
+                        "exit_code": 0,
+                    }
+                elif action == "restore_config":
+                    restored = restore_previous_model_config(db, thread, owner_key)
+                    if restored is None:
+                        return _coding_error("No unrestored model config snapshot", 404)
+                    model_config, snapshot = restored
+                    db.commit()
+                    db.refresh(thread)
+                    db.refresh(snapshot)
+                    await runtime.append_event(
+                        thread.id,
+                        None,
+                        "model_config_restored",
+                        {"model_config": model_config, "snapshot_id": snapshot.id},
+                    )
+                    return {
+                        "response": f"Restored model config for coding thread {thread.id}",
+                        "thread": _coding_thread_dict(thread, thread_model_config(db, thread)),
+                        "model_config": model_config,
+                        "snapshot": _coding_snapshot_dict(snapshot),
+                        "exit_code": 0,
+                    }
+                else:
+                    if args.get("title") is not None:
+                        title = str(args.get("title") or "").strip()
+                        if not title:
+                            return _coding_error("title cannot be blank")
+                        thread.title = title
+                    if args.get("cwd") is not None:
+                        thread.cwd = str(Path(str(args.get("cwd"))).expanduser())
+                    if args.get("harness_id") is not None:
+                        try:
+                            thread.harness_id = get_harness(args.get("harness_id")).id
+                        except ValueError as exc:
+                            return _coding_error(str(exc), 400)
+                    if args.get("session_id") is not None:
+                        thread.session_id = str(args.get("session_id") or "").strip() or None
+                    if args.get("model_endpoint_id") is not None:
+                        thread.model_endpoint_id = str(args.get("model_endpoint_id") or "").strip()
+                    if args.get("model") is not None:
+                        thread.model = str(args.get("model") or "").strip()
+                    if args.get("metadata") is not None:
+                        if not isinstance(args.get("metadata"), dict):
+                            return _coding_error("metadata must be an object")
+                        thread.metadata_json = json.dumps(args.get("metadata") or {})
+                    if args.get("status") is not None:
+                        status = str(args.get("status") or "").strip()
+                        if status not in {"idle", "queued", "starting", "running", "stopping"}:
+                            return _coding_error("Invalid thread status", 400)
+                        thread.status = status
+                thread.updated_at = datetime.utcnow()
+                db.commit()
+                db.refresh(thread)
+                return {"response": f"Updated coding thread {thread.title}", "thread": _coding_thread_dict(thread, thread_model_config(db, thread)), "exit_code": 0}
+
+            if action in {"get_run", "read_run"}:
+                run, error = require_run(db, args.get("run_id"))
+                if error:
+                    return error
+                payload: Dict[str, Any] = {"run": _coding_run_dict(run), "exit_code": 0}
+                include_events = bool(args.get("include_events", action == "read_run"))
+                if include_events:
+                    after_seq = max(0, _coding_int(args.get("after_seq"), 0))
+                    events = thread_events(db, run.thread_id, after_seq, run_id=run.id)
+                    payload["events"] = [_coding_event_dict(event) for event in events]
+                log_chars = _coding_int(args.get("log_chars"), 0 if action == "get_run" else 12_000)
+                log_tail = _coding_log_tail(run, log_chars)
+                if log_tail:
+                    payload["log_tail"] = log_tail
+                return payload
+
+            if action == "queue":
+                queued = (
+                    run_query(db)
+                    .filter(CodingRun.status == "queued")
+                    .order_by(CodingRun.queued_at.asc())
+                    .all()
+                )
+                active = (
+                    run_query(db)
+                    .filter(CodingRun.status.in_(("starting", "running", "stopping")))
+                    .order_by(CodingRun.started_at.asc())
+                    .all()
+                )
+                queue = runtime.queue_snapshot(owner_key)
+                queue.update({
+                    "queued_runs": [_coding_run_dict(run) for run in queued],
+                    "active_runs": [_coding_run_dict(run) for run in active],
+                })
+                return {"response": "Coding queue snapshot", "queue": queue, "exit_code": 0}
+
+            if action == "model_config":
+                payload: Dict[str, Any] = {
+                    "model_config": derive_odysseus_model_config(db, owner_key),
+                    "exit_code": 0,
+                }
+                if args.get("thread_id"):
+                    thread, error = require_thread(db, args.get("thread_id"))
+                    if error:
+                        return error
+                    payload["thread"] = _coding_thread_dict(thread, thread_model_config(db, thread))
+                return payload
+
+            return _coding_error(
+                "Unknown action: "
+                f"{action}. Use list_projects/create_project/get_project/update_project/delete_project/"
+                "archive_project/restore_project/list_threads/create_thread/get_thread/update_thread/"
+                "delete_thread/pin_thread/unpin_thread/run_thread/get_run/read_run/stop_run/"
+                "send_stdin/resize_run/queue/harnesses/model_config/derive_model_config/restore_config."
+            )
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            db.close()
+    except ValueError as exc:
+        return _coding_error(str(exc), 400)
+    except Exception as exc:
+        logger.error("manage_coding error: %s", exc, exc_info=True)
+        return _coding_error(str(exc))
+
+
+# ---------------------------------------------------------------------------
 # Endpoint management tool
 # ---------------------------------------------------------------------------
 

@@ -241,6 +241,7 @@ Key settings:
 |---|---|---|
 | `LLM_HOST` | `localhost` | Your LLM server (e.g. `llm-host.local:8000`) |
 | `LLM_HOSTS` | -- | Comma-separated list for model discovery |
+| `LLM_PORTS` | `8000-8020,11434` | Comma-separated ports/ranges to scan for local model servers |
 | `OPENAI_API_KEY` | -- | Optional OpenAI key. Prefer adding providers in the app unless pre-seeding. |
 | `SEARXNG_INSTANCE` | `http://localhost:8080` | SearXNG URL. Docker overrides this to `http://searxng:8080`. |
 | `SEARXNG_SECRET` | generated on first Docker boot | Optional SearXNG cookie/CSRF secret. Leave blank unless you need to pin it. |
@@ -264,6 +265,40 @@ npx -y @playwright/mcp@latest --version
 ```
 
 That installs `@playwright/mcp` plus Playwright (~300MB total). Restart Odysseus and the server will register at startup.
+
+**Phone push notifications via ntfy:** A phone cannot subscribe to `127.0.0.1` on your server. To expose ntfy safely without opening it on every interface:
+
+  - **Tailscale (recommended)** — set `NTFY_BIND=<tailscale-host-ip>` and `NTFY_BASE_URL=http://<tailscale-host-ip>:8091` in `.env`, recreate ntfy, then point the ntfy Android/iOS app at `http://<tailscale-host-ip>:8091/<your-topic>`.
+  - **Enable ntfy auth and bind to LAN** — add `NTFY_AUTH_FILE` + `NTFY_AUTH_DEFAULT_ACCESS=deny-all` to the `ntfy` service, create a user with `docker compose exec ntfy ntfy user add ...`, then set `NTFY_BIND` to your LAN IP. See the [ntfy docs](https://docs.ntfy.sh/config/#access-control).
+
+### Optional external services
+  - **Ollama** → local LLM server -- [ollama.ai](https://ollama.ai)
+
+### Ollama with Docker
+If Odysseus is running in Docker and a model server is running on the host,
+use `host.docker.internal` from inside Odysseus. For example:
+
+`http://host.docker.internal:1337/v1`
+
+You do not need to publish host model ports in `docker-compose.yml`; Compose
+port mappings are for host-to-container traffic. For auto-discovery, add ports
+to `.env`:
+
+```dotenv
+LLM_PORTS=1337,8000-8020,11434
+```
+
+For Ollama specifically, add the endpoint in Settings as:
+
+`http://host.docker.internal:11434/v1`
+
+The default Compose file already maps `host.docker.internal` on Linux. Ollama also needs to listen outside its own loopback interface:
+
+```bash
+OLLAMA_HOST=0.0.0.0:11434 ollama serve
+```
+
+For a systemd Ollama install, set that in the Ollama service override. If Odysseus can see Ollama but requests hang or fail, check that your host firewall allows Docker bridge traffic to port `11434`.
 
 ## Architecture
 ```

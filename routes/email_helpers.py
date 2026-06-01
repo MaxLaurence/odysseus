@@ -35,6 +35,7 @@ from typing import Optional, List
 
 from src.auth_helpers import get_current_user
 from src.secret_storage import decrypt as _decrypt
+from src.constants import DATA_DIR as _APP_DATA_DIR
 
 logger = logging.getLogger(__name__)
 
@@ -257,7 +258,7 @@ def _cleanup_compose_uploads(tokens) -> None:
             pass
 
 
-DATA_DIR = Path(__file__).resolve().parent.parent / "data"
+DATA_DIR = Path(_APP_DATA_DIR)
 SETTINGS_FILE = DATA_DIR / "settings.json"
 # Override at deploy time via ODYSSEUS_MAIL_ATTACHMENTS_DIR. Defaults to a
 # subdir of the install's data/ tree so the app works out-of-the-box without

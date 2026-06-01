@@ -86,7 +86,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=allowed_origins,
     allow_credentials=True,
-    allow_methods=["GET", "POST", "PUT", "DELETE"],
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
     allow_headers=[
         "Accept",
         "Authorization",
@@ -122,6 +122,7 @@ _TIMEOUT_EXEMPT_PREFIXES = (
     "/api/model/download",  # tmux setup may run pip installs
     "/api/model/probe",     # SSE; iterates models with up to 8s timeout each
     "/api/model-endpoints", # /probe sub-route also iterates models
+    "/api/coding",          # terminal streams + queued run lifecycle
     "/api/cookbook/setup",  # remote pacman/apt installs
     "/api/upload",          # large files
     "/api/image",           # diffusion proxies (inpaint/harmonize/upscale/etc.) — own 120s httpx timeout
@@ -378,7 +379,7 @@ class _RevalidatingStatic(StaticFiles):
         return resp
 
 
-app.mount("/static", _RevalidatingStatic(directory="static"), name="static")
+app.mount("/static", _RevalidatingStatic(directory=STATIC_DIR), name="static")
 
 # ========= GENERATED IMAGES =========
 @app.get("/api/generated-image/{filename}")
@@ -629,6 +630,13 @@ app.include_router(setup_calendar_routes())
 from routes.shell_routes import setup_shell_routes
 app.include_router(setup_shell_routes())
 
+# Coding station (projects, pinned coding threads, queued terminal runs)
+from src.coding_runtime import get_coding_runtime_service
+coding_runtime_service = get_coding_runtime_service()
+app.state.coding_runtime_service = coding_runtime_service
+from routes.coding_routes import setup_coding_routes
+app.include_router(setup_coding_routes())
+
 # Cookbook (model download/serve/cache, cookbook state sync)
 from routes.cookbook_routes import setup_cookbook_routes
 app.include_router(setup_cookbook_routes())
@@ -820,6 +828,10 @@ async def startup_event():
     # GC tasks created with `asyncio.create_task(...)` before they finish.
     _startup_tasks: list[asyncio.Task] = getattr(app.state, "_startup_tasks", [])
     app.state._startup_tasks = _startup_tasks
+    try:
+        await coding_runtime_service.startup_reconcile()
+    except Exception as e:
+        logger.warning("Coding runtime startup reconciliation failed: %s", e)
     if upload_cleanup_func:
         upload_cleanup_task = asyncio.create_task(upload_cleanup_func())
     # Always-on monitor that auto-continues the agent when a background bash
@@ -1033,6 +1045,10 @@ async def shutdown_event():
         await task_scheduler.stop()
     except Exception:
         pass
+    try:
+        await coding_runtime_service.shutdown()
+    except Exception as e:
+        logger.warning(f"Coding runtime shutdown error: {e}")
     # Close webhook manager
     try:
         await webhook_manager.close()

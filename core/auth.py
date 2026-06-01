@@ -19,6 +19,7 @@ logger = logging.getLogger(__name__)
 
 
 from core.atomic_io import atomic_write_json as _atomic_write_json  # noqa: E402
+from core.constants import DATA_DIR
 
 DEFAULT_PRIVILEGES = {
     "can_use_agent": True,
@@ -35,9 +36,7 @@ DEFAULT_PRIVILEGES = {
 # Admins get everything
 ADMIN_PRIVILEGES = {k: (True if isinstance(v, bool) else (0 if isinstance(v, int) else [])) for k, v in DEFAULT_PRIVILEGES.items()}
 
-DEFAULT_AUTH_PATH = os.path.join(
-    Path(__file__).parent.parent, "data", "auth.json"
-)
+DEFAULT_AUTH_PATH = os.path.join(DATA_DIR, "auth.json")
 TOKEN_TTL = 60 * 60 * 24 * 7  # 7 days
 
 # Usernames the auth + middleware layer reserve as internal "synthetic owner"

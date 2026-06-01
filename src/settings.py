@@ -94,6 +94,7 @@ DEFAULT_SETTINGS = {
     "agent_max_tool_calls": 0,
     "agent_input_token_budget": 6000,
     "agent_stream_timeout_seconds": 300,
+    "coding_max_concurrent_threads": 2,
     "task_endpoint_id": "",
     "task_model": "",
     "default_endpoint_id": "",

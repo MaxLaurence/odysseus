@@ -957,7 +957,7 @@ function initEndpointForm() {
         wrap.style.cssText = 'display:flex;align-items:center;padding:8px 0;';
         wrap.appendChild(wp.element);
         const txt = document.createElement('span');
-        txt.textContent = 'Scanning ports 8000-8020 and 11434 for model servers...';
+        txt.textContent = 'Scanning configured model server ports...';
         txt.style.cssText = 'font-size:12px;opacity:0.7;';
         wrap.appendChild(txt);
         msg.appendChild(wrap);
@@ -968,7 +968,8 @@ function initEndpointForm() {
         const data = await res.json();
         const items = data.items || [];
         if (!items.length) {
-          msg.textContent = 'No model servers found. Make sure vLLM, llama.cpp, SGLang, or Ollama is running. Docker users may need OLLAMA_HOST=0.0.0.0:11434.';
+          const ports = Array.isArray(data.ports) && data.ports.length ? ` Checked ports: ${data.ports.join(', ')}.` : '';
+          msg.textContent = 'No model servers found. Make sure vLLM, llama.cpp, SGLang, or Ollama is running on a configured port.' + ports + ' Docker users may need the model server to listen on 0.0.0.0.';
           msg.className = 'admin-error';
         } else {
           // Auto-add each discovered endpoint. Server dedupes on base_url

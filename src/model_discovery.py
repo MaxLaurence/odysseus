@@ -14,6 +14,49 @@ logger = logging.getLogger(__name__)
 _hosts_cache: List[str] = []
 _hosts_cache_time: float = 0
 _HOSTS_CACHE_TTL = 60  # seconds
+DEFAULT_MODEL_PORTS = tuple(range(8000, 8021)) + (11434,)
+
+
+def parse_model_ports(raw: Optional[str] = None) -> List[int]:
+    """Parse LLM_PORTS as comma-separated ports/ranges, preserving order."""
+    raw = os.getenv("LLM_PORTS", "").strip() if raw is None else (raw or "").strip()
+    if not raw:
+        return list(DEFAULT_MODEL_PORTS)
+
+    ports: List[int] = []
+    seen = set()
+
+    def add_port(port: int) -> None:
+        if 1 <= port <= 65535 and port not in seen:
+            ports.append(port)
+            seen.add(port)
+
+    for token in (part.strip() for part in raw.split(",")):
+        if not token:
+            continue
+        if "-" in token:
+            start_text, end_text = (part.strip() for part in token.split("-", 1))
+            try:
+                start = int(start_text)
+                end = int(end_text)
+            except ValueError:
+                logger.warning("Ignoring invalid LLM_PORTS range: %s", token)
+                continue
+            if start > end:
+                logger.warning("Ignoring descending LLM_PORTS range: %s", token)
+                continue
+            for port in range(start, end + 1):
+                add_port(port)
+            continue
+        try:
+            add_port(int(token))
+        except ValueError:
+            logger.warning("Ignoring invalid LLM_PORTS entry: %s", token)
+
+    if not ports:
+        logger.warning("LLM_PORTS did not contain any valid ports; using defaults")
+        return list(DEFAULT_MODEL_PORTS)
+    return ports
 
 
 def discover_tailscale_hosts() -> List[str]:
@@ -117,6 +160,10 @@ class ModelDiscovery:
                 pass
         return hosts
 
+    def _get_ports(self) -> List[int]:
+        """Get model server ports to scan."""
+        return parse_model_ports()
+
     def _check_port(self, host: str, port: int) -> Optional[Dict[str, Any]]:
         """Check a single host:port for models."""
         base = f"http://{host}:{port}/v1"
@@ -145,9 +192,9 @@ class ModelDiscovery:
 
         logger.info(f"Scanning {len(hosts)} hosts for models: {hosts}")
 
-        # Build list of (host, port) to check. 8000-8020 catches vLLM,
-        # llama.cpp, SGLang, and Cookbook serves; 11434 catches Ollama.
-        ports = list(range(8000, 8021)) + [11434]
+        # Build list of (host, port) to check. Defaults catch vLLM, llama.cpp,
+        # SGLang, Cookbook serves, and Ollama; LLM_PORTS can add custom ports.
+        ports = self._get_ports()
         targets = [(h, p) for h in hosts for p in ports]
 
         seen_models = set()  # dedupe by (port, model_ids) to avoid same machine via different IPs
@@ -166,7 +213,7 @@ class ModelDiscovery:
         items.sort(key=lambda x: (x["host"], x["port"]))
 
         logger.info(f"Discovered {len(items)} model endpoints across {len(hosts)} hosts")
-        return {"hosts": hosts, "items": items}
+        return {"hosts": hosts, "ports": ports, "items": items}
 
     def get_providers(self) -> Dict[str, Any]:
         """Get all available providers"""

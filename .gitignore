@@ -8,6 +8,7 @@ build/
 !static/js/editor/build/
 venv/
 .venv/
+.venv-macos-build/
 *.egg
 
 # Environment
@@ -48,6 +49,7 @@ Thumbs.db
 # Build artifacts
 *.cache
 cache/
+macos/.build/
 output.txt.txt
 
 # Media (uploaded/generated)

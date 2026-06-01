@@ -6,12 +6,13 @@ from collections import Counter
 from pathlib import Path
 from typing import Dict, Any
 
+from src.constants import DATA_DIR
 from .cache import cache_metrics
 
 logger = logging.getLogger(__name__)
 
 # Dedicated error logger with file handler
-_error_log_path = Path(__file__).resolve().parent.parent / "search_engine_error.log"
+_error_log_path = Path(DATA_DIR) / "search_engine_error.log"
 _error_handler = logging.FileHandler(_error_log_path, encoding="utf-8")
 _error_handler.setLevel(logging.WARNING)
 _error_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s"))
@@ -20,7 +21,7 @@ error_logger.addHandler(_error_handler)
 error_logger.propagate = False
 
 # Analytics file
-ANALYTICS_FILE = Path(__file__).resolve().parent.parent / "search_analytics.json"
+ANALYTICS_FILE = Path(DATA_DIR) / "search_analytics.json"
 
 
 # ----------------------------------------------------------------------

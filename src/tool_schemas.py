@@ -421,6 +421,61 @@ FUNCTION_TOOL_SCHEMAS = [
     {
         "type": "function",
         "function": {
+            "name": "manage_coding",
+            "description": "Manage Coding Station projects, threads, terminal runs, queue state, harnesses, and model config. Uses owner-scoped coding records. For run/stop/stdin/resize operations, pass exact IDs from prior manage_coding results.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": [
+                            "list_projects", "create_project", "get_project", "read_project",
+                            "update_project", "delete_project", "archive_project", "restore_project",
+                            "list_threads", "create_thread", "get_thread", "read_thread",
+                            "update_thread", "delete_thread", "pin_thread", "unpin_thread",
+                            "run_thread", "get_run", "read_run", "stop_run",
+                            "send_stdin", "resize_run", "queue", "harnesses",
+                            "model_config", "derive_model_config", "restore_config"
+                        ],
+                        "description": "Coding Station action to perform."
+                    },
+                    "project_id": {"type": "string", "description": "Project ID for project actions or thread listing/creation."},
+                    "thread_id": {"type": "string", "description": "Thread ID for thread/run/model-config actions."},
+                    "run_id": {"type": "string", "description": "Run ID for run read/control actions."},
+                    "name": {"type": "string", "description": "Project name for create/update."},
+                    "root_path": {"type": "string", "description": "Project root path for create/update."},
+                    "description": {"type": "string", "description": "Project description for create/update."},
+                    "default_harness": {"type": "string", "description": "Project default harness id."},
+                    "default_endpoint_id": {"type": "string", "description": "Project default model endpoint id."},
+                    "default_model": {"type": "string", "description": "Project default model name."},
+                    "include_archived": {"type": "boolean", "description": "Include archived projects in list_projects."},
+                    "title": {"type": "string", "description": "Thread title for create/update."},
+                    "cwd": {"type": "string", "description": "Thread/run working directory."},
+                    "harness_id": {"type": "string", "description": "Harness id for thread/run, e.g. generic, codex, claude, pi, omp, custom."},
+                    "session_id": {"type": "string", "description": "Optional chat session id to associate with a coding thread."},
+                    "model_endpoint_id": {"type": "string", "description": "Thread/run model endpoint id override."},
+                    "model": {"type": "string", "description": "Thread/run model name override."},
+                    "pinned": {"type": "boolean", "description": "Pin a new thread immediately."},
+                    "metadata": {"type": "object", "description": "Thread/run metadata. For custom harnesses, metadata.command may supply the command."},
+                    "status": {"type": "string", "enum": ["idle", "queued", "starting", "running", "stopping"], "description": "Thread status for update_thread."},
+                    "command": {"type": "string", "description": "Command for run_thread. If omitted, the harness default command is used."},
+                    "replace": {"type": "boolean", "description": "For run_thread, stop any active run in the thread before queuing the new run."},
+                    "idempotency_key": {"type": "string", "description": "Optional idempotency key for run_thread."},
+                    "data": {"type": "string", "description": "stdin text for send_stdin."},
+                    "cols": {"type": "integer", "description": "Terminal columns for resize_run."},
+                    "rows": {"type": "integer", "description": "Terminal rows for resize_run."},
+                    "after_seq": {"type": "integer", "description": "Only include coding events after this sequence for read_thread/read_run."},
+                    "include_events": {"type": "boolean", "description": "Include coding thread events in get/read responses."},
+                    "log_chars": {"type": "integer", "description": "For read_run, include this many trailing log characters when available."},
+                    "limit": {"type": "integer", "description": "Maximum items for list_projects/list_threads."}
+                },
+                "required": ["action"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "manage_calendar",
             "description": "Manage calendar events: list events in a date range, create, update, delete. Each event can carry a tag/category (event_type) and importance level. Use ISO 8601 datetimes; for all-day events set all_day=true and pass YYYY-MM-DD. For event reminders/alarms, pass reminder_minutes; the tool creates the Odysseus note reminder, so do not also call manage_notes for the same reminder.",
             "parameters": {
@@ -1210,7 +1265,8 @@ def function_call_to_tool_block(name: str, arguments: str) -> Optional[ToolBlock
             content = action
     elif tool_type in ("manage_tasks", "manage_skills", "api_call",
                         "manage_endpoints", "manage_mcp", "manage_webhooks",
-                        "manage_tokens", "manage_documents", "manage_settings"):
+                        "manage_tokens", "manage_documents", "manage_settings",
+                        "manage_coding"):
         content = json.dumps(args)
     elif tool_type == "ask_teacher":
         content = args.get("model", "auto") + "\n" + args.get("problem", "")

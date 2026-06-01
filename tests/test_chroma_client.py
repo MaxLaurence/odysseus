@@ -1,10 +1,14 @@
-"""Regression tests for the ChromaDB singleton client (issue #326).
+"""Regression tests for the ChromaDB singleton client.
 
-Covers the fast-fail preflight (so an unreachable ChromaDB doesn't block
-startup for the full OS connection timeout) and the rule that a failed
-connection must not poison the cached singleton.
+Covers the embedded-vs-HTTP selection (CHROMADB_HOST chooses an HTTP service,
+otherwise an embedded PersistentClient under DATA_DIR keeps the desktop app
+self-contained) and the fast-fail preflight (issue #326) so an unreachable HTTP
+ChromaDB fails fast instead of blocking startup on the OS connection timeout —
+and must not poison the cached singleton.
 """
+import importlib
 import socket
+import sys
 import time
 
 import pytest
@@ -40,13 +44,70 @@ def test_port_open_true_for_listening_socket():
         srv.close()
 
 
-def test_get_chroma_client_does_not_cache_when_unreachable(monkeypatch):
-    pytest.importorskip("chromadb")
-    cc.reset_client()
-    monkeypatch.setenv("CHROMADB_HOST", "127.0.0.1")
-    monkeypatch.setenv("CHROMADB_PORT", str(_free_port()))
+class _FakeClient:
+    def heartbeat(self):
+        return 1
+
+
+class _FakeChroma:
+    def __init__(self):
+        self.http_calls = []
+        self.persistent_calls = []
+
+    def HttpClient(self, *, host, port):
+        self.http_calls.append((host, port))
+        return _FakeClient()
+
+    def PersistentClient(self, *, path):
+        self.persistent_calls.append(path)
+        return _FakeClient()
+
+
+def _load_client(monkeypatch, fake_chroma):
+    monkeypatch.setitem(sys.modules, "chromadb", fake_chroma)
+    import src.chroma_client as chroma_client
+
+    return importlib.reload(chroma_client)
+
+
+def test_chroma_defaults_to_embedded_persistent_store(monkeypatch, tmp_path):
+    fake_chroma = _FakeChroma()
+    monkeypatch.delenv("CHROMADB_HOST", raising=False)
+    monkeypatch.delenv("CHROMADB_PERSIST_PATH", raising=False)
+    monkeypatch.setenv("DATA_DIR", str(tmp_path / "data"))
+    chroma_client = _load_client(monkeypatch, fake_chroma)
+
+    chroma_client.get_chroma_client()
+
+    assert fake_chroma.http_calls == []
+    assert fake_chroma.persistent_calls == [str(tmp_path / "data" / "chroma")]
+
+
+def test_chroma_uses_http_client_when_host_configured(monkeypatch, tmp_path):
+    fake_chroma = _FakeChroma()
+    monkeypatch.setenv("CHROMADB_HOST", "chromadb")
+    monkeypatch.setenv("CHROMADB_PORT", "8000")
+    monkeypatch.setenv("DATA_DIR", str(tmp_path / "data"))
+    chroma_client = _load_client(monkeypatch, fake_chroma)
+    # Preflight passes so the HTTP path is exercised (the socket probe itself is
+    # covered separately by the _port_open tests above).
+    monkeypatch.setattr(chroma_client, "_port_open", lambda *a, **k: True)
+
+    chroma_client.get_chroma_client()
+
+    assert fake_chroma.http_calls == [("chromadb", 8000)]
+    assert fake_chroma.persistent_calls == []
+
+
+def test_chroma_http_unreachable_fails_fast_and_does_not_cache(monkeypatch, tmp_path):
+    fake_chroma = _FakeChroma()
+    monkeypatch.setenv("CHROMADB_HOST", "chromadb")
+    monkeypatch.setenv("CHROMADB_PORT", "8000")
+    chroma_client = _load_client(monkeypatch, fake_chroma)
+    monkeypatch.setattr(chroma_client, "_port_open", lambda *a, **k: False)
+
     with pytest.raises(RuntimeError):
-        cc.get_chroma_client()
-    # A failed connection must leave the singleton unset so a later call
-    # (once ChromaDB is up) can succeed.
-    assert cc._client is None
+        chroma_client.get_chroma_client()
+    # A failed connection must not poison the cached singleton.
+    assert chroma_client._client is None
+    assert fake_chroma.http_calls == []

@@ -22,6 +22,7 @@ import censorModule from './js/censor.js';
 import galleryModule from './js/gallery.js';
 import tasksModule from './js/tasks.js';
 import calendarModule from './js/calendar.js';
+import codeStationModule from './js/codeStation.js';
 import notesModule from './js/notes.js';
 import adminModule from './js/admin.js';
 import settingsModule from './js/settings.js';
@@ -50,6 +51,7 @@ window.sessionModule = sessionModule;
 window.uiModule = uiModule;
 window.adminModule = adminModule;
 window.cookbookModule = cookbookModule;
+window.codeStationModule = codeStationModule;
 
 // Redirect to login on 401 from any fetch
 const _origFetch = window.fetch;
@@ -3429,6 +3431,9 @@ function startOdysseusApp() {
   if (searchChatModule) {
     searchChatModule.init(API_BASE);
   }
+  if (codeStationModule) {
+    codeStationModule.init(API_BASE, { sessionModule, uiModule, modelsModule });
+  }
 
   // Search buttons — icon rail + sidebar
   const railSearchBtn = el('rail-search-btn');
@@ -3437,6 +3442,15 @@ function startOdysseusApp() {
       if (searchChatModule) searchChatModule.openSearch();
     });
   }
+
+  // Code Station buttons — explicit tool surface, never injected into chat sessions.
+  const openCodeStation = () => {
+    if (codeStationModule) codeStationModule.open();
+  };
+  const railCodeBtn = el('rail-code');
+  if (railCodeBtn) railCodeBtn.addEventListener('click', openCodeStation);
+  const toolCodeBtn = el('tool-code-btn');
+  if (toolCodeBtn) toolCodeBtn.addEventListener('click', openCodeStation);
 
   // Rail tool buttons — delegate to sidebar tool buttons
   const _railToolMap = {

@@ -864,7 +864,7 @@ def setup_model_routes(model_discovery):
 
     @router.get("/discover")
     def discover_local(request: Request):
-        """Scan local network for model servers on common ports."""
+        """Scan local network for model servers on configured ports."""
         require_admin(request)
         return model_discovery.discover_models()
 

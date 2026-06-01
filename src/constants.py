@@ -4,10 +4,13 @@ import os
 
 APP_VERSION = "1.0.0"
 
-# Base paths
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__))) + "/"
+# Base paths. ODYSSEUS_BASE_DIR and DATA_DIR let the macOS wrapper keep the
+# application bundle read-only while storing mutable data in Application Support.
+BASE_DIR = os.path.abspath(
+    os.getenv("ODYSSEUS_BASE_DIR") or os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+) + "/"
 STATIC_DIR = os.path.join(BASE_DIR, "static")
-DATA_DIR = os.path.join(BASE_DIR, "data")
+DATA_DIR = os.path.abspath(os.getenv("DATA_DIR") or os.path.join(BASE_DIR, "data"))
 
 # Data file paths
 SESSIONS_FILE = os.path.join(DATA_DIR, "sessions.json")

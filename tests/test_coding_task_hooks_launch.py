@@ -75,6 +75,47 @@ def test_generic_harness_gets_no_task_hooks(tmp_path):
     assert not (tmp_path / "odysseus-task-acquire.sh").exists()
 
 
+# --- The `ody` guide must reach the agent's MODEL CONTEXT, not just the UI -----
+# Regression guard: dropping a SKILL.md/AGENTS.md into run_dir (which is NOT the
+# agent's cwd) or firing ctx.ui.notify never put the guide in the model's prompt.
+# Each hook-capable harness now injects it via its own additive prompt lever.
+
+_ODY_GUIDE_MARKER = "Code Station control plane"  # heading of _ODY_SKILL_MD
+
+
+def test_pi_injects_ody_guide_into_system_prompt(tmp_path):
+    plan = _plan("pi", tmp_path)
+    assert "--append-system-prompt" in plan.command
+    assert _ODY_GUIDE_MARKER in plan.command
+
+
+def test_omp_injects_ody_guide_into_system_prompt(tmp_path):
+    plan = _plan("omp", tmp_path)
+    assert "--append-system-prompt" in plan.command
+    assert _ODY_GUIDE_MARKER in plan.command
+
+
+def test_claude_injects_ody_guide_into_system_prompt(tmp_path):
+    plan = _plan("claude", tmp_path)
+    assert "--append-system-prompt" in plan.command
+    assert _ODY_GUIDE_MARKER in plan.command
+
+
+def test_codex_injects_ody_guide_via_developer_instructions(tmp_path):
+    plan = _plan("codex", tmp_path)
+    # Additive developer-instructions layer (coexists with base prompt + AGENTS.md),
+    # NOT model_instructions_file, which would replace the base instructions.
+    assert "developer_instructions=" in plan.command
+    assert "model_instructions_file" not in plan.command
+    assert _ODY_GUIDE_MARKER in plan.command
+
+
+def test_generic_harness_does_not_inject_ody_guide(tmp_path):
+    plan = _plan("generic", tmp_path)
+    assert "--append-system-prompt" not in plan.command
+    assert "developer_instructions=" not in plan.command
+
+
 # --- Phase 3b: agent-state reporting added ALONGSIDE the task-slot gating ----
 
 

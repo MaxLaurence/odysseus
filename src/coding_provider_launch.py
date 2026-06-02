@@ -308,6 +308,11 @@ def build_coding_agent_launch_plan(
                 endpoint_url=endpoint_url if pi_provider_source else "",
             )
             parts.extend(["--extension", str(extension_path)])
+            # Put the `ody` control-plane guide into the model's *system prompt*. The
+            # extension's session_start ctx.ui.notify only reaches the human-facing UI,
+            # and the on-disk SKILL.md sits in run_dir (not the agent's cwd), so neither
+            # ever entered the model's context. --append-system-prompt does, additively.
+            parts.extend(_ody_skill_prompt_args("pi"))
             _write_skill_md(run_dir, harness="pi")
             metadata["provider_tools"] = {
                 "mode": "pi-extension",
@@ -348,6 +353,10 @@ def build_coding_agent_launch_plan(
             parts.extend(_codex_hook_config_args(acquire, release, state_script))
             metadata["task_hooks"] = {"mode": "codex-config-hooks", "granularity": "per-turn"}
             metadata["agent_state_hooks"] = {"mode": "codex-config-hooks", "states": ["working", "idle", "blocked"]}
+            # Inject the `ody` guide additively via developer_instructions. run_dir/AGENTS.md
+            # is off Codex's cwd->repo-root discovery path, so it was never read; this layers
+            # the guide on top of the base prompt and any project AGENTS.md (verified additive).
+            parts.extend(_ody_skill_prompt_args("codex"))
             _write_skill_md(run_dir, harness="codex")
         command = shlex.join(parts)
     elif harness == "claude":
@@ -361,6 +370,10 @@ def build_coding_agent_launch_plan(
                 run_dir, acquire=acquire, release=release, state=state_script
             )
             parts.extend(["--settings", str(hooks_path)])
+            # Claude auto-discovers skills from the *cwd* `.claude/skills` dir, not from
+            # run_dir, so the dropped skill file was never surfaced. --append-system-prompt
+            # injects the `ody` guide directly (additive to the default system prompt).
+            parts.extend(_ody_skill_prompt_args("claude"))
             _write_skill_md(run_dir, harness="claude")
             metadata["provider_tools"] = {
                 "mode": "claude-hooks",
@@ -379,6 +392,9 @@ def build_coding_agent_launch_plan(
         if run_dir is not None:
             extension_path = _write_omp_extension(run_dir)
             parts.extend(["--hook", str(extension_path)])
+            # Same as Pi: the hook's session_start notify is UI-only and run_dir/SKILL.md
+            # is off the cwd discovery path, so inject the `ody` guide into the prompt.
+            parts.extend(_ody_skill_prompt_args("omp"))
             _write_skill_md(run_dir, harness="omp")
             metadata["provider_tools"] = {
                 "mode": "omp-hook",
@@ -684,6 +700,40 @@ server marks the run `done` on exit. To override or annotate explicitly:
 States: `working` (actively running), `blocked` (waiting on input/approval),
 `idle` (turn finished, run still alive), `done` (run ended), `unknown`.
 """
+
+
+def _ody_skill_prompt_args(harness: str) -> list[str]:
+    """Launch-command args that put the full ``ody`` guide into the agent's
+    *model context*, so the agent actually knows the ``ody`` CLI exists and how
+    to drive it.
+
+    This is the delivery the per-harness file drops never achieved: ``run_dir``
+    is not the agent's cwd (it is ``RUN_ROOT/<run_id>``; the process runs in the
+    project dir), so a ``SKILL.md`` / ``AGENTS.md`` written there falls outside
+    every harness's cwd-based context discovery — and the Pi/OMP extension only
+    surfaced the summary via ``ctx.ui.notify`` (the human-facing UI, never the
+    model). These flags inject directly into the prompt instead.
+
+    Each lever is *additive* (it layers on top of the built-in system prompt
+    rather than replacing it), verified against the installed CLIs:
+
+      * pi / omp / claude → ``--append-system-prompt <text>``.
+      * codex             → ``-c developer_instructions=<text>``. Coexists with
+        the base prompt and any project ``AGENTS.md``; Codex's ``-c`` TOML parser
+        falls back to the raw string for the non-TOML markdown body. (``codex
+        debug prompt-input`` confirms: AGENTS.md content survives and the body is
+        appended, vs. ``model_instructions_file`` which *replaces* base
+        instructions.)
+
+    Returns ``[]`` for harnesses with no known system-prompt injection lever
+    (e.g. ``generic``), leaving the command untouched.
+    """
+    harness = (harness or "").strip().lower()
+    if harness in ("pi", "omp", "claude"):
+        return ["--append-system-prompt", _ODY_SKILL_MD]
+    if harness == "codex":
+        return ["-c", f"developer_instructions={_ODY_SKILL_MD}"]
+    return []
 
 
 __all__ = [

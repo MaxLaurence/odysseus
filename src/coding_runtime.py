@@ -42,7 +42,15 @@ RUN_ROOT = Path(DATA_DIR) / "coding_runs"
 ACTIVE_STATUSES = {"starting", "running", "stopping"}
 BLOCKING_STATUSES = {"queued", "starting", "running", "stopping"}
 FINISHED_STATUSES = {"exited", "failed", "cancelled"}
-PROVIDER_ODYSSEUS_ENV_KEYS = frozenset(PROVIDER_BRIDGE_ENV_KEYS)
+# The provider-bridge keys plus the ody control-plane keys (socket + owner) that
+# create_run_env injects so an `ody` run inside a pane targets the right socket.
+# These must survive _drop_private_odysseus_env (which keeps only ODYSSEUS_* keys
+# in this allowlist). Kept separate from PROVIDER_BRIDGE_ENV_KEYS so the
+# odysseus-tool `env` status command's reported key set is unchanged.
+PROVIDER_ODYSSEUS_ENV_KEYS = frozenset(PROVIDER_BRIDGE_ENV_KEYS) | {
+    "ODYSSEUS_ODY_SOCKET",
+    "ODYSSEUS_OWNER",
+}
 
 
 class CodingRuntimeError(Exception):
@@ -164,7 +172,7 @@ class CodingRuntimeService:
         env = with_scripts_on_path(env)
         return env, self._provider_bridge.metadata_for_env(provider_env)
 
-    def _revoke_run_provider_credentials(self, run_id: str) -> None:
+    def _revoke_run_provider_credentials(self, run_id: str, db=None) -> None:
         try:
             self._provider_bridge.revoke_run_token(run_id=run_id)
         except Exception:
@@ -176,6 +184,43 @@ class CodingRuntimeService:
             get_task_slot_service().release_run(run_id)
         except Exception:
             logger.debug("Failed to release task slots for coding run %s", run_id, exc_info=True)
+        # The run is being torn down — no harness hook will fire its terminal state.
+        # Best-effort mark the thread's agent_state "done" and broadcast it on the
+        # event stream (the event row IS the broadcast; event_stream polls by seq).
+        self._emit_done_agent_state(run_id, db)
+
+    def _emit_done_agent_state(self, run_id: str, db=None) -> None:
+        """Persist a terminal ``done`` agent_state + broadcast event for a run.
+
+        When the caller already holds an open session (the ``*_db`` teardown
+        helpers, which may have appended other event rows on it), reuse it so the
+        ``done`` event's seq is allocated from the same in-session view and the
+        caller's later ``commit`` stays consistent (avoids a ``(thread_id, seq)``
+        UNIQUE collision). Otherwise open a short-lived session and commit here.
+        """
+        try:
+            owns_session = db is None
+            session = db if db is not None else SessionLocal()
+            try:
+                run = session.query(CodingRun).filter(CodingRun.id == run_id).first()
+                thread_id = run.thread_id if run else None
+                if thread_id:
+                    thread = (
+                        session.query(CodingThread).filter(CodingThread.id == thread_id).first()
+                    )
+                    if thread is not None:
+                        thread.agent_state = "done"
+                        thread.state_changed_at = _now()
+                    self._append_event_db(
+                        session, thread_id, run_id, "agent_state_changed", {"state": "done"}
+                    )
+                    if owns_session:
+                        session.commit()
+            finally:
+                if owns_session:
+                    session.close()
+        except Exception:
+            logger.debug("Failed to emit done agent_state for coding run %s", run_id, exc_info=True)
 
     def _append_event_db(
         self,
@@ -185,6 +230,14 @@ class CodingRuntimeService:
         kind: str,
         payload: dict[str, Any] | None = None,
     ) -> CodingThreadEvent:
+        # Sessions are autoflush=False, so flush any pending (not-yet-committed)
+        # event rows before computing the next seq. Without this, two appends to
+        # the same session before a commit would both read the same max(seq) and
+        # collide on the (thread_id, seq) UNIQUE constraint.
+        try:
+            db.flush()
+        except Exception:
+            pass
         next_seq = (
             db.query(func.max(CodingThreadEvent.seq))
             .filter(CodingThreadEvent.thread_id == thread_id)
@@ -405,7 +458,7 @@ class CodingRuntimeService:
 
     def _cancel_run_db(self, db, run: CodingRun, reason: str) -> None:
         if run.status in FINISHED_STATUSES:
-            self._revoke_run_provider_credentials(run.id)
+            self._revoke_run_provider_credentials(run.id, db)
             return
         run.status = "cancelled"
         run.finished_at = _now()
@@ -415,11 +468,11 @@ class CodingRuntimeService:
             thread.status = "idle"
             thread.updated_at = _now()
         self._append_event_db(db, run.thread_id, run.id, "cancelled", {"reason": reason})
-        self._revoke_run_provider_credentials(run.id)
+        self._revoke_run_provider_credentials(run.id, db)
 
     async def _stop_run_db(self, db, run: CodingRun, reason: str = "stopped") -> None:
         if run.status in FINISHED_STATUSES:
-            self._revoke_run_provider_credentials(run.id)
+            self._revoke_run_provider_credentials(run.id, db)
             return
         if run.status == "queued":
             self._cancel_run_db(db, run, reason)
@@ -434,7 +487,7 @@ class CodingRuntimeService:
 
     async def _cleanup_run_for_thread_delete_db(self, db, run: CodingRun, reason: str) -> None:
         if run.status in FINISHED_STATUSES:
-            self._revoke_run_provider_credentials(run.id)
+            self._revoke_run_provider_credentials(run.id, db)
             return
         if run.id in self._launching_runs:
             raise CodingRuntimeError(409, f"Run {run.id} is still launching; retry deletion")
@@ -660,7 +713,7 @@ class CodingRuntimeService:
                         run.status = "cancelled" if run.status == "stopping" else "failed"
                         run.finished_at = _now()
                         run.error = "Run was active during startup and no recoverable session was found"
-                        self._revoke_run_provider_credentials(run.id)
+                        self._revoke_run_provider_credentials(run.id, db)
                         thread = db.query(CodingThread).filter(CodingThread.id == run.thread_id).first()
                         if thread and thread.last_run_id == run.id:
                             thread.status = "idle"
@@ -729,7 +782,7 @@ class CodingRuntimeService:
                 if not run.tmux_session
                 else f"Run was marked active but tmux session {run.tmux_session} no longer exists"
             )
-            self._revoke_run_provider_credentials(run.id)
+            self._revoke_run_provider_credentials(run.id, db)
             thread = db.query(CodingThread).filter(CodingThread.id == run.thread_id).first()
             if thread and thread.last_run_id == run.id:
                 thread.status = "idle"
@@ -1308,8 +1361,17 @@ class CodingRuntimeService:
     ) -> AsyncIterator[dict[str, Any]]:
         last_seq = after_seq
         idle_ticks = 0
+        loop = asyncio.get_event_loop()
+        started = loop.time()
+        # Hard wall-clock cap so a permanently-stuck run (status that never closes)
+        # can't keep a subscriber's stream + its 50ms DB poll alive forever. SSE
+        # clients (EventSource) auto-reconnect with after_seq; the `ody events`
+        # CLI can re-subscribe — so a 1h cap is transparent in normal use.
+        max_seconds = 3600
         while True:
             if request is not None and await request.is_disconnected():
+                return
+            if (loop.time() - started) > max_seconds:
                 return
             events = self.get_events(thread_id, owner, last_seq)
             if events:

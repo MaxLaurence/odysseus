@@ -961,6 +961,8 @@ def test_provider_bridge_run_env_uses_canonical_names_only(monkeypatch):
     import src.coding_provider_bridge as provider_bridge
 
     monkeypatch.setenv("ODYSSEUS_TOOL_URL", "http://localhost:7000/api/coding/provider/tool")
+    # Pin the ody control-plane socket so the injected ODYSSEUS_ODY_SOCKET is deterministic.
+    monkeypatch.setenv("ODYSSEUS_ODY_SOCKET", "/tmp/ody-canonical.sock")
     monkeypatch.setattr(
         provider_bridge,
         "_mint_backend_run_token",
@@ -977,18 +979,25 @@ def test_provider_bridge_run_env_uses_canonical_names_only(monkeypatch):
         )
     )
 
+    # create_run_env now also injects the ody control-plane socket + owner so an
+    # `ody` invoked inside a pane targets the right socket/owner.
     assert env == {
         "ODYSSEUS_TOOL_URL": "http://localhost:7000/api/coding/provider/tool",
         "ODYSSEUS_TOOL_TOKEN": "ody_cp_backend",
         "ODYSSEUS_THREAD_ID": "thread-canonical",
         "ODYSSEUS_PROJECT_ID": "project-canonical",
         "ODYSSEUS_RUN_ID": "run-canonical",
+        "ODYSSEUS_ODY_SOCKET": "/tmp/ody-canonical.sock",
+        "ODYSSEUS_OWNER": "tester",
     }
     assert not any(key.startswith("ODYSSEUS_PROVIDER_") for key in env)
 
     launch_env = provider_bridge.with_scripts_on_path({"PATH": f"/usr/bin{os.pathsep}{provider_bridge.scripts_dir()}", **env})
     assert launch_env["PATH"].split(os.pathsep)[0] == str(provider_bridge.scripts_dir())
-    assert {key: launch_env[key] for key in provider_bridge.PROVIDER_BRIDGE_ENV_KEYS} == env
+    # The canonical provider-bridge keys all flow through unchanged.
+    assert {key: launch_env[key] for key in provider_bridge.PROVIDER_BRIDGE_ENV_KEYS} == {
+        key: env[key] for key in provider_bridge.PROVIDER_BRIDGE_ENV_KEYS
+    }
 
 
 def test_provider_token_discovery_allows_provider_scoped_bearer_without_admin(

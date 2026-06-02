@@ -73,3 +73,77 @@ def test_generic_harness_gets_no_task_hooks(tmp_path):
     assert "--settings" not in plan.command
     assert not (tmp_path / "odysseus-claude-hooks.json").exists()
     assert not (tmp_path / "odysseus-task-acquire.sh").exists()
+
+
+# --- Phase 3b: agent-state reporting added ALONGSIDE the task-slot gating ----
+
+
+def test_pi_plan_reports_state_and_keeps_slot_gating(tmp_path):
+    _plan("pi", tmp_path)
+    src = (tmp_path / "odysseus-pi-extension.ts").read_text(encoding="utf-8")
+    # Task-slot gating still present (unchanged contract).
+    assert '"task", "--action", "acquire"' in src
+    assert '"task", "--action", "release"' in src
+    # New: agent-state reporting on the same lifecycle events.
+    assert "reportState" in src
+    assert '"agent", "--action", "state"' in src
+    assert 'reportState("working")' in src
+    assert 'reportState("idle")' in src
+    assert 'reportState("blocked")' in src
+    # The ody control-plane skill is dropped on disk and surfaced via session_start.
+    assert (tmp_path / "SKILL.md").exists()
+    assert "ody agent report-state" in (tmp_path / "SKILL.md").read_text(encoding="utf-8")
+
+
+def test_omp_plan_reports_state_and_keeps_slot_gating(tmp_path):
+    _plan("omp", tmp_path)
+    src = (tmp_path / "odysseus-omp-hook.ts").read_text(encoding="utf-8")
+    assert '"task", "--action", "acquire"' in src
+    assert '"task", "--action", "release"' in src
+    assert "reportState" in src
+    assert 'reportState("working")' in src
+    assert 'reportState("idle")' in src
+    assert (tmp_path / "SKILL.md").exists()
+
+
+def test_claude_plan_reports_state_and_keeps_slot_gating(tmp_path):
+    _plan("claude", tmp_path)
+    settings = json.loads((tmp_path / "odysseus-claude-hooks.json").read_text(encoding="utf-8"))
+    hooks = settings["hooks"]
+
+    acquire = str(tmp_path / "odysseus-task-acquire.sh")
+    release = str(tmp_path / "odysseus-task-release.sh")
+    state = str(tmp_path / "odysseus-state.sh")
+
+    # Task-slot gating is still the FIRST hook on each turn boundary.
+    up_cmds = [h["command"] for h in hooks["UserPromptSubmit"][0]["hooks"]]
+    stop_cmds = [h["command"] for h in hooks["Stop"][0]["hooks"]]
+    assert up_cmds[0] == acquire
+    assert stop_cmds[0] == release
+    # New: agent-state reporting added alongside (not replacing) the gating.
+    assert f"{state} working" in up_cmds
+    assert f"{state} idle" in stop_cmds
+    assert "Notification" in hooks
+    assert hooks["Notification"][0]["hooks"][0]["command"] == f"{state} blocked"
+
+    # The executable state shim exists and is runnable.
+    assert os.access(tmp_path / "odysseus-state.sh", os.X_OK)
+    # Skill injected via Claude's native skills dir.
+    assert (tmp_path / ".claude" / "skills" / "ody" / "SKILL.md").exists()
+
+
+def test_codex_plan_reports_state_and_keeps_slot_gating(tmp_path):
+    plan = _plan("codex", tmp_path)
+    # Task-slot gating still wired on userPromptSubmit/stop (unchanged contract).
+    assert "hooks.userPromptSubmit=" in plan.command
+    assert "hooks.stop=" in plan.command
+    assert (tmp_path / "odysseus-task-acquire.sh").exists()
+    # New: a permissionRequest hook reporting "blocked" + working/idle on the gated events.
+    assert "hooks.permissionRequest=" in plan.command
+    state = str(tmp_path / "odysseus-state.sh")
+    assert f"{state} working" in plan.command
+    assert f"{state} idle" in plan.command
+    assert f"{state} blocked" in plan.command
+    assert (tmp_path / "odysseus-state.sh").exists()
+    # Skill injected via Codex's native AGENTS.md.
+    assert (tmp_path / "AGENTS.md").exists()

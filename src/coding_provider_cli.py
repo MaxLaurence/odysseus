@@ -154,6 +154,29 @@ def cmd_gate(args: argparse.Namespace) -> None:
         return
 
 
+def cmd_state(args: argparse.Namespace) -> None:
+    """Report this run's semantic agent state from a harness hook.
+
+    POSTs ``{"tool":"agent","action":"state","args":{"state":<state>}}`` to the
+    provider bridge. Best-effort like ``gate``: if the bridge is unreachable it
+    proceeds silently. Emits nothing on stdout so harness hook parsers see a
+    clean "proceed" (no decision).
+    """
+    payload = {
+        "tool": "agent",
+        "action": "state",
+        "args": {"state": args.agent_state},
+        "arguments": {"state": args.agent_state},
+        "thread_id": os.environ.get("ODYSSEUS_THREAD_ID", ""),
+        "project_id": os.environ.get("ODYSSEUS_PROJECT_ID", ""),
+        "run_id": os.environ.get("ODYSSEUS_RUN_ID", ""),
+    }
+    try:
+        _request(_tool_call_url(), payload)
+    except SystemExit:
+        return  # bridge unreachable / unauth → proceed without reporting state
+
+
 MCP_SERVER_NAME = "odysseus-provider-tools"
 
 
@@ -166,6 +189,17 @@ def _mcp_error_text(message: str) -> str:
 
 
 def build_mcp_server() -> Any:
+    """Build the Codex-only stdio MCP server (kept intact — Codex consumes tools
+    via MCP, not a JS extension).
+
+    NOTE: This is now a *thin adapter*. Its two tools (``odysseus_provider`` /
+    ``odysseus_list_tools``) just forward to the run-scoped provider bridge
+    (``POST /api/coding/provider/tool``), exactly like the ``ody`` CLI and the
+    Pi/OMP extension tools. The primary agent interface for driving Code Station
+    (spaces/tabs/panes/agents + ``agent report-state``) is the ``ody`` CLI on the
+    pane's PATH; this MCP surface exists only because Codex speaks MCP. Do not add
+    new behavior here — extend the provider bridge / ``ody`` instead.
+    """
     try:
         from mcp.server.fastmcp import FastMCP
     except ModuleNotFoundError as exc:
@@ -251,6 +285,12 @@ def build_parser() -> argparse.ArgumentParser:
     gate_cmd.add_argument("--store", default="", help="Slot-id store file (default: temp file keyed by ODYSSEUS_RUN_ID)")
     gate_cmd.add_argument("--max-wait", type=float, default=28.0, help="Max seconds to block on acquire before proceeding ungated")
     gate_cmd.set_defaults(func=cmd_gate)
+
+    state_cmd = sub.add_parser(
+        "state", parents=[common], help="Report this run's semantic agent state (for harness hooks)"
+    )
+    state_cmd.add_argument("agent_state", choices=["working", "blocked", "idle", "done", "unknown"])
+    state_cmd.set_defaults(func=cmd_state)
 
     return parser
 

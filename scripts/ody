@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# ody — Code Station control-plane CLI shim.
+#
+# Runs `python -m src.coding_cli` from the repo root, preferring the repo venv
+# so it works whether invoked directly or from inside a harness pane (where
+# scripts/ is already on PATH).
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$REPO_ROOT"
+export PYTHONUNBUFFERED=1
+
+if [ -x "${REPO_ROOT}/.venv/bin/python" ]; then
+  exec "${REPO_ROOT}/.venv/bin/python" -m src.coding_cli "$@"
+else
+  exec python3 -m src.coding_cli "$@"
+fi

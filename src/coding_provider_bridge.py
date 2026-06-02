@@ -80,6 +80,9 @@ class CodingProviderBridgeService:
             "ODYSSEUS_THREAD_ID": scope.thread_id,
             "ODYSSEUS_PROJECT_ID": scope.project_id,
             "ODYSSEUS_RUN_ID": scope.run_id,
+            # Point an `ody` invoked inside a pane at the right control socket + owner.
+            "ODYSSEUS_ODY_SOCKET": ody_socket_path(),
+            "ODYSSEUS_OWNER": scope.owner,
         }
 
     def create_run_token(self, scope: ProviderBridgeScope) -> str:
@@ -195,6 +198,28 @@ def _normalize_provider_tool_url(url: str, *, treat_as_app_base: bool = False) -
 
 def scripts_dir() -> Path:
     return Path(__file__).resolve().parent.parent / "scripts"
+
+
+def ody_socket_path() -> str:
+    """Resolve the ody control-plane socket path: ``$ODYSSEUS_ODY_SOCKET`` else
+    ``<data_dir>/ody.sock``.
+
+    Mirrors ``src/coding_socket.default_socket_path`` / ``src/coding_cli._socket_path``
+    without importing the runtime (avoids an import cycle): resolve ``DATA_DIR``
+    from ``core.constants``, falling back to ``./data/ody.sock``.
+    """
+    explicit = (os.environ.get("ODYSSEUS_ODY_SOCKET") or "").strip()
+    if explicit:
+        return explicit
+    try:
+        from core.constants import DATA_DIR
+
+        base = (DATA_DIR or "").strip()
+    except Exception:
+        base = ""
+    if not base:
+        base = os.path.join(os.getcwd(), "data")
+    return os.path.join(base, "ody.sock")
 
 
 def bridge_env_status() -> dict[str, Any]:

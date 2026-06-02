@@ -16,9 +16,11 @@ from pydantic import BaseModel
 from routes.auth_routes import SESSION_COOKIE
 
 from core.database import (
+    CodingLayout,
     CodingModelConfigSnapshot,
     CodingProject,
     CodingRun,
+    CodingTab,
     CodingThread,
     CodingThreadEvent,
     ModelEndpoint,
@@ -34,6 +36,8 @@ from src.coding_model_config import (
     thread_model_config,
 )
 from src.coding_runtime import CodingRuntimeError, get_coding_runtime_service
+from src.coding_workspace import get_coding_workspace_service
+from src.coding_worktrees import get_coding_worktree_service
 from src.coding_task_slots import get_task_slot_service
 from src.settings import DEFAULT_SETTINGS, load_settings, save_settings
 
@@ -119,6 +123,11 @@ def _project_dict(project: CodingProject) -> dict[str, Any]:
         "default_endpoint_id": project.default_endpoint_id or "",
         "default_model": project.default_model or "",
         "archived": bool(project.archived),
+        # getattr-guarded so a partially-migrated DB can't 500 every /projects call.
+        "parent_project_id": getattr(project, "parent_project_id", None),
+        "kind": getattr(project, "kind", None) or "root",
+        "worktree_branch": getattr(project, "worktree_branch", None),
+        "worktree_path": getattr(project, "worktree_path", None),
         "created_at": _iso(project.created_at),
         "updated_at": _iso(project.updated_at),
     }
@@ -139,6 +148,10 @@ def _thread_dict(thread: CodingThread, model_config: dict[str, Any] | None = Non
         "status": thread.status or "idle",
         "last_run_id": thread.last_run_id,
         "metadata": _json_loads(thread.metadata_json, {}),
+        "tab_id": thread.tab_id,
+        "pane_id": thread.pane_id,
+        "agent_state": thread.agent_state or "idle",
+        "state_changed_at": _iso(thread.state_changed_at),
         "created_at": _iso(thread.created_at),
         "updated_at": _iso(thread.updated_at),
     }
@@ -321,9 +334,44 @@ class CodingSettingsPatch(BaseModel):
     coding_max_concurrent_threads: int | None = None
 
 
+# ── herdr-style hierarchy: Tabs, Layouts, Agent state ──────────────────────
+class TabCreate(BaseModel):
+    label: str | None = None
+    position: int | None = None
+
+
+class TabPatch(BaseModel):
+    label: str | None = None
+    position: int | None = None
+    metadata: dict[str, Any] | None = None
+
+
+class TabRename(BaseModel):
+    label: str
+
+
+class LayoutPut(BaseModel):
+    tree: Any = None
+    focus_pane_id: str | None = None
+
+
+class AgentStateReport(BaseModel):
+    state: str
+    run_id: str | None = None
+    message: str | None = None
+
+
+class WorktreeCreate(BaseModel):
+    branch: str
+    path: str | None = None
+    base: str | None = None
+
+
 def setup_coding_routes() -> APIRouter:
     router = APIRouter(prefix="/api/coding", tags=["coding"])
     runtime = get_coding_runtime_service()
+    workspace = get_coding_workspace_service()
+    worktrees = get_coding_worktree_service()
 
     @router.get("/projects")
     async def list_projects(request: Request, include_archived: bool = Query(False)):
@@ -445,6 +493,131 @@ def setup_coding_routes() -> APIRouter:
             return {"project": _project_dict(project)}
         finally:
             db.close()
+
+    # ── Spaces (= projects + live git branch, worktree children nested) ──────
+    @router.get("/spaces")
+    async def list_spaces(request: Request, include_archived: bool = Query(False)):
+        owner = _owner(request)
+        return {"spaces": workspace.list_spaces(owner, include_archived=include_archived)}
+
+    # ── Worktree child-spaces (git worktree create/open/remove, nested) ──────
+    @router.get("/spaces/{space_id}/worktrees")
+    async def list_worktrees(request: Request, space_id: str):
+        owner = _owner(request)
+        try:
+            return {"worktrees": worktrees.list_worktrees(owner, space_id)}
+        except CodingRuntimeError as exc:
+            _runtime_error(exc)
+
+    @router.post("/spaces/{space_id}/worktrees")
+    async def create_worktree(request: Request, space_id: str, body: WorktreeCreate):
+        owner = _owner(request)
+        try:
+            return {"worktree": worktrees.create_worktree(
+                owner, space_id, body.branch, path=body.path, base=body.base,
+            )}
+        except CodingRuntimeError as exc:
+            _runtime_error(exc)
+
+    @router.post("/worktrees/{worktree_space_id}/open")
+    async def open_worktree(request: Request, worktree_space_id: str):
+        owner = _owner(request)
+        try:
+            return {"worktree": worktrees.open_worktree(owner, worktree_space_id)}
+        except CodingRuntimeError as exc:
+            _runtime_error(exc)
+
+    @router.delete("/worktrees/{worktree_space_id}")
+    async def remove_worktree(request: Request, worktree_space_id: str, force: bool = Query(False)):
+        owner = _owner(request)
+        try:
+            worktrees.remove_worktree(owner, worktree_space_id, force=force)
+            return {"ok": True, "deleted": worktree_space_id}
+        except CodingRuntimeError as exc:
+            _runtime_error(exc)
+
+    # ── Agents (= threads, cross-space) with semantic state ──────────────────
+    @router.get("/agents")
+    async def list_agents(request: Request, space_id: str | None = Query(None),
+                          running_only: bool = Query(False)):
+        owner = _owner(request)
+        return {"agents": workspace.list_agents(owner, space_id=space_id, running_only=running_only)}
+
+    @router.get("/agents/{agent_id}")
+    async def get_agent(request: Request, agent_id: str):
+        owner = _owner(request)
+        try:
+            return {"agent": workspace.get_agent(owner, agent_id)}
+        except CodingRuntimeError as exc:
+            _runtime_error(exc)
+
+    # ── Tabs (renamable groups of panes, scoped per space) ───────────────────
+    @router.get("/projects/{project_id}/tabs")
+    async def list_tabs(request: Request, project_id: str):
+        owner = _owner(request)
+        try:
+            return {"tabs": workspace.list_tabs(owner, project_id)}
+        except CodingRuntimeError as exc:
+            _runtime_error(exc)
+
+    @router.post("/projects/{project_id}/tabs")
+    async def create_tab(request: Request, project_id: str, body: TabCreate):
+        owner = _owner(request)
+        try:
+            return {"tab": workspace.create_tab(owner, project_id, label=body.label, position=body.position)}
+        except CodingRuntimeError as exc:
+            _runtime_error(exc)
+
+    @router.patch("/tabs/{tab_id}")
+    async def patch_tab(request: Request, tab_id: str, body: TabPatch):
+        owner = _owner(request)
+        try:
+            return {"tab": workspace.update_tab(owner, tab_id, label=body.label, position=body.position, metadata=body.metadata)}
+        except CodingRuntimeError as exc:
+            _runtime_error(exc)
+
+    @router.post("/tabs/{tab_id}/rename")
+    async def rename_tab(request: Request, tab_id: str, body: TabRename):
+        owner = _owner(request)
+        try:
+            return {"tab": workspace.update_tab(owner, tab_id, label=body.label)}
+        except CodingRuntimeError as exc:
+            _runtime_error(exc)
+
+    @router.delete("/tabs/{tab_id}")
+    async def delete_tab(request: Request, tab_id: str):
+        owner = _owner(request)
+        try:
+            workspace.delete_tab(owner, tab_id)
+            return {"ok": True, "deleted": tab_id}
+        except CodingRuntimeError as exc:
+            _runtime_error(exc)
+
+    # ── Layout (per-tab pane split-tree; this is what survives reload) ───────
+    @router.get("/tabs/{tab_id}/layout")
+    async def get_tab_layout(request: Request, tab_id: str):
+        owner = _owner(request)
+        try:
+            return {"layout": workspace.get_layout(owner, tab_id)}
+        except CodingRuntimeError as exc:
+            _runtime_error(exc)
+
+    @router.put("/tabs/{tab_id}/layout")
+    async def put_tab_layout(request: Request, tab_id: str, body: LayoutPut):
+        owner = _owner(request)
+        try:
+            return {"layout": workspace.put_layout(owner, tab_id, body.tree, focus_pane_id=body.focus_pane_id)}
+        except CodingRuntimeError as exc:
+            _runtime_error(exc)
+
+    # ── Agent state (semantic working|blocked|done|idle|unknown) ────────────
+    @router.post("/agents/{thread_id}/report_state")
+    async def report_agent_state(request: Request, thread_id: str, body: AgentStateReport):
+        owner = _owner(request)
+        try:
+            return {"agent": await workspace.set_agent_state(owner, thread_id, body.state, run_id=body.run_id, message=body.message)}
+        except CodingRuntimeError as exc:
+            _runtime_error(exc)
 
     @router.get("/projects/{project_id}/threads")
     async def list_threads(request: Request, project_id: str):

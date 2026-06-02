@@ -28,6 +28,10 @@ from src.coding_provider_task import (
     call_task_tool as _call_task_tool,
     handle_task_tool as _handle_task_tool,
 )
+from src.coding_provider_agent import (
+    call_agent_tool as _call_agent_tool,
+    handle_agent_tool as _handle_agent_tool,
+)
 from src.coding_provider_tool_common import (
     SessionLocal,
     int_arg as _int,
@@ -85,6 +89,12 @@ PROVIDER_TOOL_CATALOG = [
         "actions": ["acquire", "release", "heartbeat"],
         "capabilities": ["task.acquire", "task.release", "task.heartbeat"],
         "description": "Acquire/release a per-model-endpoint LLM-call slot so concurrent LLM calls are throttled (blocks until a slot is free).",
+    },
+    {
+        "tool": "agent",
+        "actions": ["state"],
+        "capabilities": ["agent.state"],
+        "description": "Report this run's semantic agent state (working|blocked|idle|done|unknown) for the herdr rollup.",
     },
 ]
 
@@ -208,6 +218,7 @@ TOOL_HANDLERS: dict[str, ProviderToolHandler] = {
     "thread_messages": _handle_thread_messages_tool,
     "model_config": _handle_model_config_tool,
     "task": _handle_task_tool,
+    "agent": _handle_agent_tool,
 }
 
 

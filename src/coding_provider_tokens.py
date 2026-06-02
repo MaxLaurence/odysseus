@@ -52,6 +52,7 @@ ALL_CAPABILITIES = {
     "task.acquire",
     "task.release",
     "task.heartbeat",
+    "agent.state",
 }
 
 READ_ONLY_CAPABILITIES = {
@@ -84,6 +85,7 @@ CAPABILITY_GROUPS = {
         "task.acquire",
         "task.release",
         "task.heartbeat",
+        "agent.state",
     },
     "terminal.write": {"terminal.start", "terminal.stdin", "terminal.resize"},
     "model_config.write": {"model_config.derive", "model_config.restore"},

@@ -35,6 +35,7 @@ const STREAM_EVENT_NAMES = [
   'command',
   'system',
   'status',
+  'agent_state_changed',
   'error',
 ];
 let API_BASE = '';
@@ -76,6 +77,17 @@ const state = {
   drag: null,         // { type:'thread'|'pane', threadId?, leafId? } during a drag
   _nodeEls: new Map(), // node id -> DOM element (keyed reconciliation)
   stoppingRuns: new Map(),
+  // ── herdr-style hierarchy: Space (=project) > Tab > Pane > Agent (=thread) ──
+  spaces: [],              // flat list of space dicts (projects + git branch + worktrees)
+  spacesLoaded: false,
+  tabs: [],                // tabs for the currently-selected space
+  selectedTabId: null,
+  allAgents: [],           // cross-space agents (for AGENTS scope = 'all')
+  agentsScope: 'current',  // 'current' | 'all'
+  agentsRunningOnly: false,
+  _layoutSaveTimer: null,
+  _suspendLayoutSave: 0,     // >0 while restoring a tab's layout (don't echo a save)
+  _lastSavedLayout: null,    // { tabId, json } dedup so identical layouts aren't re-PUT
 };
 
 function apiPath(path) {
@@ -157,6 +169,321 @@ function statusClass(status) {
   if (ACTIVE_STATUSES.has(normalized)) return normalized === 'running' ? 'running' : 'queued';
   if (DONE_STATUSES.has(normalized)) return normalized;
   return normalized || 'idle';
+}
+
+/* =============================================================================
+ * herdr-style semantic agent state + Space/Tab/Layout helpers.
+ *
+ * A thread now carries an `agent_state` (working|blocked|done|idle|unknown)
+ * reported by the harness hooks. We render a single data-status dot per agent,
+ * roll those up to tabs and spaces (most-urgent wins), and persist each tab's
+ * pane split-tree to the backend so layouts survive reloads.
+ * ========================================================================== */
+const STATE_URGENCY = {
+  blocked: 6, working: 5, running: 5, starting: 4, queued: 4, pending: 4, stopping: 4,
+  done: 2, exited: 2, failed: 2, stopped: 2, cancelled: 2, complete: 2, completed: 2,
+  idle: 1, empty: 0, unknown: 0,
+};
+
+// Collapse a thread/agent to one data-status token, preferring the harness-reported
+// semantic state (working|blocked|done) over the raw run lifecycle.
+function agentDotStatus(thread) {
+  const sem = String(thread?.agent_state || '').toLowerCase();
+  if (sem === 'working' || sem === 'blocked' || sem === 'done') return sem;
+  const cls = statusClass(thread?.status);
+  if (cls === 'running') return 'working';
+  if (ACTIVE_STATUSES.has(cls)) return 'queued';
+  if (DONE_STATUSES.has(cls)) return 'done';
+  return sem === 'unknown' ? 'unknown' : 'idle';
+}
+
+// Most-urgent status across a set of data-status tokens (the herdr rollup dot).
+function rollupStatus(tokens) {
+  let best = 'idle';
+  let bestRank = -1;
+  for (const token of tokens) {
+    const rank = STATE_URGENCY[token] ?? 0;
+    if (rank > bestRank) { bestRank = rank; best = token; }
+  }
+  return best;
+}
+
+function spaceName(spaceId) {
+  return state.spaces.find((s) => s.id === spaceId)?.name || '';
+}
+
+function currentTab() {
+  return state.tabs.find((tab) => tab.id === state.selectedTabId) || null;
+}
+
+// Status tokens for every agent currently mounted in the active tab's tree.
+function treeAgentStates() {
+  const tokens = [];
+  eachLeaf(state.workspace.root, (leaf) => {
+    if (!leaf.threadId) return;
+    const thread = state.threads.find((t) => t.id === leaf.threadId);
+    tokens.push(agentDotStatus(thread || { status: leaf.status }));
+  });
+  return tokens;
+}
+
+function focusedPaneId() {
+  const fid = state.workspace.focusId;
+  if (!fid) return null;
+  const loc = locate(state.workspace.root, fid);
+  return loc && loc.node.kind === 'leaf' ? loc.node.paneId : null;
+}
+
+// Persisted layout = the split-tree + which pane is focused. paneIds are runtime-only
+// (regenerated on load), so storing them is harmless.
+function serializeLayout() {
+  return { tree: state.workspace.root, focus_pane_id: focusedPaneId() };
+}
+
+function persistLayout() {
+  if (state._suspendLayoutSave > 0 || !state.selectedTabId) return;
+  const tabId = state.selectedTabId;
+  const body = serializeLayout();
+  const json = JSON.stringify(body);
+  // Skip if this tab's layout is byte-identical to what we last saved (avoids the
+  // renderAll() re-render storm + spurious PUTs on space switches).
+  if (state._lastSavedLayout && state._lastSavedLayout.tabId === tabId && state._lastSavedLayout.json === json) return;
+  clearTimeout(state._layoutSaveTimer);
+  state._layoutSaveTimer = setTimeout(() => {
+    state._lastSavedLayout = { tabId, json };
+    api(`/api/coding/tabs/${encodeURIComponent(tabId)}/layout`, { method: 'PUT', body })
+      .catch(() => { state._lastSavedLayout = null; /* allow retry on next mutation */ });
+  }, 400);
+}
+
+async function flushLayout() {
+  if (state._suspendLayoutSave > 0 || !state.selectedTabId) return;
+  clearTimeout(state._layoutSaveTimer);
+  const tabId = state.selectedTabId;
+  const body = serializeLayout();
+  try {
+    await api(`/api/coding/tabs/${encodeURIComponent(tabId)}/layout`, { method: 'PUT', body });
+    state._lastSavedLayout = { tabId, json: JSON.stringify(body) };
+  } catch (_) { /* best-effort */ }
+}
+
+// Rebuild a stored tree with fresh node/pane ids: the old terminals are gone, so we
+// mount new ones and reattach to live dtach runs by runId (exactly like a page reload).
+function rehydrateTree(node) {
+  if (!node) return null;
+  if (node.kind === 'leaf') {
+    return {
+      id: newId('p'),
+      kind: 'leaf',
+      threadId: node.threadId || null,
+      runId: node.runId || '',
+      paneId: newId('pane'),
+      // Stored status is a stale snapshot; applyTabLayout reconciles the real run
+      // status from the live thread list so we don't connect to dead runs.
+      status: node.threadId ? 'idle' : 'empty',
+      title: node.title || null,
+    };
+  }
+  return {
+    id: newId('n'),
+    kind: 'split',
+    dir: node.dir === 'col' ? 'col' : 'row',
+    ratio: typeof node.ratio === 'number' ? node.ratio : 0.5,
+    a: rehydrateTree(node.a),
+    b: rehydrateTree(node.b),
+  };
+}
+
+function lastActiveTabKey(spaceId) { return `cs.activeTab.${spaceId}`; }
+function rememberActiveTab(spaceId, tabId) {
+  try { if (spaceId && tabId) window.localStorage.setItem(lastActiveTabKey(spaceId), tabId); } catch (_) { /* noop */ }
+}
+function recallActiveTab(spaceId) {
+  try { return spaceId ? window.localStorage.getItem(lastActiveTabKey(spaceId)) : null; } catch (_) { return null; }
+}
+
+async function loadSpaces() {
+  try {
+    const data = await api('/api/coding/spaces');
+    state.spaces = getCollection(data, ['spaces', 'items', 'data']);
+    state.spacesLoaded = true;
+  } catch (_) {
+    state.spaces = [];
+  }
+}
+
+async function loadAllAgents() {
+  try {
+    const data = await api('/api/coding/agents');
+    state.allAgents = getCollection(data, ['agents', 'items', 'data']);
+  } catch (_) {
+    state.allAgents = [];
+  }
+}
+
+async function loadTabs(spaceId) {
+  if (!spaceId) { state.tabs = []; state.selectedTabId = null; return; }
+  try {
+    const data = await api(`/api/coding/projects/${encodeURIComponent(spaceId)}/tabs`);
+    state.tabs = getCollection(data, ['tabs', 'items', 'data']);
+  } catch (_) {
+    state.tabs = [];
+  }
+  const remembered = recallActiveTab(spaceId);
+  state.selectedTabId = (state.tabs.find((tab) => tab.id === remembered)?.id) || state.tabs[0]?.id || null;
+}
+
+// Swap the active workspace tree to a tab's persisted layout. renderWorkspace tears
+// down the previous tab's terminals (their dtach runs keep running server-side) and
+// mounts this tab's panes, reattaching any still-live runs.
+async function applyTabLayout(tabId) {
+  state._suspendLayoutSave += 1;
+  try {
+    let layout = null;
+    if (tabId) {
+      try {
+        const data = await api(`/api/coding/tabs/${encodeURIComponent(tabId)}/layout`);
+        layout = data?.layout || null;
+      } catch (_) { layout = null; }
+    }
+    const root = layout?.tree ? rehydrateTree(layout.tree) : null;
+    // Reconcile each leaf's run/status against the LIVE thread list so we only
+    // reattach panes whose dtach run is still active (a stale stored 'running'
+    // would otherwise open a WebSocket to a dead run).
+    if (root) {
+      eachLeaf(root, (leaf) => {
+        if (!leaf.threadId) return;
+        const thread = state.threads.find((t) => t.id === leaf.threadId);
+        if (thread) { leaf.runId = thread.run_id || leaf.runId || ''; leaf.status = thread.status || 'idle'; }
+      });
+    }
+    state.workspace.root = root;
+    state.workspace.focusId = root ? firstLeaf(root).id : null;
+    renderWorkspace();
+  } finally {
+    state._suspendLayoutSave -= 1;
+  }
+}
+
+async function switchTab(tabId) {
+  if (!tabId || tabId === state.selectedTabId) return;
+  await flushLayout();
+  state.selectedTabId = tabId;
+  rememberActiveTab(state.selectedProjectId, tabId);
+  await applyTabLayout(tabId);
+  renderTabs();
+  renderThreads();
+}
+
+async function createTab(label) {
+  if (!state.selectedProjectId) { toast('Select a space first'); return; }
+  await flushLayout();
+  try {
+    const data = await api(`/api/coding/projects/${encodeURIComponent(state.selectedProjectId)}/tabs`, {
+      method: 'POST', body: { label: label || 'terminal' },
+    });
+    const tab = data?.tab;
+    if (tab?.id) {
+      state.tabs.push(tab);
+      state.selectedTabId = tab.id;
+      rememberActiveTab(state.selectedProjectId, tab.id);
+      await applyTabLayout(tab.id);
+      renderTabs();
+    }
+  } catch (error) { showError('Could not create tab', error); }
+}
+
+async function renameTab(tabId) {
+  const tab = state.tabs.find((t) => t.id === tabId);
+  if (!tab) return;
+  const next = await promptText('Rename tab', tab.label || 'terminal');
+  if (next == null) return;
+  const label = String(next).trim();
+  if (!label || label === tab.label) return;
+  try {
+    const data = await api(`/api/coding/tabs/${encodeURIComponent(tabId)}/rename`, { method: 'POST', body: { label } });
+    if (data?.tab) {
+      const idx = state.tabs.findIndex((t) => t.id === tabId);
+      if (idx >= 0) state.tabs[idx] = data.tab;
+    }
+    renderTabs();
+  } catch (error) { showError('Could not rename tab', error); }
+}
+
+async function closeTab(tabId) {
+  if (state.tabs.length <= 1) { toast('A space keeps at least one tab'); return; }
+  const tab = state.tabs.find((t) => t.id === tabId);
+  const ok = uiModule?.styledConfirm
+    ? await uiModule.styledConfirm(`Close tab "${tab?.label || 'terminal'}"? Its panes' processes keep running.`, { danger: true })
+    : window.confirm('Close this tab?');
+  if (!ok) return;
+  const wasActive = tabId === state.selectedTabId;
+  if (wasActive) await flushLayout();
+  try {
+    await api(`/api/coding/tabs/${encodeURIComponent(tabId)}`, { method: 'DELETE' });
+    state.tabs = state.tabs.filter((t) => t.id !== tabId);
+    if (wasActive) {
+      state.selectedTabId = state.tabs[0]?.id || null;
+      rememberActiveTab(state.selectedProjectId, state.selectedTabId);
+      await applyTabLayout(state.selectedTabId);
+    }
+    renderTabs();
+  } catch (error) { showError('Could not close tab', error); }
+}
+
+// The AGENTS rail list, honouring the scope (current space | all spaces) + running filter.
+function currentAgents() {
+  let list = state.agentsScope === 'all' ? state.allAgents.map(normalizeThread) : state.threads;
+  if (state.agentsRunningOnly) {
+    list = list.filter((thread) => {
+      const token = agentDotStatus(thread);
+      return token === 'working' || token === 'blocked' || token === 'queued';
+    });
+  }
+  return list;
+}
+
+async function setAgentsScope(scope) {
+  state.agentsScope = scope === 'all' ? 'all' : 'current';
+  if (state.agentsScope === 'all') await loadAllAgents();
+  renderThreads();
+}
+
+function promptText(title, value) {
+  if (uiModule?.styledPrompt) return uiModule.styledPrompt(title, { value });
+  try { return Promise.resolve(window.prompt(title, value)); } catch (_) { return Promise.resolve(null); }
+}
+
+async function createWorktree(spaceId) {
+  if (!spaceId) return;
+  const branch = await promptText('New worktree branch', 'feature/');
+  if (branch == null) return;
+  const cleaned = String(branch).trim();
+  if (!cleaned) return;
+  try {
+    await api(`/api/coding/spaces/${encodeURIComponent(spaceId)}/worktrees`, { method: 'POST', body: { branch: cleaned } });
+    await loadSpaces();
+    renderSpaces();
+    toast(`Worktree ${cleaned} created`);
+  } catch (error) { showError('Could not create worktree', error); }
+}
+
+async function removeWorktree(worktreeSpaceId) {
+  if (!worktreeSpaceId) return;
+  const ok = uiModule?.styledConfirm
+    ? await uiModule.styledConfirm('Remove this worktree? The branch checkout is deleted.', { danger: true })
+    : window.confirm('Remove this worktree?');
+  if (!ok) return;
+  try {
+    await api(`/api/coding/worktrees/${encodeURIComponent(worktreeSpaceId)}?force=true`, { method: 'DELETE' });
+    if (state.selectedProjectId === worktreeSpaceId) {
+      state.selectedProjectId = null;
+      state.selectedProject = null;
+    }
+    await loadSpaces();
+    renderSpaces();
+    toast('Worktree removed');
+  } catch (error) { showError('Could not remove worktree', error); }
 }
 
 function normalizeProject(project) {
@@ -419,11 +746,20 @@ function ensureModal() {
           </div>
 
           <div class="cs-tree-scroll">
-            <div class="cs-section-head">
-              <span class="cs-section-title">Threads</span>
-              <span id="cs-thread-count" class="code-station-muted cs-section-count">0</span>
+            <div class="cs-section-head cs-spaces-head">
+              <span class="cs-section-title">Spaces</span>
+              <span id="cs-space-count" class="code-station-muted cs-section-count">0</span>
               <span class="cs-section-spacer"></span>
-              <button type="button" class="code-station-icon-btn small" data-code-action="toggle-new-thread" title="New thread" aria-label="New thread"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg></button>
+              <button type="button" class="code-station-icon-btn small" data-code-action="toggle-new-project" title="New space" aria-label="New space"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg></button>
+            </div>
+            <div id="cs-spaces-list" class="code-station-list cs-spaces-list"></div>
+            <div class="cs-section-head cs-agents-head">
+              <span class="cs-section-title">Agents</span>
+              <span id="cs-thread-count" class="code-station-muted cs-section-count">0</span>
+              <button type="button" class="cs-scope-toggle" data-code-action="agents-scope" title="Toggle agent scope (current space / all spaces)">current</button>
+              <button type="button" class="cs-scope-toggle" data-code-action="agents-filter-running" aria-pressed="false" title="Show only running/blocked agents">running</button>
+              <span class="cs-section-spacer"></span>
+              <button type="button" class="code-station-icon-btn small" data-code-action="toggle-new-thread" title="New agent" aria-label="New agent"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg></button>
             </div>
             <span id="code-thread-project-label" class="cs-tree-hidden"></span>
             <form id="code-thread-form" class="code-station-form code-station-create-form cs-inline-form" hidden>
@@ -453,6 +789,7 @@ function ensureModal() {
             <button type="button" class="cs-ws-btn" data-code-action="ws-layout-grid" title="Even grid" aria-label="Tile panes evenly"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="1.5"/><line x1="12" y1="3" x2="12" y2="21"/><line x1="3" y1="12" x2="21" y2="12"/></svg></button>
             <button type="button" class="cs-ws-btn" data-code-action="ws-close-focused" title="Close focused pane" aria-label="Close focused pane"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button>
           </div>
+          <div id="cs-tab-bar" class="cs-tab-bar" role="tablist" aria-label="Workspace tabs"></div>
           <div id="cs-ws-root" class="cs-ws-root" data-empty="true">
             <div class="cs-ws-empty">
               <svg class="cs-ws-empty-glyph" width="36" height="36" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/><line x1="13" y1="4" x2="11" y2="20"/></svg>
@@ -513,6 +850,11 @@ function wireModal(modal) {
     } catch (error) {
       showError('Code Station action failed', error);
     }
+  });
+
+  modal.addEventListener('dblclick', (event) => {
+    const tabLabel = event.target.closest('.cs-tab-label');
+    if (tabLabel) { renameTab(tabLabel.dataset.id); }
   });
 
   modal.addEventListener('submit', async (event) => {
@@ -628,6 +970,39 @@ async function handleAction(action, button) {
     toggleThreadPopover(false);
     return;
   }
+  if (action === 'select-tab') {
+    await switchTab(id);
+    return;
+  }
+  if (action === 'new-tab') {
+    await createTab();
+    return;
+  }
+  if (action === 'rename-tab') {
+    await renameTab(id);
+    return;
+  }
+  if (action === 'close-tab') {
+    await closeTab(id);
+    return;
+  }
+  if (action === 'agents-scope') {
+    await setAgentsScope(state.agentsScope === 'all' ? 'current' : 'all');
+    return;
+  }
+  if (action === 'agents-filter-running') {
+    state.agentsRunningOnly = !state.agentsRunningOnly;
+    renderThreads();
+    return;
+  }
+  if (action === 'new-worktree') {
+    await createWorktree(id);
+    return;
+  }
+  if (action === 'remove-worktree') {
+    await removeWorktree(id);
+    return;
+  }
   if (action === 'ws-split-h') {
     splitFocused('row');
     return;
@@ -684,7 +1059,7 @@ function destroyModal() {
 }
 
 async function refreshAll() {
-  await Promise.allSettled([loadProjects(), loadHarnesses(), loadModelConfig(), refreshBadges()]);
+  await Promise.allSettled([loadProjects(), loadSpaces(), loadHarnesses(), loadModelConfig(), refreshBadges()]);
   if (!selectedProjectExists()) {
     state.selectedProjectId = state.projects.find((project) => !project.archived)?.id || state.projects[0]?.id || null;
   }
@@ -808,10 +1183,19 @@ async function restoreProject(projectId, button) {
 
 async function selectProject(projectId, options = {}) {
   if (!projectId) return;
+  const spaceChanged = state.selectedProjectId !== projectId;
+  if (spaceChanged) await flushLayout(); // persist the outgoing space's active tab first
   state.selectedProjectId = projectId;
-  state.selectedProject = state.projects.find((project) => project.id === projectId) || null;
+  state.selectedProject = state.projects.find((project) => project.id === projectId)
+    || state.spaces.find((space) => space.id === projectId) || null;
   renderProjects();
-  await Promise.allSettled([loadProject(projectId), loadThreads(projectId)]);
+  renderSpaces();
+  await Promise.allSettled([loadProject(projectId), loadThreads(projectId), loadTabs(projectId)]);
+  // Swap the workspace to this space's active tab layout (mounting its panes,
+  // reattaching live dtach runs). Skip if we're re-selecting the same space.
+  if (spaceChanged || !state.workspace.root) {
+    await applyTabLayout(state.selectedTabId);
+  }
   renderAll();
   await refreshBadges();
   syncProviderTools({ reset: true, force: true });
@@ -1763,6 +2147,23 @@ function feedPane(session, payload, eventName = 'message', replay = false) {
   if (seq !== null && seq <= session.lastSeq) return;
   if (seq !== null) session.lastSeq = Math.max(session.lastSeq, seq);
 
+  // herdr semantic agent state rides the thread stream as `agent_state_changed`.
+  // It's a separate axis from run lifecycle, so update the agent + dots and stop —
+  // don't let `state: working` masquerade as a run status below.
+  const evtKind = String(payload.kind || eventName).toLowerCase();
+  if (evtKind === 'agent_state_changed' || evtKind === 'agent_state') {
+    const next = String(payload.state || payload.agent_state || '').toLowerCase();
+    if (next && session.threadId) {
+      const thread = state.threads.find((t) => t.id === session.threadId);
+      if (thread) thread.agent_state = next;
+      if (state.selectedThread?.id === session.threadId) state.selectedThread.agent_state = next;
+      renderThreads();
+      renderTabs();
+      renderSpaces();
+    }
+    return;
+  }
+
   const status = payload.status || payload.state || payload.run_status || statusFromEventKind(payload.kind || eventName);
   if (status) {
     session.status = statusLabel({ status });
@@ -2012,6 +2413,10 @@ function renderWorkspace() {
   if (cnt) { const count = countLeaves(tree); cnt.textContent = `${count} pane${count === 1 ? '' : 's'}`; }
 
   refitAll();
+  // The split-tree changed structurally: persist it for this tab and refresh the
+  // tab's rollup dot. (No-op while restoring a tab's layout.)
+  persistLayout();
+  renderTabs();
 }
 
 // ---- drag/drop + splitter wiring (delegated on the modal) ----
@@ -2087,6 +2492,7 @@ function startSplitterDrag(splitter, downEvent) {
     splitter.removeEventListener('pointerup', up);
     splitter.removeEventListener('pointercancel', up);
     refitAll();
+    persistLayout(); // a ratio change is a layout change worth keeping
   };
   splitter.addEventListener('pointermove', move);
   splitter.addEventListener('pointerup', up);
@@ -2143,8 +2549,13 @@ function wireWorkspace(modal) {
     clearDropGhost();
     try {
       if (drag.type === 'thread') {
-        const thread = state.threads.find((t) => t.id === drag.threadId);
-        if (thread) {
+        // Resolve from the current space's threads OR the cross-space agents list
+        // (the AGENTS rail in scope='all' can drag an agent from another space).
+        const thread = state.threads.find((t) => t.id === drag.threadId)
+          || state.allAgents.find((t) => t.id === drag.threadId);
+        if (thread && (thread.project_id || thread.space_id) && (thread.project_id || thread.space_id) !== state.selectedProjectId) {
+          toast('That agent lives in another space — switch to it first');
+        } else if (thread) {
           const openedLeafId = await openThreadAsPane(thread, target);
           if (openedLeafId) autoLaunchThread(thread, openedLeafId);
         }
@@ -2219,10 +2630,12 @@ function renderAll() {
   renderHeader();
   renderProjectSwitcher();
   renderProjects();
+  renderSpaces();
   renderProjectEditForm();
   renderThreadCreateForm();
   renderThreads();
   renderWorkspace();
+  renderTabs();
   renderThreadDetail();
   renderRunStatus();
   renderMobileTabs();
@@ -2297,6 +2710,119 @@ function renderProjects() {
   updateProjectQueuePills();
 }
 
+function renderSpaces() {
+  const list = q('#cs-spaces-list');
+  if (!list) return;
+  list.replaceChildren();
+  const spaces = Array.isArray(state.spaces) ? state.spaces : [];
+  const count = q('#cs-space-count');
+  if (count) count.textContent = String(spaces.length);
+  if (!spaces.length) {
+    list.appendChild(emptyState('No spaces yet — + to add one.'));
+    return;
+  }
+  const roots = spaces.filter((s) => !s.parent_project_id);
+  const childrenByParent = new Map();
+  for (const s of spaces) {
+    if (!s.parent_project_id) continue;
+    if (!childrenByParent.has(s.parent_project_id)) childrenByParent.set(s.parent_project_id, []);
+    childrenByParent.get(s.parent_project_id).push(s);
+  }
+  const appendRow = (space, isChild) => {
+    const row = document.createElement('div');
+    row.className = `code-station-row cs-space-row${isChild ? ' cs-space-child' : ''}${space.id === state.selectedProjectId ? ' selected' : ''}`;
+    row.dataset.spaceId = space.id;
+    const dot = document.createElement('span');
+    dot.className = 'cs-thread-dot cs-space-dot';
+    dot.dataset.status = agentDotStatus({ agent_state: space.agent_state });
+    const main = document.createElement('button');
+    main.type = 'button';
+    main.className = 'code-station-row-main';
+    main.dataset.codeAction = 'select-project';
+    main.dataset.id = space.id;
+    const title = document.createElement('span');
+    title.className = 'code-station-row-title';
+    title.textContent = space.name;
+    const meta = document.createElement('span');
+    meta.className = 'code-station-row-meta cs-space-branch';
+    meta.textContent = space.branch || space.worktree_branch || space.root_path || '';
+    main.append(title, meta);
+    row.append(dot, main);
+    if (isChild) {
+      const rm = document.createElement('button');
+      rm.type = 'button';
+      rm.className = 'code-station-icon-btn small cs-row-delete';
+      rm.dataset.codeAction = 'remove-worktree';
+      rm.dataset.id = space.id;
+      rm.title = 'Remove worktree';
+      rm.setAttribute('aria-label', 'Remove worktree');
+      rm.textContent = '×';
+      row.append(rm);
+    } else {
+      const wt = document.createElement('button');
+      wt.type = 'button';
+      wt.className = 'code-station-icon-btn small cs-space-worktree';
+      wt.dataset.codeAction = 'new-worktree';
+      wt.dataset.id = space.id;
+      wt.title = 'New worktree (branch)';
+      wt.setAttribute('aria-label', 'New worktree');
+      wt.innerHTML = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><line x1="6" y1="3" x2="6" y2="15"/><circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M18 9a9 9 0 0 1-9 9"/></svg>';
+      row.append(wt);
+    }
+    list.appendChild(row);
+  };
+  for (const root of roots) {
+    appendRow(root, false);
+    for (const child of (childrenByParent.get(root.id) || [])) appendRow(child, true);
+  }
+}
+
+function renderTabs() {
+  const bar = q('#cs-tab-bar');
+  if (!bar) return;
+  bar.replaceChildren();
+  if (!state.selectedProjectId) { bar.dataset.empty = 'true'; return; }
+  bar.dataset.empty = 'false';
+  const activeToken = rollupStatus(treeAgentStates());
+  for (const tab of state.tabs) {
+    const chip = document.createElement('div');
+    chip.className = `cs-tab${tab.id === state.selectedTabId ? ' active' : ''}`;
+    chip.dataset.tabId = tab.id;
+    const dot = document.createElement('span');
+    dot.className = 'cs-thread-dot cs-tab-dot';
+    // Active tab uses the live in-memory rollup (freshest); background tabs use the
+    // server-computed rollup (from their stored layout + agent states).
+    dot.dataset.status = tab.id === state.selectedTabId ? activeToken : (tab.agent_state || 'idle');
+    const label = document.createElement('button');
+    label.type = 'button';
+    label.className = 'cs-tab-label';
+    label.dataset.codeAction = 'select-tab';
+    label.dataset.id = tab.id;
+    label.textContent = tab.label || 'terminal';
+    chip.append(dot, label);
+    if (state.tabs.length > 1) {
+      const close = document.createElement('button');
+      close.type = 'button';
+      close.className = 'cs-tab-close';
+      close.dataset.codeAction = 'close-tab';
+      close.dataset.id = tab.id;
+      close.title = 'Close tab';
+      close.setAttribute('aria-label', 'Close tab');
+      close.textContent = '×';
+      chip.append(close);
+    }
+    bar.appendChild(chip);
+  }
+  const add = document.createElement('button');
+  add.type = 'button';
+  add.className = 'cs-tab-add';
+  add.dataset.codeAction = 'new-tab';
+  add.title = 'New tab';
+  add.setAttribute('aria-label', 'New tab');
+  add.textContent = '+';
+  bar.appendChild(add);
+}
+
 function renderThreadCreateForm() {
   const label = q('#code-thread-project-label');
   const project = state.selectedProject || state.projects.find((item) => item.id === state.selectedProjectId);
@@ -2320,24 +2846,35 @@ function renderThreads() {
   pinnedList.replaceChildren();
   threadList.replaceChildren();
   if (pinnedWrap) pinnedWrap.hidden = true;
+
+  // Reflect the scope / running-filter toggles in the section head.
+  const scopeBtn = state.modal?.querySelector('[data-code-action="agents-scope"]');
+  if (scopeBtn) { scopeBtn.textContent = state.agentsScope; scopeBtn.dataset.scope = state.agentsScope; }
+  const runBtn = state.modal?.querySelector('[data-code-action="agents-filter-running"]');
+  if (runBtn) { runBtn.setAttribute('aria-pressed', String(state.agentsRunningOnly)); runBtn.classList.toggle('is-on', state.agentsRunningOnly); }
+
+  const allScope = state.agentsScope === 'all';
+  const agents = currentAgents();
   const tcount = q('#cs-thread-count');
-  if (tcount) tcount.textContent = String(state.selectedProjectId ? state.threads.length : 0);
+  if (tcount) tcount.textContent = String(agents.length);
 
-  if (!state.selectedProjectId) {
-    threadList.appendChild(emptyState('Select or create a project to see its threads.'));
+  if (!allScope && !state.selectedProjectId) {
+    threadList.appendChild(emptyState('Select or create a space to see its agents.'));
     return;
   }
-  if (!state.threads.length) {
-    threadList.appendChild(emptyState('No threads yet — use + to start one.'));
+  if (!agents.length) {
+    threadList.appendChild(emptyState(state.agentsRunningOnly ? 'No running agents.' : 'No agents yet — use + to start one.'));
     return;
   }
 
-  const pinned = sortThreads(state.threads.filter((thread) => thread.pinned));
-  if (pinned.length && pinnedWrap) {
-    pinnedWrap.hidden = false;
-    for (const thread of pinned) pinnedList.appendChild(threadChip(thread));
+  if (!allScope) {
+    const pinned = sortThreads(agents.filter((thread) => thread.pinned));
+    if (pinned.length && pinnedWrap) {
+      pinnedWrap.hidden = false;
+      for (const thread of pinned) pinnedList.appendChild(threadChip(thread));
+    }
   }
-  for (const thread of sortThreads(state.threads)) threadList.appendChild(threadRow(thread));
+  for (const thread of sortThreads(agents)) threadList.appendChild(threadRow(thread, { showSpace: allScope }));
 }
 
 function threadChip(thread) {
@@ -2350,14 +2887,14 @@ function threadChip(thread) {
   chip.draggable = true;
   const dot = document.createElement('span');
   dot.className = 'cs-thread-dot';
-  dot.dataset.status = statusClass(thread.status);
+  dot.dataset.status = agentDotStatus(thread);
   const name = document.createElement('span');
   name.textContent = thread.title;
   chip.append(dot, name);
   return chip;
 }
 
-function threadRow(thread) {
+function threadRow(thread, options = {}) {
   const row = document.createElement('div');
   row.className = `code-station-row thread-row${thread.id === state.selectedThreadId ? ' selected' : ''}`;
   row.dataset.threadId = thread.id;
@@ -2369,7 +2906,7 @@ function threadRow(thread) {
   grip.innerHTML = '<svg width="8" height="14" viewBox="0 0 8 14" fill="currentColor"><circle cx="2" cy="2" r="1.1"/><circle cx="6" cy="2" r="1.1"/><circle cx="2" cy="7" r="1.1"/><circle cx="6" cy="7" r="1.1"/><circle cx="2" cy="12" r="1.1"/><circle cx="6" cy="12" r="1.1"/></svg>';
   const dot = document.createElement('span');
   dot.className = 'cs-thread-dot';
-  dot.dataset.status = statusClass(thread.status);
+  dot.dataset.status = agentDotStatus(thread);
   const main = document.createElement('button');
   main.type = 'button';
   main.className = 'code-station-row-main';
@@ -2380,7 +2917,10 @@ function threadRow(thread) {
   title.textContent = thread.title;
   const meta = document.createElement('span');
   meta.className = 'code-station-row-meta';
-  meta.textContent = [thread.harness, thread.cwd].filter(Boolean).join(' · ') || 'No cwd';
+  const metaParts = options.showSpace
+    ? [spaceName(thread.project_id || thread.space_id), thread.harness]
+    : [thread.harness, thread.cwd];
+  meta.textContent = metaParts.filter(Boolean).join(' · ') || 'No cwd';
   main.append(title, meta);
   const pin = document.createElement('button');
   pin.type = 'button';
@@ -2633,6 +3173,38 @@ export async function refreshBadges() {
   renderQueuePopover();
 }
 
+// Keep the herdr status dots fresh: re-poll space rollups + agent states on the
+// badge tick. (Mounted, active panes already update live via the SSE stream.)
+async function refreshAgentStates() {
+  if (!state.modal || !isCodeSpaceActive()) return;
+  await loadSpaces();
+  if (state.selectedProjectId) {
+    try {
+      const data = await api(`/api/coding/agents?space_id=${encodeURIComponent(state.selectedProjectId)}`);
+      const byId = new Map(getCollection(data, ['agents', 'items', 'data']).map((a) => [a.id, a]));
+      for (const thread of state.threads) {
+        const agent = byId.get(thread.id);
+        if (!agent) continue;
+        thread.agent_state = agent.agent_state;
+        // Don't clobber the live SSE-driven run status of a mounted pane with a
+        // stale poll snapshot; agent_state is harness-semantic and always safe.
+        const mounted = [...state.panes.values()].some((s) => s.threadId === thread.id);
+        if (!mounted && agent.status) thread.status = agent.status;
+      }
+    } catch (_) { /* best-effort */ }
+    // Refresh background-tab rollup dots without disturbing tab selection/order.
+    try {
+      const td = await api(`/api/coding/projects/${encodeURIComponent(state.selectedProjectId)}/tabs`);
+      const freshById = new Map(getCollection(td, ['tabs', 'items', 'data']).map((t) => [t.id, t]));
+      for (const tab of state.tabs) { const fresh = freshById.get(tab.id); if (fresh) tab.agent_state = fresh.agent_state; }
+    } catch (_) { /* best-effort */ }
+  }
+  if (state.agentsScope === 'all') await loadAllAgents();
+  renderSpaces();
+  renderTabs();
+  renderThreads();
+}
+
 // Per-project pills on the project rows: a glance shows which projects are eating
 // the shared pool, so the global header count is always attributable.
 function updateProjectQueuePills() {
@@ -2752,7 +3324,7 @@ export function init(apiBase, options = {}) {
   if (state.initialized) return;
   state.initialized = true;
   refreshBadges();
-  state.badgeTimer = window.setInterval(refreshBadges, 6000);
+  state.badgeTimer = window.setInterval(() => { refreshBadges(); refreshAgentStates(); }, 6000);
   document.addEventListener('visibilitychange', () => {
     if (!document.hidden) refreshBadges();
   });

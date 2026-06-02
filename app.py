@@ -843,6 +843,13 @@ async def startup_event():
         await coding_runtime_service.startup_reconcile()
     except Exception as e:
         logger.warning("Coding runtime startup reconciliation failed: %s", e)
+    # Code Station ody control-plane: Unix-socket JSON-RPC server for the `ody` CLI.
+    try:
+        from src.coding_socket import start_ody_socket_server
+        app.state.ody_socket_server = await start_ody_socket_server()
+    except Exception as e:
+        logger.warning("ody socket server failed to start: %s", e)
+        app.state.ody_socket_server = None
     if upload_cleanup_func:
         upload_cleanup_task = asyncio.create_task(upload_cleanup_func())
     # Always-on monitor that auto-continues the agent when a background bash
@@ -1060,6 +1067,11 @@ async def shutdown_event():
         await coding_runtime_service.shutdown()
     except Exception as e:
         logger.warning(f"Coding runtime shutdown error: {e}")
+    try:
+        from src.coding_socket import stop_ody_socket_server
+        await stop_ody_socket_server(getattr(app.state, "ody_socket_server", None))
+    except Exception as e:
+        logger.warning("ody socket server shutdown error: %s", e)
     # Close webhook manager
     try:
         await webhook_manager.close()

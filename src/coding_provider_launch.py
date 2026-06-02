@@ -78,15 +78,49 @@ def _write_pi_extension(run_dir: Path, *, model: str = "", endpoint_url: str = "
     source = _PI_EXTENSION_SOURCE.replace(
         "__ODYSSEUS_PI_PROVIDER_REGISTRATION__",
         _pi_provider_registration_source(model=model, endpoint_url=endpoint_url),
-    )
+    ).replace("__ODYSSEUS_ODY_SKILL_SUMMARY__", json.dumps(_ODY_SKILL_SUMMARY))
     path.write_text(source, encoding="utf-8")
     return path
 
 
 def _write_omp_extension(run_dir: Path) -> Path:
     path = run_dir / ODYSSEUS_OMP_EXTENSION_NAME
-    path.write_text(_OMP_EXTENSION_SOURCE, encoding="utf-8")
+    source = _OMP_EXTENSION_SOURCE.replace(
+        "__ODYSSEUS_ODY_SKILL_SUMMARY__", json.dumps(_ODY_SKILL_SUMMARY)
+    )
+    path.write_text(source, encoding="utf-8")
     return path
+
+
+def _write_skill_md(run_dir: Path | None, *, harness: str = "") -> Path | None:
+    """Drop a per-run SKILL.md documenting the ``ody`` control-plane CLI.
+
+    Injected per-harness via each one's native context mechanism:
+      * Claude → ``<run_dir>/.claude/skills/ody/SKILL.md`` (auto-discovered skill).
+      * Codex  → ``<run_dir>/AGENTS.md`` (Codex auto-reads it from the cwd).
+      * Pi/OMP → the extension surfaces a summary via ``session_start`` (above);
+        the full file is still written so the agent can read it on disk.
+
+    Returns the primary path written (the harness-native one), or None when no
+    ``run_dir`` is available.
+    """
+    if run_dir is None:
+        return None
+    harness = (harness or "").strip().lower()
+    if harness == "claude":
+        target = run_dir / ".claude" / "skills" / "ody" / "SKILL.md"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(_ODY_SKILL_MD, encoding="utf-8")
+        return target
+    if harness == "codex":
+        target = run_dir / "AGENTS.md"
+        target.write_text(_ODY_SKILL_MD, encoding="utf-8")
+        return target
+    # Pi/OMP and any other harness: write a plain SKILL.md in the run dir so the
+    # agent (surfaced via the extension session_start) can read the full doc.
+    target = run_dir / "SKILL.md"
+    target.write_text(_ODY_SKILL_MD, encoding="utf-8")
+    return target
 
 
 def _write_task_hook_scripts(run_dir: Path) -> tuple[Path, Path]:
@@ -105,23 +139,63 @@ def _write_task_hook_scripts(run_dir: Path) -> tuple[Path, Path]:
     return acquire, release
 
 
-def _write_claude_hooks_settings(run_dir: Path, *, acquire: Path, release: Path) -> Path:
-    """A `claude --settings` file that gates each turn on a task slot.
+def _write_state_hook_script(run_dir: Path) -> Path:
+    """A tiny executable wrapper a harness hook invokes as ``<script> <state>``.
 
-    UserPromptSubmit → acquire (blocks until a slot is free), Stop/StopFailure →
-    release. Passed via --settings so the user's global/project config and auth are
-    untouched.
+    Forwards to ``odysseus-tool state "$1"`` (working|blocked|idle|done|unknown),
+    which best-effort POSTs the semantic agent state to the provider bridge and
+    emits nothing on stdout (a clean "proceed" for hook parsers). Kept as a file
+    so hook configs only need an absolute path + one positional arg, avoiding
+    argument-quoting differences between Claude and Codex hook runners.
     """
+    script = run_dir / "odysseus-state.sh"
+    script.write_text('#!/bin/sh\nexec odysseus-tool state "$1"\n', encoding="utf-8")
+    script.chmod(script.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    return script
+
+
+def _write_claude_hooks_settings(run_dir: Path, *, acquire: Path, release: Path, state: Path) -> Path:
+    """A `claude --settings` file that gates each turn on a task slot AND reports
+    the run's semantic agent state.
+
+    UserPromptSubmit → acquire (blocks until a slot is free) + report ``working``;
+    Stop/StopFailure → release + report ``idle``; Notification → report ``blocked``
+    (Claude fires Notification when it pauses for input/permission). Passed via
+    --settings so the user's global/project config and auth are untouched. Hooks
+    in a list run in order, so gating (acquire/release) always still fires.
+    """
+
+    def _state_hook(value: str, timeout: int = 10) -> dict[str, Any]:
+        return {"type": "command", "command": f"{state} {value}", "timeout": timeout}
+
     settings = {
         "hooks": {
             "UserPromptSubmit": [
-                {"hooks": [{"type": "command", "command": str(acquire), "timeout": 30}]}
+                {
+                    "hooks": [
+                        {"type": "command", "command": str(acquire), "timeout": 30},
+                        _state_hook("working"),
+                    ]
+                }
             ],
             "Stop": [
-                {"hooks": [{"type": "command", "command": str(release), "timeout": 600}]}
+                {
+                    "hooks": [
+                        {"type": "command", "command": str(release), "timeout": 600},
+                        _state_hook("idle"),
+                    ]
+                }
             ],
             "StopFailure": [
-                {"hooks": [{"type": "command", "command": str(release), "timeout": 600}]}
+                {
+                    "hooks": [
+                        {"type": "command", "command": str(release), "timeout": 600},
+                        _state_hook("idle"),
+                    ]
+                }
+            ],
+            "Notification": [
+                {"hooks": [_state_hook("blocked")]}
             ],
         }
     }
@@ -130,18 +204,46 @@ def _write_claude_hooks_settings(run_dir: Path, *, acquire: Path, release: Path)
     return path
 
 
-def _codex_hook_config_args(acquire: Path, release: Path) -> list[str]:
+def _codex_hook_config_args(acquire: Path, release: Path, state: Path) -> list[str]:
     """Inline `-c` overrides registering per-turn hooks (no file / no CODEX_HOME).
 
-    Event names use the camelCase keys from Codex's HookEventName enum.
+    Event names use the camelCase keys from Codex's HookEventName enum. Each event
+    keeps its task-slot gating command (acquire/release) AND adds an agent-state
+    report (``odysseus-state.sh <state>``) so the herdr rollup reflects this run:
+    userPromptSubmit → working, stop → idle, permissionRequest → blocked. Hooks in
+    a list run in order, so gating always still fires.
+
+    Codex command hooks take a single ``command`` string (no separate ``args``
+    array), so the state is baked into the command (``odysseus-state.sh idle``).
+    ``permissionRequest`` is Codex's pause-for-approval event (there is no
+    ``notification`` event in Codex's HookEventName enum).
     """
     acquire_cmd = _toml_string(str(acquire))
     release_cmd = _toml_string(str(release))
+    state_working = _toml_string(f"{state} working")
+    state_idle = _toml_string(f"{state} idle")
+    state_blocked = _toml_string(f"{state} blocked")
     return [
         "--config",
-        f'hooks.userPromptSubmit=[{{ hooks = [{{ type = "command", command = {acquire_cmd}, timeout = 30 }}] }}]',
+        (
+            "hooks.userPromptSubmit=[{ hooks = ["
+            f'{{ type = "command", command = {acquire_cmd}, timeout = 30 }}, '
+            f'{{ type = "command", command = {state_working}, timeout = 10 }}'
+            "] }]"
+        ),
         "--config",
-        f'hooks.stop=[{{ hooks = [{{ type = "command", command = {release_cmd}, timeout = 600 }}] }}]',
+        (
+            "hooks.stop=[{ hooks = ["
+            f'{{ type = "command", command = {release_cmd}, timeout = 600 }}, '
+            f'{{ type = "command", command = {state_idle}, timeout = 10 }}'
+            "] }]"
+        ),
+        "--config",
+        (
+            "hooks.permissionRequest=[{ hooks = ["
+            f'{{ type = "command", command = {state_blocked}, timeout = 10 }}'
+            "] }]"
+        ),
     ]
 
 
@@ -206,6 +308,7 @@ def build_coding_agent_launch_plan(
                 endpoint_url=endpoint_url if pi_provider_source else "",
             )
             parts.extend(["--extension", str(extension_path)])
+            _write_skill_md(run_dir, harness="pi")
             metadata["provider_tools"] = {
                 "mode": "pi-extension",
                 "extension_path": str(extension_path),
@@ -213,6 +316,7 @@ def build_coding_agent_launch_plan(
                 "command": "odysseus-tool",
                 "env": metadata["provider_tools"]["env"],
             }
+            metadata["agent_state_hooks"] = {"mode": "pi-extension", "states": ["working", "idle", "blocked"]}
         command = shlex.join(parts)
     elif harness == "codex":
         parts = ["codex"]
@@ -238,9 +342,13 @@ def build_coding_agent_launch_plan(
         if run_dir is not None:
             # Per-turn task-slot gating via inline -c hook overrides (no file write
             # into the user's repo, no CODEX_HOME relocation that would break auth).
+            # The same events also report semantic agent state (working/idle/blocked).
             acquire, release = _write_task_hook_scripts(run_dir)
-            parts.extend(_codex_hook_config_args(acquire, release))
+            state_script = _write_state_hook_script(run_dir)
+            parts.extend(_codex_hook_config_args(acquire, release, state_script))
             metadata["task_hooks"] = {"mode": "codex-config-hooks", "granularity": "per-turn"}
+            metadata["agent_state_hooks"] = {"mode": "codex-config-hooks", "states": ["working", "idle", "blocked"]}
+            _write_skill_md(run_dir, harness="codex")
         command = shlex.join(parts)
     elif harness == "claude":
         # Per-turn task-slot gating via `--settings` (leaves global/project config
@@ -248,15 +356,20 @@ def build_coding_agent_launch_plan(
         parts = ["claude"]
         if run_dir is not None:
             acquire, release = _write_task_hook_scripts(run_dir)
-            hooks_path = _write_claude_hooks_settings(run_dir, acquire=acquire, release=release)
+            state_script = _write_state_hook_script(run_dir)
+            hooks_path = _write_claude_hooks_settings(
+                run_dir, acquire=acquire, release=release, state=state_script
+            )
             parts.extend(["--settings", str(hooks_path)])
+            _write_skill_md(run_dir, harness="claude")
             metadata["provider_tools"] = {
                 "mode": "claude-hooks",
                 "settings_path": str(hooks_path),
                 "command": "odysseus-tool",
                 "env": metadata["provider_tools"]["env"],
-                "note": "per-turn task-slot gating (UserPromptSubmit/Stop)",
+                "note": "per-turn task-slot gating (UserPromptSubmit/Stop) + agent-state reporting",
             }
+            metadata["agent_state_hooks"] = {"mode": "claude-hooks", "states": ["working", "idle", "blocked"]}
         command = shlex.join(parts)
     elif harness == "omp":
         # OMP (oh-my-pi) is Pi-API-compatible; inject a minimal hook extension that
@@ -266,13 +379,15 @@ def build_coding_agent_launch_plan(
         if run_dir is not None:
             extension_path = _write_omp_extension(run_dir)
             parts.extend(["--hook", str(extension_path)])
+            _write_skill_md(run_dir, harness="omp")
             metadata["provider_tools"] = {
                 "mode": "omp-hook",
                 "hook_path": str(extension_path),
                 "command": "odysseus-tool",
                 "env": metadata["provider_tools"]["env"],
-                "note": "task-slot gating via before_agent_start/agent_end",
+                "note": "task-slot gating via before_agent_start/agent_end + agent-state reporting",
             }
+            metadata["agent_state_hooks"] = {"mode": "omp-hook", "states": ["working", "idle", "blocked"]}
         command = shlex.join(parts)
 
     metadata["command"] = command
@@ -299,6 +414,17 @@ function runOdysseusTool(args: string[]): Promise<string> {
       else reject(new Error(stderr.trim() || stdout.trim() || `odysseus-tool exited ${code}`));
     });
   });
+}
+
+// --- Agent-state reporting --------------------------------------------------
+// Report this run's semantic state for the herdr rollup (working|blocked|idle|
+// done|unknown). Fire-and-forget: a failed report must never wedge the agent.
+function reportState(state: string): void {
+  try {
+    runOdysseusTool([
+      "call", "agent", "--action", "state", "--json", JSON.stringify({ state }),
+    ]).catch(() => {});
+  } catch (_err) { /* best-effort */ }
 }
 
 // --- Task-slot gating -------------------------------------------------------
@@ -350,13 +476,20 @@ export default function (pi: ExtensionAPI) {
 __ODYSSEUS_PI_PROVIDER_REGISTRATION__
   pi.on("session_start", async (_event, ctx) => {
     ctx.ui.notify("Odysseus provider tools loaded", "info");
+    // Surface the Code Station control-plane skill so the agent knows it can drive
+    // its own spaces/tabs/panes/agents via the `ody` CLI and report its own state.
+    ctx.ui.notify(__ODYSSEUS_ODY_SKILL_SUMMARY__, "info");
   });
 
   // Hold a slot for the whole turn: acquire when the agent starts responding (and
   // re-acquire at the start of each turn after a yield), release when it finishes.
-  odysseusOn(pi, "agent_start", async (_event, ctx) => { await odysseusEnsureSlot(ctx && (ctx as any).signal); });
-  odysseusOn(pi, "turn_start", async (_event, ctx) => { await odysseusEnsureSlot(ctx && (ctx as any).signal); });
-  odysseusOn(pi, "agent_end", async () => { await odysseusReleaseSlot(); });
+  // The same events also report semantic agent state for the herdr rollup.
+  odysseusOn(pi, "agent_start", async (_event, ctx) => { reportState("working"); await odysseusEnsureSlot(ctx && (ctx as any).signal); });
+  odysseusOn(pi, "turn_start", async (_event, ctx) => { reportState("working"); await odysseusEnsureSlot(ctx && (ctx as any).signal); });
+  odysseusOn(pi, "agent_end", async () => { await odysseusReleaseSlot(); reportState("idle"); });
+  // Surface "blocked" when the agent pauses for a permission / tool approval.
+  odysseusOn(pi, "permission_request", async () => { reportState("blocked"); });
+  odysseusOn(pi, "tool_approval", async () => { reportState("blocked"); });
 
   pi.registerTool({
     name: "odysseus_yield",
@@ -420,6 +553,12 @@ function runOdysseusTool(args) {
   });
 }
 
+function reportState(state) {
+  try {
+    runOdysseusTool(["call", "agent", "--action", "state", "--json", JSON.stringify({ state })]).catch(() => {});
+  } catch (_err) {}
+}
+
 let odysseusHeldSlot = null;
 
 async function odysseusEnsureSlot(signal) {
@@ -450,11 +589,101 @@ function odysseusOn(pi, event, handler) {
 }
 
 export default function (pi) {
-  odysseusOn(pi, "agent_start", async (_event, ctx) => { await odysseusEnsureSlot(ctx && ctx.signal); });
-  odysseusOn(pi, "turn_start", async (_event, ctx) => { await odysseusEnsureSlot(ctx && ctx.signal); });
-  odysseusOn(pi, "agent_end", async () => { await odysseusReleaseSlot(); });
+  odysseusOn(pi, "session_start", async (_event, ctx) => {
+    try { ctx.ui.notify(__ODYSSEUS_ODY_SKILL_SUMMARY__, "info"); } catch (_err) {}
+  });
+  odysseusOn(pi, "agent_start", async (_event, ctx) => { reportState("working"); await odysseusEnsureSlot(ctx && ctx.signal); });
+  odysseusOn(pi, "turn_start", async (_event, ctx) => { reportState("working"); await odysseusEnsureSlot(ctx && ctx.signal); });
+  odysseusOn(pi, "agent_end", async () => { await odysseusReleaseSlot(); reportState("idle"); });
+  odysseusOn(pi, "permission_request", async () => { reportState("blocked"); });
+  odysseusOn(pi, "tool_approval", async () => { reportState("blocked"); });
 }
 '''
+
+
+# --- ody control-plane skill -------------------------------------------------
+# A concise, accurate guide to the `ody` CLI (the Code Station control plane) that
+# is injected per-run so an agent inside a pane can drive its own layout and
+# report its own state. Verbs here mirror src/coding_cli.py exactly. The MCP
+# server (Codex) and the Pi/OMP extension tools are now thin adapters over the
+# same provider bridge — `ody` is the primary agent interface.
+
+_ODY_SKILL_SUMMARY = (
+    "Code Station control plane: run `ody` in this pane to drive spaces/tabs/panes/"
+    "agents (e.g. `ody space list`, `ody agent start --space <id> --harness claude`, "
+    "`ody pane split <pane_id> --tab <tab_id>`). Report your state with "
+    "`ody agent report-state <agent_id> --state working|blocked|idle|done`. "
+    "See the injected SKILL.md / AGENTS.md for the full command list."
+)
+
+_ODY_SKILL_MD = """\
+# Code Station control plane (`ody`)
+
+You are running inside a Code Station terminal *pane*. The `ody` CLI is on your
+PATH and is pre-pointed at this workspace's control socket (`$ODYSSEUS_ODY_SOCKET`)
+and owner (`$ODYSSEUS_OWNER`). Use it to inspect and drive your own layout
+(spaces, tabs, panes) and to start/observe other agents — without touching the
+HTTP API. Every command prints a JSON result.
+
+## Concepts
+- **space** — a project/workspace (the top-level grouping).
+- **tab** — a tab within a space; holds a pane layout tree.
+- **pane** — a terminal pane within a tab; each runs one *run*.
+- **agent** — a thread (one coding agent); its active run drives a pane.
+
+## Health
+- `ody ping` — confirm the control socket is reachable.
+
+## Spaces
+- `ody space list [--include-archived]`
+- `ody space get <space_id>`
+- `ody space rename <space_id> --name <name>`
+- `ody space focus <space_id>`
+
+## Tabs
+- `ody tab list --space <space_id>`
+- `ody tab create --space <space_id> [--label <label>] [--position <n>]`
+- `ody tab get <tab_id>`
+- `ody tab rename <tab_id> --label <label>`
+- `ody tab focus <tab_id>`
+- `ody tab close <tab_id>`
+
+## Layout
+- `ody layout get <tab_id>`
+- `ody layout put <tab_id> --tree '<json>' [--focus-pane-id <id>]`
+
+## Panes
+- `ody pane list <tab_id>`
+- `ody pane split [<pane_id>] --tab <tab_id> [--direction right|left|up|down]`
+- `ody pane close <pane_id> --tab <tab_id>`
+- `ody pane rename <pane_id> --tab <tab_id> --title <title>`
+- `ody pane send-text <run_id> --text <text>`
+- `ody pane send-keys <run_id> <keys...>` (named keys: enter, tab, esc, ctrl-c, up, ...)
+- `ody pane read <run_id> [--source visible|recent|recent-unwrapped] [--lines <n>]`
+- `ody pane report-agent <thread_id> --state working|blocked|done|idle|unknown [--message <m>] [--run-id <id>]`
+
+## Agents (threads)
+- `ody agent list [--space <space_id>] [--running-only]`
+- `ody agent get <agent_id>`
+- `ody agent start --space <space_id> [--harness <id>] [--command <cmd>] [--cwd <dir>] [--title <t>] [--tab <tab_id>] [--pane <pane_id>]`
+- `ody agent send <agent_id> --text <text>`
+- `ody agent read <agent_id> [--source visible|recent|recent-unwrapped] [--lines <n>]`
+- `ody agent focus <agent_id>`
+- `ody agent report-state <agent_id> --state working|blocked|done|idle|unknown [--message <m>] [--run-id <id>]`
+
+## Events
+- `ody events subscribe --thread <thread_id> [--after-seq <n>] [--run-id <id>]`
+  Streams JSON event frames (including `agent_state_changed`) until interrupted.
+
+## Reporting your own state
+Your harness hooks already report `working`/`idle`/`blocked` automatically, and the
+server marks the run `done` on exit. To override or annotate explicitly:
+
+    ody agent report-state <your_agent_id> --state working --message "compiling"
+
+States: `working` (actively running), `blocked` (waiting on input/approval),
+`idle` (turn finished, run still alive), `done` (run ended), `unknown`.
+"""
 
 
 __all__ = [

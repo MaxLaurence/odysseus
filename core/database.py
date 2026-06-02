@@ -583,6 +583,11 @@ class CodingProject(TimestampMixin, Base):
     default_endpoint_id = Column(String, nullable=True)
     default_model       = Column(String, nullable=True)
     archived            = Column(Boolean, default=False, nullable=False)
+    # herdr-style spaces: a project *is* a Space; worktree children nest under a parent.
+    parent_project_id   = Column(String, ForeignKey("coding_projects.id", ondelete="CASCADE"), nullable=True, index=True)
+    kind                = Column(String, nullable=False, default="root")   # 'root' | 'worktree'
+    worktree_branch     = Column(String, nullable=True)
+    worktree_path       = Column(Text, nullable=True)
 
     threads = relationship("CodingThread", back_populates="project", cascade="all, delete-orphan")
 
@@ -608,6 +613,11 @@ class CodingThread(TimestampMixin, Base):
     status            = Column(String, nullable=False, default="idle")
     last_run_id       = Column(String, nullable=True)
     metadata_json     = Column(Text, nullable=True)
+    # herdr-style agent surfacing: which tab/pane this thread mounts in + semantic state.
+    tab_id            = Column(String, ForeignKey("coding_tabs.id", ondelete="SET NULL"), nullable=True, index=True)
+    pane_id           = Column(String, nullable=True)
+    agent_state       = Column(String, nullable=False, default="idle")   # working|blocked|done|idle|unknown
+    state_changed_at  = Column(DateTime, nullable=True)
 
     project = relationship("CodingProject", back_populates="threads")
     session = relationship("Session", backref=backref("coding_threads", cascade="save-update, merge"))
@@ -732,6 +742,44 @@ class CodingProviderToken(Base):
         Index('ix_coding_provider_tokens_owner_thread', 'owner', 'thread_id', 'created_at'),
         Index('ix_coding_provider_tokens_prefix_active', 'token_prefix', 'revoked_at', 'expires_at'),
     )
+
+
+class CodingTab(TimestampMixin, Base):
+    """Renamable tab inside a Space (project). Owns one pane split-tree layout.
+
+    herdr hierarchy: Space (=CodingProject) > Tab (this) > Pane (leaf in layout) > Agent (=CodingThread).
+    """
+    __tablename__ = "coding_tabs"
+
+    id            = Column(String, primary_key=True, index=True)
+    owner         = Column(String, nullable=True, index=True)
+    project_id    = Column(String, ForeignKey("coding_projects.id", ondelete="CASCADE"), nullable=False, index=True)
+    label         = Column(String, nullable=False, default="terminal")
+    position      = Column(Integer, nullable=False, default=0)
+    metadata_json = Column(Text, nullable=True)
+
+    layout = relationship("CodingLayout", back_populates="tab", uselist=False, cascade="all, delete-orphan")
+
+    __table_args__ = (
+        Index('ix_coding_tabs_owner_project', 'owner', 'project_id', 'position'),
+    )
+
+
+class CodingLayout(Base):
+    """Serialized pane split-tree for a single tab (one row per tab).
+
+    `tree_json` is the binary split-tree the frontend renders (LEAF/SPLIT nodes),
+    so the layout survives reloads and is consistent across clients.
+    """
+    __tablename__ = "coding_layouts"
+
+    tab_id        = Column(String, ForeignKey("coding_tabs.id", ondelete="CASCADE"), primary_key=True)
+    owner         = Column(String, nullable=True, index=True)
+    tree_json     = Column(Text, nullable=False, default="null")
+    focus_pane_id = Column(String, nullable=True)
+    updated_at    = Column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    tab = relationship("CodingTab", back_populates="layout")
 
 
 class TaskRun(Base):
@@ -1647,6 +1695,66 @@ def _migrate_seed_email_account():
         logging.getLogger(__name__).warning(f"seed email account migration: {e}")
 
 
+def _migrate_add_coding_space_columns():
+    """Add herdr-style Space/worktree columns to coding_projects. Guarded + idempotent."""
+    import sqlite3
+    db_path = DATABASE_URL.replace("sqlite:///", "")
+    if not os.path.exists(db_path):
+        return
+    try:
+        conn = sqlite3.connect(db_path)
+        cursor = conn.execute("PRAGMA table_info(coding_projects)")
+        columns = [row[1] for row in cursor.fetchall()]
+        adds = {
+            "parent_project_id": "ALTER TABLE coding_projects ADD COLUMN parent_project_id TEXT",
+            "kind":              "ALTER TABLE coding_projects ADD COLUMN kind TEXT DEFAULT 'root'",
+            "worktree_branch":   "ALTER TABLE coding_projects ADD COLUMN worktree_branch TEXT",
+            "worktree_path":     "ALTER TABLE coding_projects ADD COLUMN worktree_path TEXT",
+        }
+        added = False
+        for col, ddl in adds.items():
+            if col not in columns:
+                conn.execute(ddl)
+                added = True
+        conn.execute("CREATE INDEX IF NOT EXISTS ix_coding_projects_parent ON coding_projects(parent_project_id)")
+        conn.commit()  # commit the ALTERs and/or the CREATE INDEX
+        if added:
+            logging.getLogger(__name__).info("Migrated: added Space/worktree columns to coding_projects")
+        conn.close()
+    except Exception as e:
+        logging.getLogger(__name__).warning(f"coding_projects space-columns migration failed: {e}")
+
+
+def _migrate_add_coding_thread_agent_columns():
+    """Add herdr-style agent surfacing columns to coding_threads. Guarded + idempotent."""
+    import sqlite3
+    db_path = DATABASE_URL.replace("sqlite:///", "")
+    if not os.path.exists(db_path):
+        return
+    try:
+        conn = sqlite3.connect(db_path)
+        cursor = conn.execute("PRAGMA table_info(coding_threads)")
+        columns = [row[1] for row in cursor.fetchall()]
+        adds = {
+            "tab_id":           "ALTER TABLE coding_threads ADD COLUMN tab_id TEXT",
+            "pane_id":          "ALTER TABLE coding_threads ADD COLUMN pane_id TEXT",
+            "agent_state":      "ALTER TABLE coding_threads ADD COLUMN agent_state TEXT DEFAULT 'idle'",
+            "state_changed_at": "ALTER TABLE coding_threads ADD COLUMN state_changed_at DATETIME",
+        }
+        added = False
+        for col, ddl in adds.items():
+            if col not in columns:
+                conn.execute(ddl)
+                added = True
+        conn.execute("CREATE INDEX IF NOT EXISTS ix_coding_threads_tab ON coding_threads(tab_id)")
+        conn.commit()  # commit the ALTERs and/or the CREATE INDEX
+        if added:
+            logging.getLogger(__name__).info("Migrated: added agent/tab columns to coding_threads")
+        conn.close()
+    except Exception as e:
+        logging.getLogger(__name__).warning(f"coding_threads agent-columns migration failed: {e}")
+
+
 def init_db():
     """
     Initialize the database by creating all tables.
@@ -1680,6 +1788,8 @@ def init_db():
     _migrate_add_notifications_enabled()
     _migrate_drop_ping_notes_tasks()
     _migrate_add_crew_member_id()
+    _migrate_add_coding_space_columns()
+    _migrate_add_coding_thread_agent_columns()
     _migrate_add_assistant_columns()
     _migrate_seed_email_account()
     _migrate_add_calendar_metadata()

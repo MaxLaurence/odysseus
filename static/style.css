@@ -36531,3 +36531,105 @@ body.code-space-active > #chat-container { display: none !important; }
   border-color: color-mix(in srgb, var(--cs-bad, #e06c75) 55%, var(--border));
   background: color-mix(in srgb, var(--cs-bad, #e06c75) 12%, var(--panel));
 }
+
+/* ============================================================================
+ * herdr-style hierarchy: Spaces rail, Tab bar, semantic agent-state dots.
+ * (Appended by the Code Station revamp — Space > Tab > Pane > Agent.)
+ * ========================================================================== */
+.code-station-modal { --cs-blocked: #f0a868; }
+
+/* Semantic agent-state dots (working|blocked|done|unknown) extend the lifecycle set. */
+[data-status="working"].cs-thread-dot, [data-status="working"].cs-pane-led {
+  background: var(--cs-ok);
+  box-shadow: 0 0 5px color-mix(in srgb, var(--cs-ok) 70%, transparent);
+  animation: cs-breathe 1.6s var(--cs-ease) infinite;
+}
+[data-status="blocked"].cs-thread-dot, [data-status="blocked"].cs-pane-led {
+  background: var(--cs-blocked);
+  box-shadow: 0 0 6px color-mix(in srgb, var(--cs-blocked) 85%, transparent);
+  animation: cs-pulse 1s var(--cs-ease) infinite;
+}
+[data-status="done"].cs-thread-dot, [data-status="done"].cs-pane-led {
+  background: color-mix(in srgb, var(--cs-info) 68%, transparent);
+}
+[data-status="unknown"].cs-thread-dot, [data-status="unknown"].cs-pane-led {
+  background: color-mix(in srgb, var(--cs-terminal-fg) 22%, transparent);
+}
+
+/* ── Workspace tab bar (renamable, per-space) ─────────────────────────────── */
+.cs-tab-bar {
+  display: flex; align-items: stretch; gap: 2px;
+  padding: 0 6px; min-height: 30px;
+  background: color-mix(in srgb, var(--cs-terminal) 72%, var(--panel));
+  border-bottom: 1px solid var(--cs-seam);
+  overflow-x: auto; overflow-y: hidden;
+}
+.cs-tab-bar[data-empty="true"] { display: none; }
+.cs-tab {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 4px 9px; font-size: 11.5px; white-space: nowrap;
+  color: color-mix(in srgb, var(--cs-terminal-fg) 62%, transparent);
+  border: 1px solid transparent; border-bottom: none;
+  border-radius: 6px 6px 0 0; align-self: flex-end; cursor: pointer;
+  transition: color .12s var(--cs-ease), background .12s var(--cs-ease);
+}
+.cs-tab:hover { color: var(--cs-terminal-fg); background: color-mix(in srgb, var(--cs-terminal-fg) 6%, transparent); }
+.cs-tab.active {
+  color: var(--cs-terminal-fg);
+  background: var(--cs-terminal);
+  border-color: var(--cs-seam);
+  box-shadow: inset 0 2px 0 var(--cs-accent);
+}
+.cs-tab-label { background: none; border: none; color: inherit; font: inherit; cursor: pointer; padding: 0; }
+.cs-tab-dot { width: 6px; height: 6px; }
+.cs-tab-close, .cs-tab-add {
+  background: none; border: none; cursor: pointer; line-height: 1; border-radius: 4px;
+  color: color-mix(in srgb, var(--cs-terminal-fg) 48%, transparent);
+}
+.cs-tab-close { font-size: 14px; padding: 0 2px; }
+.cs-tab-close:hover { color: var(--cs-bad); }
+.cs-tab-add { align-self: center; font-size: 16px; padding: 0 6px; }
+.cs-tab-add:hover { color: var(--cs-terminal-fg); }
+
+/* ── Spaces rail (project + live branch + nested worktrees + rollup dot) ───── */
+.cs-spaces-list { max-height: 32vh; overflow-y: auto; flex: 0 0 auto; }
+.cs-space-row { display: flex; align-items: center; gap: 7px; padding: 4px 8px; }
+.cs-space-row.selected { background: color-mix(in srgb, var(--cs-accent) 12%, transparent); }
+.cs-space-row:hover { background: color-mix(in srgb, var(--cs-terminal-fg) 5%, transparent); }
+.cs-space-row .code-station-row-main {
+  display: flex; flex-direction: column; align-items: flex-start; gap: 1px;
+  background: none; border: none; color: inherit; cursor: pointer;
+  min-width: 0; flex: 1; text-align: left; padding: 0;
+}
+.cs-space-row .code-station-row-title { font-size: 12px; color: var(--cs-terminal-fg); }
+.cs-space-branch {
+  font-size: 10px; color: color-mix(in srgb, var(--cs-terminal-fg) 45%, transparent);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 100%;
+}
+.cs-space-child { margin-left: 14px; border-left: 1px solid var(--cs-seam); padding-left: 9px; }
+.cs-space-dot { width: 7px; height: 7px; }
+.cs-space-worktree, .cs-space-row .cs-row-delete {
+  opacity: 0; background: none; border: none; cursor: pointer;
+  color: color-mix(in srgb, var(--cs-terminal-fg) 55%, transparent);
+  transition: opacity .12s var(--cs-ease);
+}
+.cs-space-row:hover .cs-space-worktree, .cs-space-row:hover .cs-row-delete { opacity: .75; }
+.cs-space-worktree:hover { color: var(--cs-accent); opacity: 1; }
+.cs-space-row .cs-row-delete:hover { color: var(--cs-bad); opacity: 1; }
+
+/* ── AGENTS section scope/running toggles ─────────────────────────────────── */
+.cs-scope-toggle {
+  background: none; border: 1px solid var(--cs-seam);
+  color: color-mix(in srgb, var(--cs-terminal-fg) 55%, transparent);
+  font-size: 9.5px; letter-spacing: .02em; text-transform: lowercase;
+  padding: 1px 7px; border-radius: 10px; cursor: pointer; margin-left: 4px;
+}
+.cs-scope-toggle:hover {
+  color: var(--cs-terminal-fg);
+  border-color: color-mix(in srgb, var(--cs-terminal-fg) 30%, transparent);
+}
+.cs-scope-toggle.is-on, .cs-scope-toggle[data-scope="all"] {
+  color: var(--cs-accent);
+  border-color: color-mix(in srgb, var(--cs-accent) 50%, transparent);
+  background: color-mix(in srgb, var(--cs-accent) 10%, transparent);
+}

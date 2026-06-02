@@ -581,6 +581,59 @@ class CodingRuntimeService:
         await self.pump_queue(owner=owner)
         return detached
 
+    def active_run_count(self, *, owner: str | None = None) -> int:
+        """Runs holding (or about to hold) a live session: starting/running/stopping.
+
+        Backs the desktop quit prompt — "would quitting orphan work?" Queued runs
+        are excluded (no process yet; they resurvive a restart untouched) and so are
+        finished runs. ``owner=None`` counts across all owners (the desktop is a
+        single-machine, typically single-user deployment).
+        """
+        db = SessionLocal()
+        try:
+            query = db.query(CodingRun).filter(CodingRun.status.in_(tuple(ACTIVE_STATUSES)))
+            if owner is not None:
+                query = query.join(CodingThread, CodingThread.id == CodingRun.thread_id).filter(
+                    CodingRun.owner == owner, CodingThread.owner == owner
+                )
+            return query.count()
+        finally:
+            db.close()
+
+    async def stop_all_runs(self, *, owner: str | None = None, reason: str = "app shutdown") -> int:
+        """Stop every active or queued run (optionally scoped to one owner).
+
+        Backs the desktop "Quit Everything" path: a machine-level wind-down that
+        should leave nothing orphaned. Each run is stopped exactly like ``stop_run``
+        (graceful SIGINT then kill of its dtach session), which leaves a running run
+        in ``stopping``; if the backend exits before the monitor task finalizes it,
+        ``startup_reconcile`` reconciles ``stopping`` → ``cancelled`` on next launch.
+        Queued / not-yet-attached runs are cancelled outright. Returns the number of
+        runs that were active/queued when the stop was issued. ``owner=None`` stops
+        across all owners. Deliberately does NOT pump the queue afterwards — the whole
+        point is to wind down, not relaunch.
+        """
+        stopped = 0
+        async with self._lock:
+            db = SessionLocal()
+            try:
+                query = db.query(CodingRun).filter(CodingRun.status.in_(tuple(BLOCKING_STATUSES)))
+                if owner is not None:
+                    query = query.join(CodingThread, CodingThread.id == CodingRun.thread_id).filter(
+                        CodingRun.owner == owner, CodingThread.owner == owner
+                    )
+                runs = query.order_by(CodingRun.queued_at.asc()).all()
+                for run in runs:
+                    try:
+                        await self._stop_run_db(db, run, reason=reason)
+                        stopped += 1
+                    except Exception:
+                        logger.exception("stop_all_runs: failed to stop run %s", run.id)
+                db.commit()
+            finally:
+                db.close()
+        return stopped
+
     async def send_stdin(self, run_id: str, owner: str, data: str) -> CodingRun:
         run = await self._get_owned_run(run_id, owner)
         metadata = _json_loads(run.metadata_json, {})

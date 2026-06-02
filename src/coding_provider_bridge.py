@@ -222,6 +222,66 @@ def ody_socket_path() -> str:
     return os.path.join(base, "ody.sock")
 
 
+PROVIDER_TOOL_URL_FILENAME = "ody-tool-url"
+
+
+def provider_tool_url_file() -> str:
+    """Stable path where the running backend publishes its CURRENT provider-tool
+    URL. Lives next to the ody socket (``<data_dir>/ody-tool-url``) — a path that
+    does NOT change across backend restarts, even though the backend's HTTP port
+    does. Long-lived agent runs re-read it so a restart on a new port doesn't
+    orphan their ``odysseus-tool`` calls with a stale baked-in ``ODYSSEUS_TOOL_URL``.
+    """
+    return str(Path(ody_socket_path()).parent / PROVIDER_TOOL_URL_FILENAME)
+
+
+def read_published_provider_tool_url() -> str:
+    """Return the backend's currently-published provider-tool URL, or "" if none.
+
+    Read fresh on every call (no caching) so a backend restart on a new port is
+    picked up immediately by already-running agent runs.
+    """
+    try:
+        with open(provider_tool_url_file(), encoding="utf-8") as handle:
+            value = handle.read().strip()
+    except OSError:
+        return ""
+    return _normalize_provider_tool_url(value) if value else ""
+
+
+def publish_provider_tool_url(url: str | None = None) -> str:
+    """Publish the backend's current provider-tool URL to the stable file so
+    running agents can re-resolve the (dynamic) port after a restart. Call once at
+    backend startup. Best-effort: returns the URL written, or "" on failure.
+
+    Resolves the URL from the server's own env (``provider_tool_url()`` → the
+    current ``ODYSSEUS_PORT``) unless an explicit ``url`` is given. Writes
+    atomically (temp + ``os.replace``) so a concurrent reader never sees a partial
+    file.
+    """
+    resolved = _normalize_provider_tool_url(url) if url else provider_tool_url()
+    if not resolved:
+        return ""
+    path = Path(provider_tool_url_file())
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+        tmp.write_text(resolved, encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError:
+        return ""
+    return resolved
+
+
+def unpublish_provider_tool_url() -> None:
+    """Remove the published URL file on graceful shutdown (best-effort). A new
+    startup overwrites it anyway, so a leftover file from a crash is harmless."""
+    try:
+        os.remove(provider_tool_url_file())
+    except OSError:
+        pass
+
+
 def bridge_env_status() -> dict[str, Any]:
     env = {key: os.environ.get(key, "") for key in PROVIDER_BRIDGE_ENV_KEYS}
     return {

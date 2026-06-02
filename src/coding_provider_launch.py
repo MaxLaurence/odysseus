@@ -625,11 +625,14 @@ export default function (pi) {
 # same provider bridge — `ody` is the primary agent interface.
 
 _ODY_SKILL_SUMMARY = (
-    "Code Station control plane: run `ody` in this pane to drive spaces/tabs/panes/"
-    "agents (e.g. `ody space list`, `ody agent start --space <id> --harness claude`, "
-    "`ody pane split <pane_id> --tab <tab_id>`). Report your state with "
+    "Code Station control plane: use the `ody` CLI (on your PATH, talks to a stable "
+    "control socket) to see and drive everything outside your own pane — list/read "
+    "other agents & panes, spawn subagents, split panes, send input. When the user "
+    "says 'my other pane', 'the other agent', or 'what's running', run "
+    "`ody agent list --running-only` then `ody agent read <id>` / `ody pane read <run_id>` "
+    "— do NOT use tmux/dtach or tail raw.log. Report state with "
     "`ody agent report-state <agent_id> --state working|blocked|idle|done`. "
-    "See the injected SKILL.md / AGENTS.md for the full command list."
+    "Full reference in the injected guide."
 )
 
 _ODY_SKILL_MD = """\
@@ -640,6 +643,37 @@ PATH and is pre-pointed at this workspace's control socket (`$ODYSSEUS_ODY_SOCKE
 and owner (`$ODYSSEUS_OWNER`). Use it to inspect and drive your own layout
 (spaces, tabs, panes) and to start/observe other agents — without touching the
 HTTP API. Every command prints a JSON result.
+
+## When to use `ody` (and what NOT to do)
+`ody` is how you SEE and DRIVE everything outside your own pane, and it talks to a
+**stable control socket** — so it keeps working even if the `odysseus_provider` /
+`odysseus-tool` HTTP bridge reports an error. Reach for `ody` whenever the user
+mentions another pane/tab/agent, asks what's running, or wants to change the
+layout or start more agents.
+
+**Do NOT** read another pane by running `tmux` or `dtach`, by `cat`-ing
+`raw.log`, or by poking at `/tmp/odysseus-cs/*` sockets or files under
+`…/coding_runs/<id>/`. Those are raw terminal bytes (escape codes, partial
+redraws) or internal plumbing and will mislead you. Use `ody … read`, which
+returns clean decoded text. If `odysseus_provider` fails, fall back to `ody` —
+NOT to tmux/dtach.
+
+Common requests → what to run:
+- "look at / check my other pane", "what's the other agent doing", "what's
+  running?" → `ody agent list --running-only` (or `ody pane list <tab_id>`) to
+  find it, then `ody agent read <agent_id>` / `ody pane read <run_id>`.
+- "spawn / start a subagent", "run this in another agent", "kick off a helper" →
+  `ody agent start --space <space_id> --harness <id> --command <cmd>`.
+- "split the screen", "open a pane beside this" → `ody pane split <pane_id>
+  --tab <tab_id> --direction right`.
+- "tell the other agent X", "send this to that pane" → `ody agent send
+  <agent_id> --text <…>` (or `ody pane send-text <run_id> --text <…>`; submit a
+  line with `ody pane send-keys <run_id> enter`).
+- "watch / wait on the other agent" → `ody events subscribe --thread <thread_id>`.
+
+IDs cascade: `ody space list` → `ody tab list --space <id>` → `ody pane list
+<tab_id>` / `ody agent list --space <id>`; feed the run_id / agent_id you get back
+into the read/send/split commands above.
 
 ## Concepts
 - **space** — a project/workspace (the top-level grouping).

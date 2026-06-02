@@ -12,7 +12,11 @@ import urllib.error
 import urllib.request
 from typing import Any
 
-from src.coding_provider_bridge import bridge_env_status, provider_tool_url
+from src.coding_provider_bridge import (
+    bridge_env_status,
+    provider_tool_url,
+    read_published_provider_tool_url,
+)
 
 
 def _json_payload(value: str | None) -> Any:
@@ -25,7 +29,14 @@ def _json_payload(value: str | None) -> Any:
 
 
 def _tool_call_url() -> str:
-    return provider_tool_url()
+    # Prefer the URL the backend publishes at startup (re-read every call). The
+    # backend's HTTP port is dynamic and changes on each restart, but the published
+    # file sits at a stable path next to the ody socket — so a long-lived run
+    # re-resolves the current port instead of hitting the dead one baked into
+    # ODYSSEUS_TOOL_URL at launch (which is what caused "[Errno 61] Connection
+    # refused" after a backend restart). Falls back to the launch-time env when
+    # nothing is published (e.g. dev runs, or before the backend has published).
+    return read_published_provider_tool_url() or provider_tool_url()
 
 
 def _request(url: str, payload: dict[str, Any] | None = None, method: str = "POST") -> Any:

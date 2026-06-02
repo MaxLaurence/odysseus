@@ -758,6 +758,9 @@ def test_endpoint_backed_pi_launch_registers_odysseus_provider(tmp_path):
 
 
 def _clear_provider_url_env(monkeypatch):
+    import os
+    import tempfile
+
     for key in (
         "ODYSSEUS_TOOL_URL",
         "ODYSSEUS_PUBLIC_BASE_URL",
@@ -768,6 +771,60 @@ def _clear_provider_url_env(monkeypatch):
         "APP_PORT",
     ):
         monkeypatch.delenv(key, raising=False)
+    # Point the published-URL lookup (read by provider_cli._tool_call_url) at a temp
+    # dir with no `ody-tool-url` file, so URL-resolution tests exercise the env-based
+    # path deterministically regardless of the host's real data dir. Tests that want
+    # a published URL override ODYSSEUS_ODY_SOCKET with their own tmp_path.
+    monkeypatch.setenv(
+        "ODYSSEUS_ODY_SOCKET",
+        os.path.join(tempfile.gettempdir(), "odysseus-test-no-published-url", "ody.sock"),
+    )
+
+
+def test_publish_and_read_provider_tool_url_roundtrip(monkeypatch, tmp_path):
+    import src.coding_provider_bridge as provider_bridge
+
+    _clear_provider_url_env(monkeypatch)
+    monkeypatch.setenv("ODYSSEUS_ODY_SOCKET", str(tmp_path / "ody.sock"))
+    monkeypatch.setenv("ODYSSEUS_PORT", "61703")
+
+    written = provider_bridge.publish_provider_tool_url()
+    assert written == "http://localhost:61703/api/coding/provider/tool"
+    assert (tmp_path / "ody-tool-url").read_text(encoding="utf-8").strip() == written
+    assert provider_bridge.read_published_provider_tool_url() == written
+
+    provider_bridge.unpublish_provider_tool_url()
+    assert provider_bridge.read_published_provider_tool_url() == ""
+
+
+def test_tool_call_url_prefers_published_over_stale_env(monkeypatch, tmp_path):
+    """A backend restart changes the dynamic port, so the agent's baked-in
+    ODYSSEUS_TOOL_URL goes stale. `odysseus-tool` must re-resolve from the published
+    file (current port), not the dead port in its env — the fix for the
+    '[Errno 61] Connection refused' a restart caused for already-running agents."""
+    import src.coding_provider_cli as provider_cli
+
+    _clear_provider_url_env(monkeypatch)
+    monkeypatch.setenv("ODYSSEUS_ODY_SOCKET", str(tmp_path / "ody.sock"))
+    # Backend (re)started on a new port and published it next to the ody socket:
+    (tmp_path / "ody-tool-url").write_text(
+        "http://127.0.0.1:61703/api/coding/provider/tool", encoding="utf-8"
+    )
+    # The agent still has the OLD (now-dead) port baked into its env from launch:
+    monkeypatch.setenv("ODYSSEUS_TOOL_URL", "http://127.0.0.1:55807/api/coding/provider/tool")
+
+    assert provider_cli._tool_call_url() == "http://127.0.0.1:61703/api/coding/provider/tool"
+
+
+def test_tool_call_url_falls_back_to_env_when_nothing_published(monkeypatch, tmp_path):
+    import src.coding_provider_cli as provider_cli
+
+    _clear_provider_url_env(monkeypatch)
+    # Stable dir exists but the backend hasn't published (e.g. dev run): use the env.
+    monkeypatch.setenv("ODYSSEUS_ODY_SOCKET", str(tmp_path / "ody.sock"))
+    monkeypatch.setenv("ODYSSEUS_TOOL_URL", "http://127.0.0.1:55807/api/coding/provider/tool")
+
+    assert provider_cli._tool_call_url() == "http://127.0.0.1:55807/api/coding/provider/tool"
 
 
 @pytest.mark.parametrize(

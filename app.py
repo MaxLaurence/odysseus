@@ -850,6 +850,16 @@ async def startup_event():
     except Exception as e:
         logger.warning("ody socket server failed to start: %s", e)
         app.state.ody_socket_server = None
+    # Publish the current (dynamic) provider-tool URL to a stable file so already-
+    # running agent runs re-resolve the port after a backend restart instead of
+    # hitting the dead port baked into their ODYSSEUS_TOOL_URL at launch.
+    try:
+        from src.coding_provider_bridge import publish_provider_tool_url
+        published = publish_provider_tool_url()
+        if published:
+            logger.info("Published provider-tool URL for agents: %s", published)
+    except Exception as e:
+        logger.warning("Failed to publish provider-tool URL: %s", e)
     if upload_cleanup_func:
         upload_cleanup_task = asyncio.create_task(upload_cleanup_func())
     # Always-on monitor that auto-continues the agent when a background bash
@@ -1072,6 +1082,11 @@ async def shutdown_event():
         await stop_ody_socket_server(getattr(app.state, "ody_socket_server", None))
     except Exception as e:
         logger.warning("ody socket server shutdown error: %s", e)
+    try:
+        from src.coding_provider_bridge import unpublish_provider_tool_url
+        unpublish_provider_tool_url()
+    except Exception as e:
+        logger.warning("provider-tool URL cleanup error: %s", e)
     # Close webhook manager
     try:
         await webhook_manager.close()

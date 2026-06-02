@@ -1011,6 +1011,21 @@ def setup_coding_routes() -> APIRouter:
         finally:
             db.close()
 
+    @router.get("/runtime/active-tasks")
+    async def runtime_active_tasks(request: Request):
+        # Machine-level count (all owners) backing the desktop quit prompt. Side
+        # effect free — unlike /queue it does NOT pump, so it's safe on a quit path.
+        require_admin(request)
+        return {"active": runtime.active_run_count()}
+
+    @router.post("/runtime/stop-all")
+    async def runtime_stop_all(request: Request):
+        # Backs the desktop "Quit Everything" path: stop every active/queued run
+        # across all owners so nothing is left orphaned when the backend goes down.
+        require_admin(request)
+        stopped = await runtime.stop_all_runs(reason="app quit")
+        return {"stopped": stopped}
+
     @router.get("/settings")
     async def get_coding_settings(request: Request):
         _owner(request)

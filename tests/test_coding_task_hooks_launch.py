@@ -116,6 +116,17 @@ def test_generic_harness_does_not_inject_ody_guide(tmp_path):
     assert "developer_instructions=" not in plan.command
 
 
+def test_ody_guide_tells_agent_when_to_use_it(tmp_path):
+    # The guide must steer agents to `ody` for other panes/agents and AWAY from raw
+    # terminal reads — the failure mode the user hit (agent ran `tmux capture-pane`
+    # / tailed raw.log instead of using the tool).
+    cmd = _plan("pi", tmp_path).command
+    assert "agent list --running-only" in cmd   # how to find other agents
+    assert "pane read" in cmd                    # how to read another pane cleanly
+    assert "agent start" in cmd                  # spawning subagents is called out
+    assert "raw.log" in cmd and "tmux" in cmd    # named in the "do NOT" anti-pattern
+
+
 # --- Phase 3b: agent-state reporting added ALONGSIDE the task-slot gating ----
 
 

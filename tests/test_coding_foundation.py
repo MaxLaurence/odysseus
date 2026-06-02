@@ -1518,3 +1518,187 @@ def test_queue_response_includes_task_slot_snapshot(coding_client, isolated_codi
     assert task_slots["waiting_total"] == 0
     assert task_slots["endpoints"] == []
     assert "default_limit" in task_slots
+
+
+def test_active_run_count_excludes_queued_and_finished(isolated_coding_store):
+    # Backs the desktop quit prompt: only runs holding (or about to hold) a live
+    # session count. Queued runs (no process yet) and finished runs are excluded.
+    from src.coding_runtime import CodingRuntimeService
+
+    service = CodingRuntimeService()
+    _project_id, thread_id = _seed_project_and_thread(isolated_coding_store)
+    db = isolated_coding_store.SessionLocal()
+    try:
+        for status in ("running", "starting", "stopping", "queued", "exited"):
+            db.add(
+                CodingRun(
+                    id=f"run-{status}-{uuid.uuid4()}",
+                    thread_id=thread_id,
+                    owner="tester",
+                    harness_id="generic",
+                    status=status,
+                    command="echo hi",
+                    cwd=str(isolated_coding_store.workspace),
+                    metadata_json="{}",
+                )
+            )
+        db.commit()
+    finally:
+        db.close()
+
+    assert service.active_run_count() == 3
+    assert service.active_run_count(owner="tester") == 3
+    assert service.active_run_count(owner="someone-else") == 0
+
+
+@pytest.mark.asyncio
+async def test_stop_all_runs_stops_running_and_cancels_queued(monkeypatch, isolated_coding_store):
+    import src.coding_runtime as coding_runtime
+    from src.coding_runtime import CodingRuntimeService
+
+    monkeypatch.setattr(coding_runtime.CodingRuntimeService, "dtach_available", lambda _self: True)
+    killed: list[str] = []
+
+    async def has_session(_self, _name):
+        return True
+
+    async def send_input(_self, _name, _data):
+        return None
+
+    async def kill_session(_self, name):
+        killed.append(name)
+        return None
+
+    monkeypatch.setattr(coding_runtime.CodingPtyBridge, "has_session", has_session)
+    monkeypatch.setattr(coding_runtime.CodingPtyBridge, "send_input", send_input)
+    monkeypatch.setattr(coding_runtime.CodingPtyBridge, "kill_session", kill_session)
+
+    service = CodingRuntimeService()
+    _project_id, thread_id = _seed_project_and_thread(isolated_coding_store)
+    running_id = f"run-{uuid.uuid4()}"
+    queued_id = f"run-{uuid.uuid4()}"
+    exited_id = f"run-{uuid.uuid4()}"
+    db = isolated_coding_store.SessionLocal()
+    try:
+        db.add_all(
+            [
+                CodingRun(
+                    id=running_id,
+                    thread_id=thread_id,
+                    owner="tester",
+                    harness_id="generic",
+                    status="running",
+                    command="echo run",
+                    cwd=str(isolated_coding_store.workspace),
+                    tmux_session="sess-running",
+                    metadata_json="{}",
+                    started_at=datetime.utcnow(),
+                ),
+                CodingRun(
+                    id=queued_id,
+                    thread_id=thread_id,
+                    owner="tester",
+                    harness_id="generic",
+                    status="queued",
+                    command="echo queued",
+                    cwd=str(isolated_coding_store.workspace),
+                    metadata_json="{}",
+                ),
+                CodingRun(
+                    id=exited_id,
+                    thread_id=thread_id,
+                    owner="tester",
+                    harness_id="generic",
+                    status="exited",
+                    command="echo done",
+                    cwd=str(isolated_coding_store.workspace),
+                    metadata_json="{}",
+                    finished_at=datetime.utcnow(),
+                ),
+            ]
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    stopped = await service.stop_all_runs()
+
+    # running (→ stopping, session killed) + queued (→ cancelled); exited ignored.
+    assert stopped == 2
+    assert killed == ["sess-running"]
+    statuses = _run_statuses(isolated_coding_store, running_id, queued_id, exited_id)
+    assert statuses[running_id] == "stopping"
+    assert statuses[queued_id] == "cancelled"
+    assert statuses[exited_id] == "exited"
+
+
+def test_runtime_active_tasks_and_stop_all_endpoints(monkeypatch, coding_client, isolated_coding_store):
+    import src.coding_runtime as coding_runtime
+
+    monkeypatch.setattr(coding_runtime.CodingRuntimeService, "dtach_available", lambda _self: True)
+
+    async def has_session(_self, _name):
+        return True
+
+    async def send_input(_self, _name, _data):
+        return None
+
+    async def kill_session(_self, _name):
+        return None
+
+    monkeypatch.setattr(coding_runtime.CodingPtyBridge, "has_session", has_session)
+    monkeypatch.setattr(coding_runtime.CodingPtyBridge, "send_input", send_input)
+    monkeypatch.setattr(coding_runtime.CodingPtyBridge, "kill_session", kill_session)
+
+    client, _runtime = coding_client
+    _project_id, thread_id = _seed_project_and_thread(isolated_coding_store)
+    running_id = f"run-{uuid.uuid4()}"
+    queued_id = f"run-{uuid.uuid4()}"
+    db = isolated_coding_store.SessionLocal()
+    try:
+        db.add_all(
+            [
+                CodingRun(
+                    id=running_id,
+                    thread_id=thread_id,
+                    owner="tester",
+                    harness_id="generic",
+                    status="running",
+                    command="echo run",
+                    cwd=str(isolated_coding_store.workspace),
+                    tmux_session="sess-1",
+                    metadata_json="{}",
+                    started_at=datetime.utcnow(),
+                ),
+                CodingRun(
+                    id=queued_id,
+                    thread_id=thread_id,
+                    owner="tester",
+                    harness_id="generic",
+                    status="queued",
+                    command="echo queued",
+                    cwd=str(isolated_coding_store.workspace),
+                    metadata_json="{}",
+                ),
+            ]
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    # Count is side-effect free and excludes the queued run.
+    resp = client.get("/api/coding/runtime/active-tasks")
+    assert resp.status_code == 200
+    assert resp.json() == {"active": 1}
+
+    # stop-all winds down both the running and the queued run.
+    resp = client.post("/api/coding/runtime/stop-all")
+    assert resp.status_code == 200
+    assert resp.json() == {"stopped": 2}
+
+    statuses = _run_statuses(isolated_coding_store, running_id, queued_id)
+    # The running run is now "stopping" (its session was killed; the monitor task
+    # finalizes it to "cancelled" out of band — not in this unit test). The queued
+    # run is cancelled outright.
+    assert statuses[running_id] == "stopping"
+    assert statuses[queued_id] == "cancelled"

@@ -1,9 +1,14 @@
 import AppKit
 import Darwin
 import Foundation
+import Security
 
 @MainActor
 final class BackendController: ObservableObject {
+    // Single shared instance so the SwiftUI scene and the NSApplicationDelegate
+    // (quit handler) talk to the same backend process.
+    static let shared = BackendController()
+
     @Published private(set) var statusText = "Starting Odysseus..."
     @Published private(set) var url: URL?
     @Published private(set) var logURL: URL?
@@ -30,10 +35,26 @@ final class BackendController: ObservableObject {
     private var isStarting = false
     private var startupTask: Task<Void, Never>?
 
+    // Loopback-only secret shared with the backend via ODYSSEUS_INTERNAL_TOKEN so
+    // this app can hit admin-gated control routes (the quit handler's task count /
+    // stop-all) without a session cookie. Generated per launch, never persisted.
+    private let internalToken = BackendController.makeInternalToken()
+
     init() {
         let savedMode = UserDefaults.standard.string(forKey: Self.sharingModeKey)
         sharingMode = SharingMode(rawValue: savedMode ?? "") ?? .localOnly
         llmPorts = UserDefaults.standard.string(forKey: Self.llmPortsKey) ?? "1337,8000-8020,11434"
+    }
+
+    private static func makeInternalToken() -> String {
+        var bytes = [UInt8](repeating: 0, count: 32)
+        if SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes) != errSecSuccess {
+            // Fallback: still random enough for a loopback-only, per-launch secret.
+            for index in bytes.indices {
+                bytes[index] = UInt8.random(in: UInt8.min...UInt8.max)
+            }
+        }
+        return bytes.map { String(format: "%02x", $0) }.joined()
     }
 
     func startIfNeeded() {
@@ -80,7 +101,8 @@ final class BackendController: ObservableObject {
                 port: port,
                 appSupport: appSupport,
                 dataDir: dataDir,
-                llmPorts: llmPorts
+                llmPorts: llmPorts,
+                internalToken: internalToken
             )
             process.standardOutput = logHandle
             process.standardError = logHandle
@@ -126,6 +148,53 @@ final class BackendController: ObservableObject {
         tailscaleProcess?.terminate()
         tailscaleProcess = nil
         sharingStatus = "Sharing is off."
+    }
+
+    /// Number of coding agents the backend currently considers active (running /
+    /// starting / stopping). Drives the quit prompt — 0 means quitting orphans
+    /// nothing. Returns 0 if the backend can't be reached (treat as "safe to quit").
+    func activeTaskCount() async -> Int {
+        guard let base = url else { return 0 }
+        var request = URLRequest(url: base.appendingPathComponent("api/coding/runtime/active-tasks"))
+        request.setValue(internalToken, forHTTPHeaderField: "X-Odysseus-Internal-Token")
+        request.timeoutInterval = 5
+        do {
+            let (data, response) = try await URLSession.shared.data(for: request)
+            guard let http = response as? HTTPURLResponse, http.statusCode == 200,
+                  let object = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let active = object["active"] as? Int else {
+                return 0
+            }
+            return active
+        } catch {
+            writeWrapperLog("active-tasks query failed: \(error.localizedDescription)")
+            return 0
+        }
+    }
+
+    /// Stop every active/queued agent across the backend (the "Quit Everything"
+    /// path). Returns the number stopped; 0 on failure.
+    @discardableResult
+    func stopAllTasks() async -> Int {
+        guard let base = url else { return 0 }
+        var request = URLRequest(url: base.appendingPathComponent("api/coding/runtime/stop-all"))
+        request.httpMethod = "POST"
+        request.setValue(internalToken, forHTTPHeaderField: "X-Odysseus-Internal-Token")
+        request.timeoutInterval = 30
+        do {
+            let (data, response) = try await URLSession.shared.data(for: request)
+            guard let http = response as? HTTPURLResponse, http.statusCode == 200,
+                  let object = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let stopped = object["stopped"] as? Int else {
+                writeWrapperLog("stop-all returned an unexpected response")
+                return 0
+            }
+            writeWrapperLog("stop-all stopped \(stopped) task(s)")
+            return stopped
+        } catch {
+            writeWrapperLog("stop-all failed: \(error.localizedDescription)")
+            return 0
+        }
     }
 
     func openInBrowser() {
@@ -385,7 +454,13 @@ private enum BackendLaunch {
         }
     }
 
-    func environment(port: Int, appSupport: URL, dataDir: URL, llmPorts: String) -> [String: String] {
+    func environment(
+        port: Int,
+        appSupport: URL,
+        dataDir: URL,
+        llmPorts: String,
+        internalToken: String
+    ) -> [String: String] {
         var env = ProcessInfo.processInfo.environment
         env["PATH"] = [
             "/opt/homebrew/bin",
@@ -400,6 +475,7 @@ private enum BackendLaunch {
         env["ODYSSEUS_DESKTOP"] = "1"
         env["ODYSSEUS_HOST"] = "127.0.0.1"
         env["ODYSSEUS_PORT"] = "\(port)"
+        env["ODYSSEUS_INTERNAL_TOKEN"] = internalToken
         env["DATA_DIR"] = dataDir.path
         env["DATABASE_URL"] = "sqlite:///\(dataDir.appendingPathComponent("app.db").path)"
         env["CHROMADB_PERSIST_PATH"] = dataDir.appendingPathComponent("chroma", isDirectory: true).path

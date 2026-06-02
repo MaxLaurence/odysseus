@@ -998,7 +998,12 @@ async function runSelectedThread(button) {
   paneNote(`Queueing ${harness} run…`);
   try {
     // Launch the pty at the pane's real size so the harness renders correctly from frame 1.
-    if (session) { try { session.fit(); } catch (_) { /* noop */ } }
+    // Wait two frames for the pane layout to settle first — a pane opened during a split
+    // reflow can otherwise measure a premature width, and the harness banner won't reflow.
+    if (session) {
+      await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+      try { session.fit(); } catch (_) { /* noop */ }
+    }
     const cols = session?.term?.cols || undefined;
     const rows = session?.term?.rows || undefined;
     const data = await api(`/api/coding/threads/${encodeURIComponent(state.selectedThreadId)}/run`, {
@@ -1138,6 +1143,102 @@ function xtermReady() {
   return typeof window !== 'undefined'
     && typeof window.Terminal === 'function'
     && window.FitAddon && typeof window.FitAddon.FitAddon === 'function';
+}
+
+// ---- terminal engine: Ghostty (WASM VT core) with xterm.js fallback ----
+// ghostty-web ships a self-contained WASM terminal core + Canvas2D renderer behind an
+// xterm.js-compatible API (write / onData / onResize / resize / focus / clear / dispose /
+// cols / rows / loadAddon). It replaces xterm's renderer — the source of the persistent
+// resize/scroll glitches — while the tmux + PTY-over-WebSocket backend stays untouched.
+// xterm.js remains the fallback if the WASM core is absent or fails to instantiate.
+function ghosttyPresent() {
+  return typeof window !== 'undefined'
+    && window.GhosttyWeb
+    && typeof window.GhosttyWeb.Terminal === 'function'
+    && typeof window.GhosttyWeb.FitAddon === 'function';
+}
+
+let _ghosttyInitPromise = null;
+let _ghosttyInitDone = false;
+let _ghosttyInitFailed = false;
+
+// Kick off (exactly once) the async WASM instantiation ghostty-web needs before
+// `new Terminal()`. Resolves true when the Ghostty engine is usable, false to fall back.
+function ensureTerminalEngine() {
+  if (_ghosttyInitPromise) return _ghosttyInitPromise;
+  if (!ghosttyPresent() || typeof window.GhosttyWeb.init !== 'function') {
+    _ghosttyInitFailed = true;
+    _ghosttyInitPromise = Promise.resolve(false);
+    return _ghosttyInitPromise;
+  }
+  _ghosttyInitPromise = Promise.resolve()
+    .then(() => window.GhosttyWeb.init())
+    .then(() => { _ghosttyInitDone = true; return true; })
+    .catch((err) => {
+      _ghosttyInitFailed = true;
+      try { console.error('[code-station] Ghostty WASM init failed; using xterm.js', err); } catch (_) { /* noop */ }
+      return false;
+    });
+  return _ghosttyInitPromise;
+}
+
+// True once the Ghostty engine is instantiated and ready to create terminals.
+function ghosttyReady() {
+  return _ghosttyInitDone && !_ghosttyInitFailed && ghosttyPresent();
+}
+
+// Which engine a freshly-mounted pane should use right now:
+//  'ghostty'         — ready, build a Ghostty terminal
+//  'ghostty-pending' — present but still warming up; mount should defer + retry
+//  'xterm'           — fall back to the xterm.js renderer
+//  'none'            — no terminal engine available at all
+function activeTerminalEngine() {
+  if (ghosttyReady()) return 'ghostty';
+  if (!_ghosttyInitFailed && ghosttyPresent()) return 'ghostty-pending';
+  return xtermReady() ? 'xterm' : 'none';
+}
+
+// Build a terminal + fit addon for `termEl` using the active engine. Returns a normalized
+// shape; the rest of the pane lifecycle is engine-agnostic because both engines expose the
+// same write/onData/onResize/resize/focus/clear/dispose API.
+function createPaneTerminal(termEl) {
+  if (ghosttyReady()) {
+    const term = new window.GhosttyWeb.Terminal({
+      cursorBlink: true,
+      fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace',
+      fontSize: 12,
+      scrollback: 5000,
+      theme: TERMINAL_THEME,
+    });
+    const fitAddon = new window.GhosttyWeb.FitAddon();
+    term.loadAddon(fitAddon);
+    term.open(termEl);
+    return { term, fitAddon, webgl: null, engine: 'ghostty' };
+  }
+  // xterm.js fallback (DOM/WebGL renderer)
+  const term = new window.Terminal({
+    allowProposedApi: true,
+    convertEol: false,
+    cursorBlink: true,
+    fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace',
+    fontSize: 12,
+    lineHeight: 1.2,
+    scrollback: 5000,
+    theme: TERMINAL_THEME,
+  });
+  const fitAddon = new window.FitAddon.FitAddon();
+  term.loadAddon(fitAddon);
+  try { term.loadAddon(new window.WebLinksAddon.WebLinksAddon()); } catch (_) { /* optional */ }
+  try { term.loadAddon(new window.ClipboardAddon.ClipboardAddon()); } catch (_) { /* optional */ }
+  term.open(termEl);
+  let webgl = null;
+  try {
+    webgl = new window.WebglAddon.WebglAddon();
+    term.loadAddon(webgl);
+  } catch (_) {
+    webgl = null; // no WebGL2 → xterm keeps its DOM renderer
+  }
+  return { term, fitAddon, webgl, engine: 'xterm' };
 }
 
 // ---- tree helpers ----
@@ -1475,38 +1576,30 @@ function focusLeaf(leafId) {
   if (session) { try { session.term.focus(); } catch (_) { /* noop */ } }
 }
 
-// ---- per-pane xterm lifecycle ----
+// ---- per-pane terminal lifecycle ----
 function mountPane(leaf, leafEl) {
   if (!leaf.threadId) return;
   const termEl = leafEl.querySelector('.cs-pane-term');
   if (!termEl) return;
-  if (!xtermReady()) {
+
+  const engine = activeTerminalEngine();
+  if (engine === 'ghostty-pending') {
+    // The Ghostty WASM core is still instantiating — show a brief placeholder and mount
+    // once it's ready (idempotent: ensureTerminalEngine() returns the in-flight promise).
+    termEl.replaceChildren();
+    termEl.innerHTML = '<div class="cs-pane-noxterm">Starting terminal engine…</div>';
+    ensureTerminalEngine().then(() => {
+      if (leafEl.isConnected && !leafEl.__mounted) mountPane(leaf, leafEl);
+    });
+    return;
+  }
+  if (engine === 'none') {
     termEl.innerHTML = '<div class="cs-pane-noxterm">Terminal engine unavailable</div>';
     return;
   }
-  termEl.replaceChildren(); // clear any leftover DOM from a previously-disposed terminal
-  const term = new window.Terminal({
-    allowProposedApi: true,
-    convertEol: false,
-    cursorBlink: true,
-    fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace',
-    fontSize: 12,
-    lineHeight: 1.2,
-    scrollback: 5000,
-    theme: TERMINAL_THEME,
-  });
-  const fitAddon = new window.FitAddon.FitAddon();
-  term.loadAddon(fitAddon);
-  try { term.loadAddon(new window.WebLinksAddon.WebLinksAddon()); } catch (_) { /* optional */ }
-  try { term.loadAddon(new window.ClipboardAddon.ClipboardAddon()); } catch (_) { /* optional */ }
-  term.open(termEl);
 
-  // Intentionally NOT using the WebGL renderer. A browser keeps only a handful of
-  // live WebGL contexts, so with several terminal panes the inactive ones lose their
-  // context and render garbage (rows of dots) — and per-pane context churn on
-  // focus/resize made it worse. xterm's default DOM renderer has no context limit
-  // and is plenty fast for agent output, so every pane renders reliably.
-  const webgl = null;
+  termEl.replaceChildren(); // clear any leftover DOM from a previously-disposed terminal
+  const { term, fitAddon, webgl, engine: usedEngine } = createPaneTerminal(termEl);
 
   const session = {
     paneId: leaf.paneId,
@@ -1515,6 +1608,7 @@ function mountPane(leaf, leafEl) {
     term,
     fitAddon,
     webgl,
+    engine: usedEngine,
     ro: null,
     ws: null,
     source: null,
@@ -2652,6 +2746,9 @@ export function init(apiBase, options = {}) {
   sessionModule = options.sessionModule || window.sessionModule || sessionModule;
   uiModule = options.uiModule || window.uiModule || uiModule;
   modelsModule = options.modelsModule || window.modelsModule || modelsModule;
+  // Warm up the Ghostty WASM terminal core at app boot (idempotent) so panes mount
+  // instantly when the user opens Code Station. Fire-and-forget; falls back to xterm.js.
+  try { ensureTerminalEngine(); } catch (_) { /* noop */ }
   if (state.initialized) return;
   state.initialized = true;
   refreshBadges();

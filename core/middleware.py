@@ -89,7 +89,10 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
             # don't execute script, the residual risk is visual-only.
             response.headers["Content-Security-Policy"] = (
                 "default-src 'self'; "
-                f"script-src 'self' 'nonce-{nonce}' https://cdn.jsdelivr.net; "
+                # `wasm-unsafe-eval` lets the Code Station terminal instantiate the
+                # vendored Ghostty VT core (WebAssembly). Without it, WebKit/Chrome
+                # block `WebAssembly.instantiate` under a strict `script-src`.
+                f"script-src 'self' 'wasm-unsafe-eval' 'nonce-{nonce}' https://cdn.jsdelivr.net; "
                 "style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; "
                 "font-src 'self' https://cdn.jsdelivr.net; "
                 "img-src 'self' data: blob:; "

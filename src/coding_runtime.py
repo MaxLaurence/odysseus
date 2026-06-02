@@ -7,7 +7,6 @@ import json
 import logging
 import os
 import shlex
-import shutil
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -33,7 +32,7 @@ from src.coding_provider_bridge import (
     scripts_dir,
     with_scripts_on_path,
 )
-from src.coding_pty_bridge import CodingPtyBridge
+from src.coding_pty_bridge import CodingPtyBridge, dtach_bin
 from src.coding_task_slots import get_task_slot_service
 from src.settings import get_setting
 
@@ -44,7 +43,6 @@ ACTIVE_STATUSES = {"starting", "running", "stopping"}
 BLOCKING_STATUSES = {"queued", "starting", "running", "stopping"}
 FINISHED_STATUSES = {"exited", "failed", "cancelled"}
 PROVIDER_ODYSSEUS_ENV_KEYS = frozenset(PROVIDER_BRIDGE_ENV_KEYS)
-TMUX_PROVIDER_ENV_PREFIXES = ("OPENAI_", "OLLAMA_", "ANTHROPIC_", "CODEX_")
 
 
 class CodingRuntimeError(Exception):
@@ -113,9 +111,11 @@ class CodingRuntimeService:
         self._active_processes: dict[str, asyncio.subprocess.Process] = {}
         self._deleting_threads: set[tuple[str, str]] = set()
         self._launching_runs: dict[str, tuple[str, str]] = {}
+        # Per-run capture-logger tasks (dtach clients that tee output to raw.log).
+        self._capture_tasks: dict[str, asyncio.Task] = {}
         self._provider_bridge = get_provider_bridge_service()
         self._pty_bridge = CodingPtyBridge(
-            tmux_available=self.tmux_available,
+            backend_available=self.dtach_available,
             get_owned_run=self._get_owned_run,
             finished_statuses=FINISHED_STATUSES,
             logger=logger,
@@ -128,13 +128,13 @@ class CodingRuntimeService:
             value = 2
         return max(1, value)
 
-    def tmux_available(self) -> bool:
-        return shutil.which("tmux") is not None
+    def dtach_available(self) -> bool:
+        return dtach_bin() is not None
 
     def run_dir(self, run_id: str) -> Path:
         return RUN_ROOT / run_id
 
-    def _tmux_session_name(self, run_id: str) -> str:
+    def _session_name(self, run_id: str) -> str:
         return f"ody-code-{run_id.replace('-', '')[:16]}"
 
     def _issue_provider_bridge_env(self, run: CodingRun, thread: CodingThread | None) -> dict[str, str]:
@@ -163,13 +163,6 @@ class CodingRuntimeService:
         env = _drop_private_odysseus_env(env)
         env = with_scripts_on_path(env)
         return env, self._provider_bridge.metadata_for_env(provider_env)
-
-    def _tmux_launch_env_items(self, env: dict[str, str]) -> list[tuple[str, str]]:
-        allowed: list[tuple[str, str]] = []
-        for key, value in sorted(env.items()):
-            if key == "PATH" or key.startswith(TMUX_PROVIDER_ENV_PREFIXES) or key in PROVIDER_ODYSSEUS_ENV_KEYS:
-                allowed.append((key, value))
-        return allowed
 
     def _revoke_run_provider_credentials(self, run_id: str) -> None:
         try:
@@ -542,12 +535,10 @@ class CodingRuntimeService:
             raise CodingRuntimeError(409, "stdin is unsupported for this run")
         if run.status not in ACTIVE_STATUSES:
             raise CodingRuntimeError(409, "Run is not active")
-        parts = data.split("\n")
-        for idx, part in enumerate(parts):
-            if part:
-                await self._tmux_exec("send-keys", "-t", run.tmux_session, "-l", part, check=False)
-            if idx < len(parts) - 1:
-                await self._tmux_exec("send-keys", "-t", run.tmux_session, "Enter", check=False)
+        # Inject the bytes into the session without a full attach (dtach -p). Newlines
+        # map to CR (terminal Enter). The live keystroke path is the WebSocket bridge;
+        # this HTTP route is a fallback for programmatic input.
+        await self._pty_bridge.send_input(run.tmux_session, data.replace("\n", "\r").encode("utf-8"))
         await self.append_event(run.thread_id, run.id, "stdin", {"bytes": len(data.encode("utf-8"))})
         return await self._get_owned_run(run_id, owner)
 
@@ -560,18 +551,9 @@ class CodingRuntimeService:
             raise CodingRuntimeError(409, "Run is not active")
         cols = max(20, min(int(cols), 400))
         rows = max(5, min(int(rows), 120))
-        # resize-WINDOW (not resize-pane): the session is detached + window-size manual, so
-        # the window must be resized for the pty/SIGWINCH to follow the UI pane.
-        await self._tmux_exec(
-            "resize-window",
-            "-t",
-            run.tmux_session,
-            "-x",
-            str(cols),
-            "-y",
-            str(rows),
-            check=False,
-        )
+        # The authoritative resize is the WebSocket bridge: the browser sets its PTY
+        # winsize and dtach forwards a clean SIGWINCH to the program. There is no
+        # off-client dtach resize, so this HTTP route only records the intent.
         await self.append_event(run.thread_id, run.id, "resize", {"cols": cols, "rows": rows})
         return await self._get_owned_run(run_id, owner)
 
@@ -654,7 +636,7 @@ class CodingRuntimeService:
                 )
                 for run in stale:
                     recoverable = False
-                    if run.tmux_session and run.run_dir and await self._tmux_has_session(run.tmux_session):
+                    if run.tmux_session and run.run_dir and await self._pty_bridge.has_session(run.tmux_session):
                         recoverable = True
                     if recoverable:
                         run.status = "running"
@@ -672,12 +654,12 @@ class CodingRuntimeService:
                         recoverable_ids.append(run.id)
                     else:
                         if not run.tmux_session:
-                            derived_session = self._tmux_session_name(run.id)
-                            if await self._tmux_has_session(derived_session):
-                                await self._tmux_exec("kill-session", "-t", derived_session, check=False)
+                            derived_session = self._session_name(run.id)
+                            if await self._pty_bridge.has_session(derived_session):
+                                await self._pty_bridge.kill_session(derived_session)
                         run.status = "cancelled" if run.status == "stopping" else "failed"
                         run.finished_at = _now()
-                        run.error = "Run was active during startup and no recoverable tmux session was found"
+                        run.error = "Run was active during startup and no recoverable session was found"
                         self._revoke_run_provider_credentials(run.id)
                         thread = db.query(CodingThread).filter(CodingThread.id == run.thread_id).first()
                         if thread and thread.last_run_id == run.id:
@@ -735,7 +717,7 @@ class CodingRuntimeService:
 
             has_runtime_resource = False
             if run.tmux_session:
-                has_runtime_resource = self.tmux_available() and await self._tmux_has_session(run.tmux_session)
+                has_runtime_resource = self.dtach_available() and await self._pty_bridge.has_session(run.tmux_session)
             if has_runtime_resource:
                 continue
 
@@ -765,6 +747,8 @@ class CodingRuntimeService:
     async def shutdown(self) -> None:
         for task in list(self._active_tasks.values()):
             task.cancel()
+        for task in list(self._capture_tasks.values()):
+            task.cancel()
         for proc in list(self._active_processes.values()):
             try:
                 proc.terminate()
@@ -773,36 +757,39 @@ class CodingRuntimeService:
         for run_id in set(self._active_tasks) | set(self._active_processes):
             self._revoke_run_provider_credentials(run_id)
         self._active_tasks.clear()
+        self._capture_tasks.clear()
         self._active_processes.clear()
 
     async def _launch_run(self, run_id: str) -> None:
         run = await self._get_run(run_id)
         if not run:
             return
-        if self.tmux_available():
-            await self._launch_tmux_run(run)
+        if self.dtach_available():
+            await self._launch_dtach_run(run)
         else:
             await self._launch_subprocess_run(run)
 
-    async def _launch_tmux_run(self, run: CodingRun) -> None:
-        session = self._tmux_session_name(run.id)
+    async def _launch_dtach_run(self, run: CodingRun) -> None:
+        session = self._session_name(run.id)
         run_dir = Path(run.run_dir or self.run_dir(run.id))
         log_path = Path(run.log_path or (run_dir / "raw.log"))
         exit_path = run_dir / "exit_code"
         script_path = run_dir / "run.sh"
         run_dir.mkdir(parents=True, exist_ok=True)
-        # Run the harness DIRECTLY on the tmux pane's pty so its stdout/stderr stay a
+        # Run the harness DIRECTLY on the dtach session's pty so its stdout/stderr stay a
         # real TTY (isatty() == True). Interactive agent CLIs (pi, codex, claude, a
         # login shell, …) need that or they detect "not a terminal" and refuse to render
-        # their UI / exit immediately. Output is captured out-of-band via `tmux pipe-pane`
-        # below — NOT by piping the command through `tee`, which would make stdout a pipe.
+        # their UI / exit immediately. Output is captured out-of-band by the capture
+        # logger (a persistent dtach client teeing to raw.log) — NOT by piping the command
+        # through `tee`, which would make stdout a pipe.
         #
         # We invoke the command through the user's INTERACTIVE LOGIN shell (`-ilc`) so it
         # inherits exactly the PATH/env the user has in their own terminal. Otherwise a
         # server launched outside a shell (GUI app / launchd) lacks rc-added dirs like
         # ~/.bun/bin, and `pi` (etc.) fails with "command not found".
         #
-        # The short sleep lets pipe-pane attach before the program emits its first byte.
+        # The short sleep lets the capture logger attach before the program emits its
+        # first byte (and gives the 0x0 dtach pty its initial size).
         user_shell = _user_login_shell()
         script_dir = str(scripts_dir())
         launch_command = f"export PATH={shlex.quote(script_dir)}:$PATH; {run.command}"
@@ -844,54 +831,29 @@ class CodingRuntimeService:
                 )
                 init_cols = int(run_meta.get("cols") or 120)
                 init_rows = int(run_meta.get("rows") or 40)
-                # Size the detached session to the UI pane up front.
-                args = ["new-session", "-d", "-s", session, "-c", run.cwd, "-x", str(init_cols), "-y", str(init_rows)]
-                for key, value in self._tmux_launch_env_items(env):
-                    args.extend(["-e", f"{key}={value}"])
-                # tmux runs the new-session command via `/bin/sh -c`, so the script path MUST be
-                # shell-quoted — otherwise a space in the path (e.g. the packaged app's data dir
-                # "~/Library/Application Support/Odysseus/…") word-splits and the pane dies
-                # instantly with no output (run never executes).
-                args.append(shlex.quote(str(script_path)))
             finally:
                 db.close()
 
-            # Deep scrollback so the user can scroll back through terminal history with the
-            # mouse wheel (tmux copy-mode). Must be set BEFORE the pane is created — pane
-            # history is allocated at creation time. (`set -g` auto-starts the socket server.)
-            await self._tmux_exec("set-option", "-g", "history-limit", "50000", check=False)
-
-            proc = await self._tmux_exec(*args, check=False)
-            if proc.returncode != 0:
-                stderr = (proc.stderr or b"").decode(errors="replace").strip()
-                await self._mark_failed(run.id, f"Failed to start tmux: {stderr or proc.returncode}")
+            # Create the detached dtach session running the harness. dtach passes the
+            # program's raw PTY straight through (no emulation/scrollback/reflow of its
+            # own), so the browser terminal owns scrollback and resize is a clean
+            # SIGWINCH — see src/coding_pty_bridge.py for why tmux was removed. The full
+            # (already-sanitized) launch env is handed to dtach directly, which the
+            # program inherits — no per-var allow-list / `-e` plumbing needed.
+            result = await self._pty_bridge.create_session(session, script_path, env, cwd=run.cwd)
+            if result.returncode != 0:
+                stderr = (result.stderr or b"").decode(errors="replace").strip()
+                await self._mark_failed(run.id, f"Failed to start dtach session: {stderr or result.returncode}")
                 await self.pump_queue()
                 return
 
-            # Make the session a TRANSPARENT, low-latency passthrough for the PTY/WebSocket
-            # client (xterm.js): no status bar, no prefix key interception, instant ESC, and
-            # extended keys forwarded. window-size is MANUAL — the PTY bridge explicitly
-            # resize-windows to the xterm pane on attach and on every resize, so the harness
-            # width always matches what xterm renders (no client-size heuristics fighting it,
-            # which caused wrapped/garbled output). Mouse on + alternate-scroll so the wheel
-            # scrolls history (copy-mode) / scrolls inside full-screen apps.
-            await self._tmux_exec("set-option", "-s", "extended-keys", "on", check=False)
-            # Pi/harnesses negotiate modified keys best with the csi-u encoding (Pi warns
-            # otherwise); set it so key handling is correct.
-            await self._tmux_exec("set-option", "-s", "extended-keys-format", "csi-u", check=False)
-            # Mouse OFF so the wheel scrolls xterm.js's OWN scrollback (native-terminal
-            # scrolling). With mouse on, tmux captured the wheel into copy-mode, which
-            # garbled the pane on scroll. xterm owns selection + scrollback; tmux just
-            # streams the live screen, and lines that scroll off feed xterm's buffer.
-            await self._tmux_exec("set-option", "-g", "mouse", "off", check=False)
-            await self._tmux_exec("set-option", "-g", "escape-time", "0", check=False)
-            await self._tmux_exec("set-option", "-t", session, "status", "off", check=False)
-            await self._tmux_exec("set-option", "-t", session, "prefix", "None", check=False)
-            await self._tmux_exec("set-option", "-t", session, "prefix2", "None", check=False)
-            await self._tmux_exec("set-option", "-t", session, "window-size", "manual", check=False)
-
-            # Capture the pane's raw output to the log (out-of-band, preserves the program's TTY).
-            await self._start_pane_capture(session, log_path)
+            # Persistent capture logger: attaches at the initial pane size (sizing the
+            # freshly-created 0x0 program) and tees ALL output to raw.log for the run's
+            # lifetime — so output is captured even with no browser attached. Replaces
+            # the old `tmux pipe-pane`.
+            self._capture_tasks[run.id] = self._pty_bridge.start_capture(
+                session, log_path, init_cols=init_cols, init_rows=init_rows
+            )
 
             async with self._lock:
                 db = SessionLocal()
@@ -899,7 +861,7 @@ class CodingRuntimeService:
                     current = db.query(CodingRun).filter(CodingRun.id == run.id).first()
                     thread = db.query(CodingThread).filter(CodingThread.id == run.thread_id).first()
                     if not current:
-                        raise RuntimeError("Run disappeared during tmux launch")
+                        raise RuntimeError("Run disappeared during dtach launch")
                     metadata = _json_loads(current.metadata_json, {})
                     metadata.update(
                         {
@@ -935,21 +897,24 @@ class CodingRuntimeService:
                 finally:
                     db.close()
         except Exception as exc:
+            self._cancel_capture(run.id)
             try:
-                if await self._tmux_has_session(session):
-                    await self._tmux_exec("kill-session", "-t", session, check=False)
+                if await self._pty_bridge.has_session(session):
+                    await self._pty_bridge.kill_session(session)
             except Exception:
-                logger.debug("Failed to clean up tmux session after launch error", exc_info=True)
-            await self._mark_failed(run.id, f"Failed to start tmux: {exc}")
+                logger.debug("Failed to clean up dtach session after launch error", exc_info=True)
+            await self._mark_failed(run.id, f"Failed to start dtach session: {exc}")
             await self.pump_queue()
             return
         finally:
             await self._end_run_launch(run.id)
 
-        await self._tail_tmux_run(run.id, session, log_path, exit_path)
+        await self._tail_run(run.id, session, log_path, exit_path)
 
-    async def _start_pane_capture(self, session: str, log_path: Path) -> None:
-        await self._pty_bridge.start_pane_capture(session, log_path)
+    def _cancel_capture(self, run_id: str) -> None:
+        task = self._capture_tasks.pop(run_id, None)
+        if task and not task.done():
+            task.cancel()
 
     async def _tail_recovered_tmux_run(self, run_id: str) -> None:
         run = await self._get_run(run_id)
@@ -957,20 +922,24 @@ class CodingRuntimeService:
             return
         metadata = _json_loads(run.metadata_json, {})
         exit_path = Path(metadata.get("exit_path") or Path(run.run_dir or self.run_dir(run.id)) / "exit_code")
-        # Re-establish output capture: the pipe-pane `cat` from the original launch died
-        # when the server restarted, so without this a recovered run would stream nothing.
-        await self._start_pane_capture(run.tmux_session, Path(run.log_path))
-        await self._tail_tmux_run(run.id, run.tmux_session, Path(run.log_path), exit_path)
+        # Re-establish output capture: the original capture logger died when the server
+        # restarted, so without this a recovered run would stream nothing to raw.log.
+        init_cols = int(metadata.get("cols") or 120)
+        init_rows = int(metadata.get("rows") or 40)
+        self._capture_tasks[run_id] = self._pty_bridge.start_capture(
+            run.tmux_session, Path(run.log_path), init_cols=init_cols, init_rows=init_rows
+        )
+        await self._tail_run(run.id, run.tmux_session, Path(run.log_path), exit_path)
 
-    async def _tail_tmux_run(self, run_id: str, session: str, log_path: Path, exit_path: Path) -> None:
-        # Pure exit watcher: live output now streams over the PTY/WebSocket (attach_pty)
-        # and history is captured to raw.log by pipe-pane, so there's no log-draining /
-        # per-chunk DB events here anymore — just detect completion and finalize.
+    async def _tail_run(self, run_id: str, session: str, log_path: Path, exit_path: Path) -> None:
+        # Pure exit watcher: live output streams over the PTY/WebSocket (attach_pty) and
+        # history is captured to raw.log by the capture logger, so there's no log-draining
+        # / per-chunk DB events here — just detect completion and finalize.
         try:
             while True:
                 if exit_path.exists():
                     break
-                if not await self._tmux_has_session(session):
+                if not await self._pty_bridge.has_session(session):
                     break
                 await asyncio.sleep(0.2)
             exit_code = None
@@ -979,11 +948,12 @@ class CodingRuntimeService:
                     exit_code = int(exit_path.read_text(encoding="utf-8").strip())
                 except Exception:
                     exit_code = -1
+            self._cancel_capture(run_id)
             await self._finalize_run(run_id, exit_code)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            logger.warning("tmux run watcher failed: %s", exc)
+            logger.warning("dtach run watcher failed: %s", exc)
             await self._mark_failed(run_id, str(exc))
         finally:
             await self.pump_queue()
@@ -1192,24 +1162,27 @@ class CodingRuntimeService:
         strict: bool = False,
         include_unpersisted_tmux: bool = False,
     ) -> None:
-        tmux_session = run.tmux_session
-        derived_tmux_session = False
-        if not tmux_session and include_unpersisted_tmux and run.id not in self._active_processes:
-            tmux_session = self._tmux_session_name(run.id)
-            derived_tmux_session = True
+        session = run.tmux_session
+        derived_session = False
+        if not session and include_unpersisted_tmux and run.id not in self._active_processes:
+            session = self._session_name(run.id)
+            derived_session = True
 
-        if tmux_session:
-            if not self.tmux_available():
-                if strict and not derived_tmux_session:
-                    raise CodingRuntimeError(500, f"Cannot stop tmux run {run.id}: tmux is unavailable")
-            elif await self._tmux_has_session(tmux_session):
-                if not derived_tmux_session:
-                    await self._tmux_exec("send-keys", "-t", tmux_session, "C-c", check=False)
+        if session:
+            self._cancel_capture(run.id)
+            if not self.dtach_available():
+                if strict and not derived_session:
+                    raise CodingRuntimeError(500, f"Cannot stop run {run.id}: dtach is unavailable")
+            elif await self._pty_bridge.has_session(session):
+                if not derived_session:
+                    # Graceful: deliver Ctrl-C to the program (SIGINT), give it a beat,
+                    # then kill the dtach master if it's still alive.
+                    await self._pty_bridge.send_input(session, b"\x03")
                     await asyncio.sleep(0.5)
-                if await self._tmux_has_session(tmux_session):
-                    await self._tmux_exec("kill-session", "-t", tmux_session, check=False)
-                if strict and await self._tmux_has_session(tmux_session):
-                    raise CodingRuntimeError(500, f"Failed to stop tmux session for run {run.id}")
+                if await self._pty_bridge.has_session(session):
+                    await self._pty_bridge.kill_session(session)
+                if strict and await self._pty_bridge.has_session(session):
+                    raise CodingRuntimeError(500, f"Failed to stop session for run {run.id}")
             return
         proc = self._active_processes.get(run.id)
         if proc:
@@ -1236,14 +1209,8 @@ class CodingRuntimeService:
         if strict and run.status == "running":
             raise CodingRuntimeError(409, f"Cannot clean up active run {run.id}: no runtime resource is tracked")
 
-    async def _tmux_has_session(self, session: str) -> bool:
-        return await self._pty_bridge.tmux_has_session(session)
-
     async def attach_pty(self, websocket, run_id: str, owner: str, cols: int = 120, rows: int = 40) -> None:
         await self._pty_bridge.attach_pty(websocket, run_id, owner, cols, rows)
-
-    async def _tmux_exec(self, *args: str, check: bool = True):
-        return await self._pty_bridge.tmux_exec(*args, check=check)
 
     async def _get_run(self, run_id: str) -> CodingRun | None:
         db = SessionLocal()
@@ -1391,7 +1358,7 @@ class CodingRuntimeService:
             return {
                 "max_concurrent": self.max_concurrent_runs(),
                 "project_id": project_id,
-                "tmux_available": self.tmux_available(),
+                "tmux_available": self.dtach_available(),
                 "queued": [run.id for run in queued],
                 "active": [run.id for run in active],
                 "queued_count": len(queued),

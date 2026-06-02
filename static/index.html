@@ -2280,6 +2280,14 @@
 <script src="/static/lib/xterm/addon-web-links.js"></script>
 <script src="/static/lib/xterm/addon-clipboard.js"></script>
 
+<!-- Ghostty VT core compiled to WebAssembly (vendored, offline-safe). Exposes
+     window.GhosttyWeb.{init, Terminal, FitAddon}; the .wasm is embedded as a base64
+     data URL inside the UMD, so there's no separate .wasm fetch/MIME wiring. Code Station
+     prefers this renderer (Canvas2D, robust resize) and falls back to xterm.js above if the
+     WASM core is missing or fails to instantiate. Requires `wasm-unsafe-eval` in the CSP
+     script-src (see core/middleware.py). The tmux + PTY-over-WebSocket backend is unchanged. -->
+<script src="/static/lib/ghostty/ghostty-web.umd.js"></script>
+
 <!-- Load modules in this order -->
 <script type="module" src="/static/js/storage.js"></script>
 <script type="module" src="/static/js/ui.js"></script>

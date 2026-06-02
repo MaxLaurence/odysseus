@@ -557,25 +557,9 @@ def test_launch_environment_strips_private_odysseus_env_and_preserves_provider_a
     assert "ODYSSEUS_PRIVATE_FLAG" not in env
     assert env["PATH"].startswith(f"{scripts_dir()}{os.pathsep}")
     assert metadata["token_issued"] is True
-
-    forwarded = dict(
-        service._tmux_launch_env_items(
-            {
-                **env,
-                "ODYSSEUS_INTERNAL_TOKEN": "server-admin-token",
-                "ODYSSEUS_PRIVATE_FLAG": "server-private",
-                "ANTHROPIC_API_KEY": "anthropic-token",
-                "OLLAMA_HOST": "http://127.0.0.1:11434",
-            }
-        )
-    )
-    assert forwarded["PATH"] == env["PATH"]
-    assert forwarded["OPENAI_API_KEY"] == "model-token"
-    assert forwarded["ANTHROPIC_API_KEY"] == "anthropic-token"
-    assert forwarded["OLLAMA_HOST"] == "http://127.0.0.1:11434"
-    assert forwarded["ODYSSEUS_TOOL_TOKEN"] == "ody_cp_run_token"
-    assert "ODYSSEUS_INTERNAL_TOKEN" not in forwarded
-    assert "ODYSSEUS_PRIVATE_FLAG" not in forwarded
+    # The full (already-sanitized) launch env is handed to dtach directly; private
+    # ODYSSEUS_* vars are dropped by _build_launch_environment (asserted above), so the
+    # agent never sees server-internal tokens.
 
 
 def test_provider_cli_list_uses_provider_authenticated_tool_action(monkeypatch, capsys):
@@ -727,15 +711,15 @@ def test_queue_poll_reconciles_dead_tmux_run_and_starts_next(
         "get_setting",
         lambda key, default=None: 1 if key == "coding_max_concurrent_threads" else default,
     )
-    monkeypatch.setattr(coding_runtime.CodingRuntimeService, "tmux_available", lambda _self: True)
+    monkeypatch.setattr(coding_runtime.CodingRuntimeService, "dtach_available", lambda _self: True)
 
-    async def missing_tmux_session(_self, _session):
+    async def missing_session(_self, _name):
         return False
 
     async def no_launch(_self, _run_id):
         return None
 
-    monkeypatch.setattr(coding_runtime.CodingRuntimeService, "_tmux_has_session", missing_tmux_session)
+    monkeypatch.setattr(coding_runtime.CodingPtyBridge, "has_session", missing_session)
     monkeypatch.setattr(coding_runtime.CodingRuntimeService, "_launch_run", no_launch)
 
     _project_id, stale_thread_id = _seed_project_and_thread(isolated_coding_store)
@@ -1319,7 +1303,7 @@ async def test_terminals_launch_concurrently_without_a_cap(monkeypatch, isolated
         lambda key, default=None: 1 if key == "coding_max_concurrent_threads" else default,
     )
     service = CodingRuntimeService()
-    monkeypatch.setattr(service, "tmux_available", lambda: False)
+    monkeypatch.setattr(service, "dtach_available", lambda: False)
 
     project_id, first_thread_id = _seed_project_and_thread(
         isolated_coding_store,
@@ -1447,7 +1431,7 @@ async def test_manage_coding_runs_thread_and_reads_events(monkeypatch, isolated_
     from src.tool_implementations import do_manage_coding
 
     runtime = CodingRuntimeService()
-    monkeypatch.setattr(runtime, "tmux_available", lambda: False)
+    monkeypatch.setattr(runtime, "dtach_available", lambda: False)
     monkeypatch.setattr(coding_runtime, "get_coding_runtime_service", lambda: runtime)
 
     project = await do_manage_coding(

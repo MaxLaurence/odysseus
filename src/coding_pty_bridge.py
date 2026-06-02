@@ -1,4 +1,25 @@
-"""PTY/WebSocket transport for Coding Station tmux-backed runs."""
+"""PTY/dtach transport for Coding Station persistent runs.
+
+Each run's program lives in a ``dtach`` session — a *thin* detach/attach tool with
+**no terminal emulation, scrollback, or screen reflow** of its own. The program's
+raw PTY byte stream is passed straight through to the browser terminal (Ghostty/
+xterm.js), so the browser emulator owns scrollback and a resize is a clean, direct
+SIGWINCH to the program.
+
+We used to run each pane inside ``tmux``. tmux is itself a terminal emulator, so
+stacking it under the browser emulator was the root cause of the persistent scroll
+and resize bugs: on attach tmux switches the client into the alternate screen (which
+has no saved lines by spec, so the browser's scrollback stayed empty), it keeps all
+history in its own copy-mode buffer and streams only the viewport, and on resize it
+reflows/redraws the whole screen and clamps to the smallest attached client. None of
+that is tunable away — it's architectural — so tmux was replaced with dtach.
+
+Persistence + remote access (Tailscale): the program survives a client disconnect,
+and ``dtach -a /tmp/odysseus-cs/<name>`` from any machine attaches the SAME live
+session. dtach client flags we always pass: ``-E`` (disable the detach character so
+every byte — including pasted control bytes — reaches the program), ``-z`` (disable
+the suspend key), ``-r winch`` (redraw via SIGWINCH on attach; no injected ^L).
+"""
 
 from __future__ import annotations
 
@@ -8,7 +29,9 @@ import json
 import logging
 import os
 import pty
-import shlex
+import shutil
+import signal
+import stat
 import struct
 import termios
 from dataclasses import dataclass
@@ -16,66 +39,269 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 
-TMUX_SOCKET = "odysseus-cs"
+# Short socket dir: a unix socket path must fit in sun_path (~104 bytes on macOS),
+# so we cannot place sockets under the run dir (the packaged app's data dir alone is
+# ~80 chars). Sessions don't survive a reboot anyway (the programs don't), so /tmp is
+# fine. Mirrors the spirit of the old private ``tmux -L odysseus-cs`` socket.
+SOCKET_DIR = Path("/tmp/odysseus-cs")
+
+# dtach attach-client flags (see module docstring).
+_DTACH_CLIENT_FLAGS = ("-E", "-z", "-r", "winch")
+
+
+def dtach_bin() -> str | None:
+    """Resolve the dtach executable, preferring the copy bundled with the app so the
+    packaged build doesn't depend on a Homebrew install. Falls back to PATH and the
+    usual Homebrew locations (a GUI-launched backend can have a minimal PATH). Returns
+    None if dtach can't be found anywhere (then runs use the no-session subprocess path).
+    """
+    # 1. Bundled with the app: <_internal>/vendor/dtach (parallels scripts_dir()).
+    bundled = Path(__file__).resolve().parent.parent / "vendor" / "dtach"
+    try:
+        if bundled.is_file() and os.access(bundled, os.X_OK):
+            return str(bundled)
+    except Exception:
+        pass
+    # 2. On PATH.
+    found = shutil.which("dtach")
+    if found:
+        return found
+    # 3. Common Homebrew prefixes (arm64 + Intel).
+    for candidate in ("/opt/homebrew/bin/dtach", "/usr/local/bin/dtach"):
+        try:
+            if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+                return candidate
+        except Exception:
+            pass
+    return None
 
 
 @dataclass(frozen=True)
-class TmuxResult:
+class DtachResult:
     returncode: int
     stdout: bytes
     stderr: bytes
 
 
 class CodingPtyBridge:
-    """Low-level tmux/PTY transport used by the coding runtime."""
+    """Low-level dtach/PTY transport used by the coding runtime."""
 
     def __init__(
         self,
         *,
-        tmux_available: Callable[[], bool],
+        backend_available: Callable[[], bool],
         get_owned_run: Callable[[str, str], Awaitable[Any]],
         finished_statuses: set[str],
         logger: logging.Logger | None = None,
     ) -> None:
-        self._tmux_available = tmux_available
+        self._backend_available = backend_available
         self._get_owned_run = get_owned_run
         self._finished_statuses = finished_statuses
         self._logger = logger or logging.getLogger(__name__)
 
-    async def tmux_exec(self, *args: str, check: bool = True) -> TmuxResult:
+    # ---- socket helpers --------------------------------------------------
+
+    @staticmethod
+    def socket_path(name: str) -> Path:
+        return SOCKET_DIR / name
+
+    @classmethod
+    def _ensure_socket_dir(cls) -> None:
+        try:
+            SOCKET_DIR.mkdir(parents=True, exist_ok=True)
+            os.chmod(SOCKET_DIR, 0o700)
+        except Exception:
+            pass
+
+    async def has_session(self, name: str) -> bool:
+        if not name or not self._backend_available():
+            return False
+        try:
+            st = os.stat(self.socket_path(name))
+            return stat.S_ISSOCK(st.st_mode)
+        except FileNotFoundError:
+            return False
+        except Exception:
+            return False
+
+    # ---- session lifecycle ----------------------------------------------
+
+    async def create_session(
+        self,
+        name: str,
+        script_path: Path,
+        env: dict[str, str],
+        *,
+        cwd: str,
+    ) -> DtachResult:
+        """Create a detached dtach session running ``script_path``.
+
+        ``dtach -n`` forks a daemon master (it reparents to PID 1 and keeps the full
+        argv, so it can later be found/killed via the socket path) and the foreground
+        invocation returns immediately. The program starts on a fresh PTY at 0x0
+        until the first client attaches — the capture logger (started right after
+        this) attaches at the run's initial size, so the program is sized promptly.
+        """
+        dtach = dtach_bin()
+        if not dtach:
+            return DtachResult(127, b"", b"dtach executable not found")
+        self._ensure_socket_dir()
+        sock = str(self.socket_path(name))
+        # Clear any stale socket left by a crashed master of the same name.
+        try:
+            os.unlink(sock)
+        except FileNotFoundError:
+            pass
+        except Exception:
+            pass
         proc = await asyncio.create_subprocess_exec(
-            "tmux",
-            "-L",
-            TMUX_SOCKET,
-            *args,
-            stdout=asyncio.subprocess.PIPE,
+            dtach,
+            "-n",
+            sock,
+            str(script_path),
+            env=env,
+            cwd=cwd,
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.PIPE,
         )
-        stdout, stderr = await proc.communicate()
-        result = TmuxResult(proc.returncode, stdout, stderr)
-        if check and proc.returncode != 0:
-            raise RuntimeError(stderr.decode(errors="replace") or f"tmux exited {proc.returncode}")
-        return result
+        _out, err = await proc.communicate()
+        return DtachResult(proc.returncode, b"", err or b"")
 
-    async def tmux_has_session(self, session: str) -> bool:
-        if not session or not self._tmux_available():
-            return False
-        result = await self.tmux_exec("has-session", "-t", session, check=False)
-        return result.returncode == 0
+    async def send_input(self, name: str, data: bytes) -> None:
+        """Inject raw bytes into the session's program without a full attach
+        (``dtach -p`` copies stdin to the session). Used for HTTP stdin and for
+        the graceful Ctrl-C on stop."""
+        if not data or not await self.has_session(name):
+            return
+        dtach = dtach_bin()
+        if not dtach:
+            return
+        sock = str(self.socket_path(name))
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                dtach,
+                "-p",
+                sock,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            await proc.communicate(input=data)
+        except Exception:
+            self._logger.debug("dtach send_input failed for %s", name, exc_info=True)
 
-    async def start_pane_capture(self, session: str, log_path: Path) -> None:
-        """Mirror a tmux pane's raw output to ``log_path`` via ``pipe-pane``."""
+    async def kill_session(self, name: str) -> None:
+        """Terminate a session by killing its dtach master (which kills the program).
+        The master keeps ``dtach -n <socket>`` in its argv and removes the socket on
+        exit; the socket name is unique per run so the pattern can't match another."""
+        if not name:
+            return
+        sock = str(self.socket_path(name))
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "pkill",
+                "-f",
+                f"dtach -n {sock}",
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            await proc.communicate()
+        except Exception:
+            self._logger.debug("pkill for dtach session %s failed", name, exc_info=True)
+        # Remove a stale socket if the master was already gone / didn't clean up.
+        try:
+            os.unlink(sock)
+        except FileNotFoundError:
+            pass
+        except Exception:
+            pass
+
+    def start_capture(
+        self,
+        name: str,
+        log_path: Path,
+        *,
+        init_cols: int,
+        init_rows: int,
+    ) -> asyncio.Task:
+        """Start the persistent capture logger (replaces ``tmux pipe-pane``).
+
+        Returns an ``asyncio.Task``; the caller tracks it and cancels it on teardown
+        (it also self-terminates when the session ends)."""
+        return asyncio.create_task(
+            self._capture_loop(name, Path(log_path), int(init_cols), int(init_rows))
+        )
+
+    async def _capture_loop(self, name: str, log_path: Path, init_cols: int, init_rows: int) -> None:
+        """A long-lived dtach client that tees ALL session output to ``log_path`` for
+        the run's lifetime — so output is captured even when no browser is attached
+        (autonomous agents), exactly like the old pipe-pane. It attaches FIRST at the
+        run's initial size (giving the 0x0 program a real size); later browser
+        attaches win the size (dtach: last attach/resize wins) and this logger never
+        re-pushes its size, so it can't clobber the browser geometry."""
+        # Give the freshly-created session a moment to come up.
+        for _ in range(50):
+            if await self.has_session(name):
+                break
+            await asyncio.sleep(0.1)
+        else:
+            return
         try:
             log_path.parent.mkdir(parents=True, exist_ok=True)
         except Exception:
             pass
-        await self.tmux_exec(
-            "pipe-pane",
-            "-t",
-            session,
-            f"cat >> {shlex.quote(str(log_path))}",
-            check=False,
-        )
+
+        master, slave = pty.openpty()
+        self._set_winsize(master, init_rows, init_cols)
+        proc = await self._spawn_attach(name, slave)
+        os.close(slave)
+        os.set_blocking(master, False)
+
+        loop = asyncio.get_event_loop()
+        queue: asyncio.Queue[bytes] = asyncio.Queue()
+
+        def _on_readable() -> None:
+            try:
+                data = os.read(master, 65536)
+            except (BlockingIOError, InterruptedError):
+                return
+            except OSError:
+                data = b""
+            queue.put_nowait(data)
+
+        loop.add_reader(master, _on_readable)
+        # Push the initial size to the program (the program started at 0x0).
+        try:
+            os.kill(proc.pid, signal.SIGWINCH)
+        except Exception:
+            pass
+        try:
+            with open(log_path, "ab", buffering=0) as f:
+                while True:
+                    data = await queue.get()
+                    if not data:
+                        return
+                    try:
+                        f.write(data)
+                    except Exception:
+                        pass
+        except asyncio.CancelledError:
+            raise
+        finally:
+            loop.remove_reader(master)
+            try:
+                proc.terminate()
+            except ProcessLookupError:
+                pass
+            except Exception:
+                pass
+            try:
+                os.close(master)
+            except OSError:
+                pass
+
+    # ---- low-level helpers ----------------------------------------------
 
     @staticmethod
     def _set_winsize(fd: int, rows: int, cols: int) -> None:
@@ -84,15 +310,41 @@ class CodingPtyBridge:
         except Exception:
             pass
 
+    async def _spawn_attach(self, name: str, slave_fd: int):
+        """Spawn a ``dtach -a`` client bridged to the given PTY slave."""
+
+        def _child_setup() -> None:
+            os.setsid()
+            try:
+                fcntl.ioctl(0, termios.TIOCSCTTY, 0)
+            except Exception:
+                pass
+
+        attach_env = dict(os.environ)
+        attach_env["TERM"] = "xterm-256color"
+        return await asyncio.create_subprocess_exec(
+            dtach_bin() or "dtach",
+            "-a",
+            str(self.socket_path(name)),
+            *_DTACH_CLIENT_FLAGS,
+            stdin=slave_fd,
+            stdout=slave_fd,
+            stderr=slave_fd,
+            preexec_fn=_child_setup,
+            env=attach_env,
+        )
+
+    # ---- WebSocket bridge -----------------------------------------------
+
     async def attach_pty(self, websocket, run_id: str, owner: str, cols: int = 120, rows: int = 40) -> None:
-        """Bridge a WebSocket to the run's tmux session through a real PTY."""
+        """Bridge a WebSocket to the run's dtach session through a real PTY."""
         cols = max(20, min(int(cols or 120), 400))
         rows = max(5, min(int(rows or 40), 120))
         run = await self._get_owned_run(run_id, owner)
-        session = run.tmux_session
-        alive = bool(session) and await self.tmux_has_session(session)
+        name = run.tmux_session
+        alive = bool(name) and await self.has_session(name)
 
-        # Fresh queued runs launch asynchronously; wait for the tmux session before
+        # Fresh queued runs launch asynchronously; wait for the session before
         # falling back to read-only history replay.
         if not alive and (run.status or "").lower() in ("queued", "starting", "pending", ""):
             for _ in range(300):
@@ -101,8 +353,8 @@ class CodingPtyBridge:
                     run = await self._get_owned_run(run_id, owner)
                 except Exception:
                     break
-                session = run.tmux_session
-                if session and await self.tmux_has_session(session):
+                name = run.tmux_session
+                if name and await self.has_session(name):
                     alive = True
                     break
                 if (run.status or "").lower() in self._finished_statuses:
@@ -123,39 +375,18 @@ class CodingPtyBridge:
                 pass
             return
 
-        # Size the tmux window to THIS client up front (window-size is manual), so the
-        # harness renders at the real pane width from the first frame instead of staying
-        # at the session's creation size → wrapped/garbled output until a later resize.
-        await self.tmux_exec("resize-window", "-t", session, "-x", str(cols), "-y", str(rows), check=False)
-
         master, slave = pty.openpty()
         self._set_winsize(master, rows, cols)
-
-        def _child_setup() -> None:
-            os.setsid()
-            try:
-                fcntl.ioctl(0, termios.TIOCSCTTY, 0)
-            except Exception:
-                pass
-
-        attach_env = dict(os.environ)
-        attach_env["TERM"] = "xterm-256color"
-        proc = await asyncio.create_subprocess_exec(
-            "tmux",
-            "-L",
-            TMUX_SOCKET,
-            "attach-session",
-            "-d",
-            "-t",
-            session,
-            stdin=slave,
-            stdout=slave,
-            stderr=slave,
-            preexec_fn=_child_setup,
-            env=attach_env,
-        )
+        proc = await self._spawn_attach(name, slave)
         os.close(slave)
         os.set_blocking(master, False)
+        # Push this client's size to the program (browser geometry wins; dtach uses
+        # the most recent attach/resize). The capture logger attached first at the
+        # run's initial size — this corrects it to the actual pane size.
+        try:
+            os.kill(proc.pid, signal.SIGWINCH)
+        except Exception:
+            pass
 
         loop = asyncio.get_event_loop()
         out_queue: asyncio.Queue[bytes] = asyncio.Queue()
@@ -193,14 +424,14 @@ class CodingPtyBridge:
                     if not isinstance(ctrl, dict):
                         continue
                     if ctrl.get("type") == "resize":
-                        new_cols = max(20, min(int(ctrl.get("cols") or cols), 400))
-                        new_rows = max(5, min(int(ctrl.get("rows") or rows), 120))
-                        self._set_winsize(master, new_rows, new_cols)
-                        # window-size is manual, so the PTY winsize alone won't move the
-                        # tmux window — resize it explicitly to keep the harness in sync.
-                        await self.tmux_exec(
-                            "resize-window", "-t", session, "-x", str(new_cols), "-y", str(new_rows), check=False
-                        )
+                        # Set the PTY winsize and nudge the dtach client with SIGWINCH
+                        # so it forwards the new size to the program (clean resize, no
+                        # tmux reflow grid).
+                        self._set_winsize(master, int(ctrl.get("rows") or rows), int(ctrl.get("cols") or cols))
+                        try:
+                            os.kill(proc.pid, signal.SIGWINCH)
+                        except Exception:
+                            pass
                     elif ctrl.get("type") == "input" and ctrl.get("data") is not None:
                         os.write(master, str(ctrl["data"]).encode("utf-8"))
 
@@ -212,6 +443,8 @@ class CodingPtyBridge:
                 task.cancel()
         finally:
             loop.remove_reader(master)
+            # Detaching (terminating our dtach client) leaves the SESSION alive —
+            # the program keeps running for reconnects / remote attach.
             try:
                 proc.terminate()
             except ProcessLookupError:

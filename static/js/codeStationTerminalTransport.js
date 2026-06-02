@@ -51,6 +51,13 @@ export function connectPaneWs(session, options = {}) {
     opened = true;
     try { session.fit && session.fit(); } catch (_) { /* noop */ }
     sendPaneResize(session);
+    // A pane opened during a split reflow can measure a premature size on first fit.
+    // Re-fit once after layout settles so the tmux window corrects to the pane's final
+    // width (tmux reflows its history to match), avoiding a mis-sized harness banner.
+    setTimeout(() => {
+      try { session.fit && session.fit(); } catch (_) { /* noop */ }
+      sendPaneResize(session);
+    }, 150);
   };
   ws.onmessage = (event) => {
     if (typeof event.data === 'string') {

@@ -12,6 +12,9 @@ datas = [
     (str(ROOT / "static"), "static"),
     (str(ROOT / "config"), "config"),
     (str(ROOT / "licenses"), "licenses"),
+    # Bundled helper binaries (e.g. dtach for Code Station session persistence) so the
+    # packaged app doesn't depend on a Homebrew install. The executable bit is preserved.
+    (str(ROOT / "vendor"), "vendor"),
     (str(ROOT / "requirements.txt"), "."),
 ]
 

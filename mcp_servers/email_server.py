@@ -31,7 +31,18 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 server = Server("email")
 EMAIL_SOCKET_TIMEOUT = float(os.environ.get("EMAIL_SOCKET_TIMEOUT", "20"))
-DATA_DIR = Path(__file__).resolve().parent.parent / "data"
+
+# imaplib caps a single response line at _MAXLINE (1 MB by default). A folder
+# with hundreds of thousands of messages can return a `SEARCH`/unread-scan
+# result on one line that overruns it ("command: UID => got more than 1000000
+# bytes"). Raise the ceiling so the SEARCH-based paths tolerate large responses;
+# _list_emails additionally avoids the unbounded `SEARCH ALL` (see below).
+imaplib._MAXLINE = max(getattr(imaplib, "_MAXLINE", 0), 50_000_000)
+# Resolve the data dir the same way src.constants does: honor the DATA_DIR env
+# var the macOS/PyInstaller launcher sets. The bundled scripts live under
+# _MEIPASS, so a __file__-relative path would point at the read-only bundle dir
+# instead of the real app-support data dir. Fall back to <repo>/data from source.
+DATA_DIR = Path(os.environ.get("DATA_DIR") or (Path(__file__).resolve().parent.parent / "data"))
 
 
 def _b(value) -> bytes:
@@ -195,7 +206,7 @@ def _load_config(account: str | None = None) -> dict:
     else:
         # Legacy fallback: settings.json flat keys
         try:
-            settings_path = Path(__file__).resolve().parent.parent / "data" / "settings.json"
+            settings_path = DATA_DIR / "settings.json"
             if settings_path.exists():
                 settings = json.loads(settings_path.read_text(encoding="utf-8"))
                 for key in (
@@ -396,6 +407,31 @@ def _get_cached_summaries():
 # ── Tool implementations ──
 
 
+def _recent_uids_by_sequence(conn, total, max_results):
+    """Return the UIDs of the newest `max_results` messages, newest-first,
+    without issuing a `SEARCH ALL`. Resolving by message-sequence range keeps
+    the IMAP response small even for folders with hundreds of thousands of
+    messages (a `SEARCH ALL` would return every UID on one line and overrun
+    imaplib's _MAXLINE limit). `total` is the EXISTS count from SELECT.
+    """
+    if total <= 0 or max_results <= 0:
+        return []
+    start = max(1, total - max_results + 1)
+    status, data = conn.fetch(f"{start}:{total}", "(UID)")
+    if status != "OK" or not data:
+        return []
+    uids = []
+    for item in data:
+        raw = item[0] if isinstance(item, tuple) else item
+        if not isinstance(raw, (bytes, bytearray)):
+            continue
+        m = re.search(rb"UID\s+(\d+)", raw)
+        if m:
+            uids.append(m.group(1))
+    # Sequence range comes back oldest-first; newest-first matches the SEARCH path.
+    return list(reversed(uids))[:max_results]
+
+
 def _list_emails(folder="INBOX", max_results=20, unresponded_only=False,
                  unread_only=False, account=None):
     """List emails newest-first. By default returns the latest messages,
@@ -404,24 +440,32 @@ def _list_emails(folder="INBOX", max_results=20, unresponded_only=False,
     account selects mailbox (None = default).
     """
     conn = _imap_connect(account)
-    select_status, _ = conn.select(folder, readonly=True)
+    select_status, select_data = conn.select(folder, readonly=True)
     if select_status != "OK":
         conn.logout()
         raise ValueError(f"IMAP folder not found: {folder}")
 
-    if unread_only and unresponded_only:
-        status, data = conn.uid("SEARCH", None, "(UNSEEN UNANSWERED)")
-    elif unread_only:
-        status, data = conn.uid("SEARCH", None, "(UNSEEN)")
+    if unread_only or unresponded_only:
+        criteria = "(UNSEEN UNANSWERED)" if (unread_only and unresponded_only) else "(UNSEEN)"
+        status, data = conn.uid("SEARCH", None, criteria)
+        if status != "OK" or not data or not data[0]:
+            conn.logout()
+            return []
+        uid_list = list(reversed(data[0].split()))[:max_results]
     else:
-        # Include read too — IMAP search "ALL" returns the entire folder
-        status, data = conn.uid("SEARCH", None, "ALL")
+        # No filter: avoid `UID SEARCH ALL` (one giant response line for large
+        # folders → imaplib _MAXLINE overflow). SELECT already told us how many
+        # messages exist, so fetch just the newest `max_results` by sequence.
+        try:
+            total = int(select_data[0]) if select_data and select_data[0] else 0
+        except (TypeError, ValueError):
+            total = 0
+        uid_list = _recent_uids_by_sequence(conn, total, max_results)
 
-    if status != "OK" or not data[0]:
+    if not uid_list:
         conn.logout()
         return []
 
-    uid_list = list(reversed(data[0].split()))[:max_results]
     cache = _get_cached_summaries()
     results = []
 

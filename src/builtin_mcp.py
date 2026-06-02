@@ -86,6 +86,21 @@ _BUILTIN_NPX_SERVERS = {
 MCP_DISABLED = os.environ.get("ODYSSEUS_DISABLE_MCP", "").lower() in ("1", "true", "yes")
 
 
+def python_mcp_launch(script_path: str):
+    """Return (command, args) to launch a bundled Python stdio MCP server.
+
+    From source, sys.executable is a real interpreter, so run the script
+    directly. In a PyInstaller bundle sys.executable is the app binary, not
+    Python — `sys.executable <script>.py` would re-enter the launcher and boot a
+    second backend. The frozen launcher accepts a `--odysseus-mcp <script>`
+    dispatch arg (see macos/backend_launcher.py) that runpy-executes the script
+    in place, so route through it when frozen.
+    """
+    if getattr(sys, "frozen", False):
+        return sys.executable, ["--odysseus-mcp", script_path]
+    return sys.executable, [script_path]
+
+
 async def register_builtin_servers(mcp_manager):
     """Connect all built-in MCP servers to the manager."""
     if MCP_DISABLED:
@@ -93,16 +108,16 @@ async def register_builtin_servers(mcp_manager):
         return
 
     base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    python = sys.executable
 
     async def _connect_python_server(server_id: str, script_path: str, name: str):
         try:
+            command, args = python_mcp_launch(script_path)
             ok = await mcp_manager.connect_server(
                 server_id=server_id,
                 name=name,
                 transport="stdio",
-                command=python,
-                args=[script_path],
+                command=command,
+                args=args,
                 env={"PYTHONPATH": base_dir},
             )
             if ok:

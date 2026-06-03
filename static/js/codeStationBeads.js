@@ -22,7 +22,11 @@ function esc(value) {
   ));
 }
 
-export function createBeadsPanel({ api, toast, confirm } = {}) {
+// `container` (optional) mounts the board into an arbitrary element — e.g. a
+// workspace pane — instead of the fixed sidebar IDs. In that mode there is no
+// section header/count badge (the pane bar owns the title), so head()/countEl()
+// return null and render() simply skips them (it already guards both).
+export function createBeadsPanel({ api, toast, confirm, container = null } = {}) {
   let projectId = null;
   let data = null;          // last /beads payload
   let showGraph = false;    // graph vs list view
@@ -32,10 +36,11 @@ export function createBeadsPanel({ api, toast, confirm } = {}) {
   let detail = null;        // { issue } | { error } for the expanded issue
   let closed = null;        // lazily-loaded closed issues for the 'closed' filter
   let busy = false;
+  let disposed = false;     // set on pane teardown — in-flight async callbacks then no-op
 
-  const panel = () => document.getElementById('cs-beads-panel');
-  const head = () => document.getElementById('cs-beads-head');
-  const countEl = () => document.getElementById('cs-beads-count');
+  const panel = () => container || document.getElementById('cs-beads-panel');
+  const head = () => (container ? null : document.getElementById('cs-beads-head'));
+  const countEl = () => (container ? null : document.getElementById('cs-beads-count'));
   const base = () => `/api/coding/projects/${encodeURIComponent(projectId)}/beads`;
 
   function notify(msg, kind) {
@@ -49,6 +54,7 @@ export function createBeadsPanel({ api, toast, confirm } = {}) {
 
   // --- data -----------------------------------------------------------------
   async function sync(nextProjectId) {
+    if (disposed) return;
     if (nextProjectId !== undefined && nextProjectId !== projectId) {
       projectId = nextProjectId;
       expandedId = null; detail = null; closed = null; // reset per-issue state across spaces
@@ -374,6 +380,7 @@ export function createBeadsPanel({ api, toast, confirm } = {}) {
   }
 
   function render() {
+    if (disposed) return;
     const el = panel();
     if (!el) return;
     const headEl = head();
@@ -549,5 +556,5 @@ export function createBeadsPanel({ api, toast, confirm } = {}) {
     });
   }
 
-  return { sync, render, getProjectId: () => projectId };
+  return { sync, render, getProjectId: () => projectId, dispose: () => { disposed = true; } };
 }

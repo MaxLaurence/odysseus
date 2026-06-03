@@ -450,3 +450,268 @@ def test_schedule_reindex_without_loop_is_noop():
 
     # No running event loop → returns quietly instead of raising.
     bridge._schedule_reindex("o", "p", "/tmp/x")
+
+
+# ── beads → RAG enrichment round-trip ───────────────────────────────────────
+class _FakeRag:
+    """Minimal in-memory stand-in for VectorRAG with the surface the bridge and
+    chat search both use: ``healthy``, ``delete_by_source``, ``add_documents_batch``
+    and an ``owner``-filtered ``search``. Lets us prove the enrichment round-trips
+    (issue → indexed doc → recalled by an owner-scoped query) without standing up
+    ChromaDB + an embedding backend."""
+
+    def __init__(self):
+        self.healthy = True
+        self.docs: list[tuple[str, dict]] = []
+
+    def delete_by_source(self, source: str) -> int:
+        before = len(self.docs)
+        self.docs = [(t, m) for t, m in self.docs if m.get("source") != source]
+        return before - len(self.docs)
+
+    def add_documents_batch(self, docs):
+        self.docs.extend(docs)
+        return {"success": True, "added_count": len(docs)}
+
+    def search(self, query: str, k: int = 5, owner=None):
+        q = set(query.lower().split())
+        hits = []
+        for text, meta in self.docs:
+            if owner is not None and meta.get("owner") != owner:
+                continue  # mirror VectorRAG's owner where-filter
+            if q & set(text.lower().split()):
+                hits.append({"document": text, "metadata": meta})
+        return hits[:k]
+
+
+@bd_missing
+def test_beads_enrichment_round_trips_into_rag(bd_repo, monkeypatch):
+    """An open issue is indexed under the per-project source with owner metadata,
+    and a later owner-scoped chat search recalls it — the exact path that lets a
+    normal chat 'remember' the codebase backlog. This is the seam the suite used
+    to mock out wholesale."""
+    import src.coding_beads_bridge as bridge
+
+    fake = _FakeRag()
+    monkeypatch.setattr(bridge, "get_rag_manager", lambda: fake, raising=False)
+    # get_rag_manager is imported lazily inside reindex_project_in_rag from
+    # src.rag_singleton, so patch it at the source too.
+    import src.rag_singleton as rag_singleton
+    monkeypatch.setattr(rag_singleton, "get_rag_manager", lambda: fake)
+
+    bridge.reindex_project_in_rag("tester", "proj-rt", bd_repo["root"])
+
+    # Every indexed doc is tagged with the per-project source + owner, and points
+    # back at a real issue id — the contract chat retrieval and re-enrichment rely on.
+    assert fake.docs, "expected open issues to be indexed into RAG"
+    for _text, meta in fake.docs:
+        assert meta["source"] == bridge._rag_source("proj-rt")
+        assert meta["owner"] == "tester"
+        assert meta["kind"] == "beads_issue"
+        assert meta["issue_id"]
+
+    # The seed repo has an open 'Fix login bug' issue → an owner-scoped query for
+    # it comes back, while a query under a *different* owner sees nothing.
+    recalled = fake.search("login bug", owner="tester")
+    assert any("login" in d["document"].lower() for d in recalled)
+    assert fake.search("login bug", owner="someone-else") == []
+
+
+@bd_missing
+def test_beads_enrichment_replaces_stale_docs(bd_repo, monkeypatch):
+    """Re-indexing is delete-by-source then re-add, so a project's docs don't
+    accumulate stale rows across runs."""
+    import src.coding_beads_bridge as bridge
+
+    fake = _FakeRag()
+    # A pre-existing stale doc for this project under the same source.
+    source = bridge._rag_source("proj-stale")
+    fake.docs.append(("Beads issue OLD: ancient removed issue", {"source": source, "owner": "tester"}))
+    import src.rag_singleton as rag_singleton
+    monkeypatch.setattr(rag_singleton, "get_rag_manager", lambda: fake)
+    monkeypatch.setattr(bridge, "get_rag_manager", lambda: fake, raising=False)
+
+    bridge.reindex_project_in_rag("tester", "proj-stale", bd_repo["root"])
+
+    # The stale doc is gone; only freshly-indexed live issues remain.
+    assert all("ancient removed issue" not in t for t, _m in fake.docs)
+    assert fake.docs  # but the live issues are present
+
+
+@pytest.mark.skipif(
+    os.environ.get("ODYSSEUS_RAG_INTEGRATION") != "1",
+    reason="real ChromaDB round-trip; set ODYSSEUS_RAG_INTEGRATION=1 to run",
+)
+@bd_missing
+def test_beads_enrichment_real_chromadb(bd_repo):
+    """Opt-in: exercise the genuine VectorRAG (ChromaDB + embeddings) so the
+    metadata/owner-filter contract is verified against the real store, not a fake.
+    Gated behind an env flag because it needs an embedding backend + Chroma."""
+    from src.coding_beads_bridge import reindex_project_in_rag
+    from src.rag_singleton import get_rag_manager
+
+    rag = get_rag_manager()
+    if rag is None or not getattr(rag, "healthy", False):
+        pytest.skip("RAG/ChromaDB backend not available")
+
+    reindex_project_in_rag("tester", "proj-real", bd_repo["root"])
+    hits = rag.search("login bug", k=5, owner="tester")
+    assert any(h.get("metadata", {}).get("kind") == "beads_issue" for h in hits)
+
+
+# ── memory → Beads routing guard (structural, not just ody-guide prose) ──────
+class _FakeMemoryManager:
+    """Just enough of MemoryManager for the provider tool's add/edit paths."""
+
+    def __init__(self):
+        self.saved: list[dict] = []
+
+    def load(self, owner=None):
+        return list(self.saved)
+
+    def load_all(self):
+        return list(self.saved)
+
+    def add_entry(self, text, source="user", category="fact", owner=None):
+        return {"id": str(uuid.uuid4()), "text": text, "category": category,
+                "source": source, "owner": owner, "uses": 0}
+
+    def save(self, entries):
+        self.saved = list(entries)
+
+
+def _mem_context(*, project_id):
+    from src.coding_provider_tokens import ProviderContext
+    return ProviderContext(
+        token_id="tok",
+        thread_id="thread-x",
+        project_id=project_id,
+        owner="tester",
+        session_id=None,
+        capabilities=frozenset({"memory.read", "memory.write"}),
+        run_id=None,
+    )
+
+
+def test_memory_add_rejects_work_category_when_project_scoped():
+    """A project-scoped agent may not file a task/bug into owner memory — it gets
+    a 400 pointing at the beads tool, so the 'memory = facts, Beads = work' split
+    is enforced in code, not just the prompt."""
+    from src.coding_provider_memory import call_memory_tool
+    from src.coding_provider_tokens import CodingProviderError
+
+    mgr = _FakeMemoryManager()
+    for category in ("task", "todo", "bug", "backlog"):
+        with pytest.raises(CodingProviderError) as exc:
+            call_memory_tool(
+                _mem_context(project_id="proj-1"),
+                "add",
+                {"text": "fix the flaky auth test", "category": category},
+                mgr,
+            )
+        assert exc.value.status_code == 400
+        assert "beads" in exc.value.detail.lower()
+    assert mgr.saved == []  # nothing leaked into the store
+
+
+def test_memory_add_allows_facts_when_project_scoped():
+    """The guard is surgical: durable user facts still go through unimpeded."""
+    from src.coding_provider_memory import call_memory_tool
+
+    mgr = _FakeMemoryManager()
+    result = call_memory_tool(
+        _mem_context(project_id="proj-1"),
+        "add",
+        {"text": "I prefer trunk-based development", "category": "fact"},
+        mgr,
+    )
+    assert result["memory"]["text"] == "I prefer trunk-based development"
+    assert len(mgr.saved) == 1
+
+
+def test_memory_add_allows_work_category_without_project_scope():
+    """Outside a project context (no project_id) there's no Beads repo to route
+    to, so the guard stays out of the way — non-coding memory writes are unchanged."""
+    from src.coding_provider_memory import call_memory_tool
+
+    mgr = _FakeMemoryManager()
+    result = call_memory_tool(
+        _mem_context(project_id=""),
+        "add",
+        {"text": "follow up on the invoice", "category": "task"},
+        mgr,
+    )
+    assert result["memory"]["category"] == "task"
+    assert len(mgr.saved) == 1
+
+
+def test_memory_edit_rejects_relabel_to_work_category_when_project_scoped():
+    """Closing the smuggling path: an existing fact can't be re-categorized into a
+    work category to sneak a task into a project-scoped agent's memory."""
+    from src.coding_provider_memory import call_memory_tool
+    from src.coding_provider_tokens import CodingProviderError
+
+    mgr = _FakeMemoryManager()
+    existing = mgr.add_entry("some note", category="fact", owner="tester")
+    mgr.saved = [existing]
+
+    with pytest.raises(CodingProviderError) as exc:
+        call_memory_tool(
+            _mem_context(project_id="proj-1"),
+            "edit",
+            {"memory_id": existing["id"], "text": "actually a task now", "category": "task"},
+            mgr,
+        )
+    assert exc.value.status_code == 400
+    assert "beads" in exc.value.detail.lower()
+
+
+# ── reconcile: catch direct-CLI (raw `bd`) drift on read ────────────────────
+@bd_missing
+def test_reconcile_reindexes_only_on_drift(bd_repo, monkeypatch):
+    """The read-path reconcile is fingerprint-gated: it re-embeds when the backlog
+    has drifted (e.g. an agent ran raw `bd create` in its PTY, bypassing the
+    bridge) and no-ops when it hasn't — so reads stay cheap."""
+    import src.coding_beads_bridge as bridge
+
+    fake = _FakeRag()
+    monkeypatch.setattr(bridge, "get_rag_manager", lambda: fake, raising=False)
+    import src.rag_singleton as rag_singleton
+    monkeypatch.setattr(rag_singleton, "get_rag_manager", lambda: fake)
+    # Start from a clean fingerprint table so this test is order-independent.
+    monkeypatch.setattr(bridge, "_RAG_FINGERPRINTS", {})
+
+    # First reconcile on an un-indexed project always reindexes (no fingerprint yet).
+    assert bridge.reconcile_project_in_rag("tester", "proj-recon", bd_repo["root"]) is True
+    indexed_after_first = len(fake.docs)
+    assert indexed_after_first > 0
+
+    # No change → second reconcile is a no-op (fingerprint matches, no re-embed).
+    assert bridge.reconcile_project_in_rag("tester", "proj-recon", bd_repo["root"]) is False
+    assert len(fake.docs) == indexed_after_first
+
+    # Simulate a raw-CLI write: a new issue appears in `.beads/` out-of-band.
+    get_beads_service().create(bd_repo["root"], "Snuck in via raw bd", issue_type="task")
+    # Now the fingerprint differs → reconcile detects drift and reindexes.
+    assert bridge.reconcile_project_in_rag("tester", "proj-recon", bd_repo["root"]) is True
+    assert any("Snuck in via raw bd" in t for t, _m in fake.docs)
+
+
+def test_schedule_reconcile_without_loop_is_noop():
+    import src.coding_beads_bridge as bridge
+
+    # No running event loop → returns quietly instead of raising.
+    bridge.schedule_reconcile("o", "p", "/tmp/x")
+
+
+def test_issues_fingerprint_is_order_independent():
+    from src.coding_beads_bridge import _issues_fingerprint
+
+    a = [{"id": "x1", "title": "A", "issue_type": "bug", "status": "open"},
+         {"id": "x2", "title": "B", "issue_type": "task", "status": "open"}]
+    b = list(reversed(a))
+    assert _issues_fingerprint(a) == _issues_fingerprint(b)
+    # A status change moves the fingerprint (the doc text would change).
+    c = [dict(a[0], status="closed"), a[1]]
+    assert _issues_fingerprint(a) != _issues_fingerprint(c)
+

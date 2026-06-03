@@ -43,7 +43,6 @@ const STREAM_EVENT_NAMES = [
 let API_BASE = '';
 let sessionModule = null;
 let uiModule = null;
-let beadsModule = null;
 let modelsModule = null;
 let providerToolsModule = null;
 
@@ -275,15 +274,17 @@ async function flushLayout() {
 function rehydrateTree(node) {
   if (!node) return null;
   if (node.kind === 'leaf') {
+    const paneKind = node.paneKind === 'beads' ? 'beads' : 'terminal';
     return {
       id: newId('p'),
       kind: 'leaf',
-      threadId: node.threadId || null,
-      runId: node.runId || '',
+      paneKind,
+      threadId: paneKind === 'beads' ? null : (node.threadId || null),
+      runId: paneKind === 'beads' ? '' : (node.runId || ''),
       paneId: newId('pane'),
       // Stored status is a stale snapshot; applyTabLayout reconciles the real run
       // status from the live thread list so we don't connect to dead runs.
-      status: node.threadId ? 'idle' : 'empty',
+      status: paneKind === 'beads' ? 'idle' : (node.threadId ? 'idle' : 'empty'),
       title: node.title || null,
     };
   }
@@ -676,25 +677,70 @@ function syncProviderTools(options = {}) {
   return pending;
 }
 
-function ensureBeadsModule() {
-  if (beadsModule) return beadsModule;
-  beadsModule = createBeadsPanel({
-    api,
-    toast,
-    confirm: (message, options) => (
-      uiModule?.styledConfirm
-        ? uiModule.styledConfirm(message, options)
-        : Promise.resolve(window.confirm(message))
-    ),
-  });
-  return beadsModule;
+function beadsConfirm(message, options) {
+  return uiModule?.styledConfirm
+    ? uiModule.styledConfirm(message, options)
+    : Promise.resolve(window.confirm(message));
 }
 
-function syncBeads() {
+// The Beads board lives in the workspace as a `beads` pane kind, not the sidebar.
+// Re-sync every open board pane (there's normally at most one per tab) for the
+// current space — called on space/project switch and on `beads_changed` events.
+function syncBeadsPanes() {
   const projectId = asId(state.selectedProjectId || state.selectedProject?.id);
-  ensureBeadsModule().sync(projectId).catch((error) => {
-    console.debug('Beads refresh failed', error);
-  });
+  for (const session of state.panes.values()) {
+    if (session.paneKind === 'beads' && session.beads) {
+      session.beads.sync(projectId).catch((error) => console.debug('Beads refresh failed', error));
+    }
+  }
+}
+
+// Open (or focus) the Beads board pane: reuse an existing one, fill an empty
+// focused pane, else split the focused pane to the right.
+function openBeadsPane() {
+  const root = state.workspace.root;
+  let existing = null;
+  eachLeaf(root, (leaf) => { if (!existing && leaf.paneKind === 'beads') existing = leaf; });
+  if (existing) { focusLeaf(existing.id); return; }
+
+  if (!root) {
+    const leaf = makeBeadsLeaf();
+    state.workspace.root = leaf;
+    state.workspace.focusId = leaf.id;
+    renderWorkspace();
+    focusLeaf(leaf.id);
+    return;
+  }
+  const focusId = state.workspace.focusId || firstLeaf(root).id;
+  const fl = locate(root, focusId);
+  if (fl && fl.node.kind === 'leaf' && !fl.node.threadId && fl.node.paneKind !== 'beads') {
+    // Convert an empty terminal pane in place; new paneId forces a remount.
+    const node = fl.node;
+    node.paneKind = 'beads';
+    node.threadId = null;
+    node.runId = '';
+    node.paneId = newId('pane');
+    node.status = 'idle';
+    state.workspace.focusId = node.id;
+    renderWorkspace();
+    focusLeaf(node.id);
+  } else {
+    splitAt(focusId, 'row', 'b', makeBeadsLeaf());
+  }
+}
+
+function mountBeadsPane(leaf, leafEl) {
+  const termEl = leafEl.querySelector('.cs-pane-term');
+  if (!termEl) return;
+  termEl.replaceChildren();
+  const container = document.createElement('div');
+  container.className = 'cs-beads-panel';
+  termEl.appendChild(container);
+  const beads = createBeadsPanel({ api, toast, confirm: beadsConfirm, container });
+  state.panes.set(leaf.paneId, { paneId: leaf.paneId, paneKind: 'beads', el: leafEl, beads, status: 'idle' });
+  leafEl.__mounted = true;
+  beads.sync(asId(state.selectedProjectId || state.selectedProject?.id))
+    .catch((error) => console.debug('Beads init failed', error));
 }
 
 function connectPaneWs(session) {
@@ -777,12 +823,6 @@ function ensureModal() {
               <button type="button" class="code-station-icon-btn small" data-code-action="toggle-new-project" title="New space" aria-label="New space"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg></button>
             </div>
             <div id="cs-spaces-list" class="code-station-list cs-spaces-list"></div>
-            <div class="cs-section-head cs-beads-head" id="cs-beads-head" hidden>
-              <span class="cs-section-title" title="Beads (bd) — the repo-scoped, dependency-aware backlog">Work</span>
-              <span id="cs-beads-count" class="code-station-muted cs-section-count">0</span>
-              <span class="cs-section-spacer"></span>
-            </div>
-            <div id="cs-beads-panel" class="cs-beads-panel" hidden></div>
             <div class="cs-section-head cs-agents-head">
               <span class="cs-section-title">Agents</span>
               <span id="cs-thread-count" class="code-station-muted cs-section-count">0</span>
@@ -814,6 +854,7 @@ function ensureModal() {
             <span class="cs-ws-title">WORKSPACE</span>
             <span id="cs-ws-count" class="code-station-muted">0 panes</span>
             <span class="cs-ws-spacer"></span>
+            <button type="button" class="cs-ws-btn cs-ws-btn--beads" data-code-action="open-beads" title="Open the Beads board" aria-label="Open the Beads board"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/></svg></button>
             <button type="button" class="cs-ws-btn" data-code-action="ws-split-h" title="Split focused pane right" aria-label="Split focused pane right"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="1.5"/><line x1="12" y1="4" x2="12" y2="20"/></svg></button>
             <button type="button" class="cs-ws-btn" data-code-action="ws-split-v" title="Split focused pane down" aria-label="Split focused pane down"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="1.5"/><line x1="3" y1="12" x2="21" y2="12"/></svg></button>
             <button type="button" class="cs-ws-btn" data-code-action="ws-layout-grid" title="Even grid" aria-label="Tile panes evenly"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="1.5"/><line x1="12" y1="3" x2="12" y2="21"/><line x1="3" y1="12" x2="21" y2="12"/></svg></button>
@@ -825,6 +866,7 @@ function ensureModal() {
               <svg class="cs-ws-empty-glyph" width="36" height="36" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/><line x1="13" y1="4" x2="11" y2="20"/></svg>
               <p>Drag a thread here to open a live terminal.</p>
               <span class="cs-ws-empty-sub">Drop on a pane edge to split &middot; drag a pane bar to rearrange</span>
+              <button type="button" class="cs-ws-empty-btn" data-code-action="open-beads">Open the Beads board</button>
             </div>
             <div id="cs-ws-dropghost" class="cs-ws-dropghost" hidden></div>
           </div>
@@ -1047,6 +1089,10 @@ async function handleAction(action, button) {
   }
   if (action === 'ws-close-focused') {
     await closeFocused();
+    return;
+  }
+  if (action === 'open-beads') {
+    openBeadsPane();
   }
 }
 
@@ -1100,7 +1146,7 @@ async function refreshAll() {
     state.selectedThreadId = null;
     renderAll();
     syncProviderTools({ reset: true, load: false });
-    syncBeads();
+    syncBeadsPanes();
   }
 }
 
@@ -1230,7 +1276,7 @@ async function selectProject(projectId, options = {}) {
   renderAll();
   await refreshBadges();
   syncProviderTools({ reset: true, force: true });
-  syncBeads();
+  syncBeadsPanes();
   if (!options.keepTab) setMobileTab('threads');
 }
 
@@ -1700,6 +1746,7 @@ function makeLeaf(thread) {
   return {
     id: newId('p'),
     kind: 'leaf',
+    paneKind: 'terminal',
     threadId: thread?.id || null,
     runId: thread?.run_id || '',
     paneId: newId('pane'),
@@ -1708,7 +1755,12 @@ function makeLeaf(thread) {
 }
 
 function makeEmptyLeaf() {
-  return { id: newId('p'), kind: 'leaf', threadId: null, runId: '', paneId: newId('pane'), status: 'empty' };
+  return { id: newId('p'), kind: 'leaf', paneKind: 'terminal', threadId: null, runId: '', paneId: newId('pane'), status: 'empty' };
+}
+
+// A non-terminal pane that hosts the Beads backlog board (project-scoped, no run).
+function makeBeadsLeaf() {
+  return { id: newId('p'), kind: 'leaf', paneKind: 'beads', threadId: null, runId: '', paneId: newId('pane'), status: 'idle' };
 }
 
 function focusedSession() {
@@ -1824,7 +1876,7 @@ async function closeLeaf(leafId, options = {}) {
   const loc = locate(root, leafId);
   if (!loc) return;
   if (stopRun && loc.node.kind === 'leaf') await stopPaneRunIfActive(loc.node);
-  if (loc.node.kind === 'leaf' && loc.node.threadId && state.panes.has(loc.node.paneId)) {
+  if (loc.node.kind === 'leaf' && (loc.node.threadId || loc.node.paneKind === 'beads') && state.panes.has(loc.node.paneId)) {
     teardownPane(loc.node.paneId);
   }
   if (!loc.parent) {
@@ -1866,7 +1918,7 @@ async function moveLeaf(sourceLeafId, targetLeafId, edge) {
     // the target's now-orphaned session so it doesn't leak.
     const tloc = locate(state.workspace.root, targetLeafId);
     if (!tloc) { splitAt(state.workspace.root ? firstLeaf(state.workspace.root).id : sourceLeafId, 'row', 'b', srcNode); return; }
-    if (tloc.node.kind === 'leaf' && tloc.node.threadId && state.panes.has(tloc.node.paneId)) {
+    if (tloc.node.kind === 'leaf' && (tloc.node.threadId || tloc.node.paneKind === 'beads') && state.panes.has(tloc.node.paneId)) {
       teardownPane(tloc.node.paneId);
     }
     if (!tloc.parent) state.workspace.root = srcNode;
@@ -1909,9 +1961,11 @@ async function openThreadAsPane(thread, target) {
   if (!loc || loc.node.kind !== 'leaf') return null;
   if (target.edge === 'center') {
     const leaf = loc.node;
-    if (leaf.threadId !== thread.id) {
+    if (leaf.threadId !== thread.id || leaf.paneKind === 'beads') {
       await stopPaneRunIfActive(leaf);
-      if (leaf.threadId && state.panes.has(leaf.paneId)) teardownPane(leaf.paneId);
+      // Drop the old session whatever its kind (terminal OR a beads board).
+      if (state.panes.has(leaf.paneId)) teardownPane(leaf.paneId);
+      leaf.paneKind = 'terminal';
       leaf.threadId = thread.id;
       leaf.runId = thread.run_id || '';
       leaf.paneId = newId('pane');
@@ -1989,11 +2043,12 @@ function focusLeaf(leafId) {
     renderThreadDetail();
   }
   const session = leaf ? state.panes.get(leaf.paneId) : null;
-  if (session) { try { session.term.focus(); } catch (_) { /* noop */ } }
+  if (session && session.term) { try { session.term.focus(); } catch (_) { /* noop */ } }
 }
 
 // ---- per-pane terminal lifecycle ----
 function mountPane(leaf, leafEl) {
+  if (leaf.paneKind === 'beads') { mountBeadsPane(leaf, leafEl); return; }
   if (!leaf.threadId) return;
   const termEl = leafEl.querySelector('.cs-pane-term');
   if (!termEl) return;
@@ -2081,6 +2136,15 @@ function mountPane(leaf, leafEl) {
 function teardownPane(paneId) {
   const session = state.panes.get(paneId);
   if (!session) return;
+  if (session.paneKind === 'beads') {
+    // No terminal/WebSocket to dispose; mark the board disposed so any in-flight
+    // async callbacks no-op, then drop it (its delegated listeners die with the
+    // container when the pane DOM is removed).
+    try { session.beads?.dispose?.(); } catch (_) { /* noop */ }
+    if (session.el) session.el.__mounted = false;
+    state.panes.delete(paneId);
+    return;
+  }
   closePaneWs(session);
   if (session.source) { try { session.source.close(); } catch (_) { /* noop */ } session.source = null; }
   clearTimeout(session._ft);
@@ -2187,7 +2251,7 @@ function feedPane(session, payload, eventName = 'message', replay = false) {
   // stream as `beads_changed`. Refresh the per-project panel + the space dots.
   if (evtKind === 'beads_changed') {
     const changedProject = asId(payload.project_id || payload.projectId);
-    if (!changedProject || changedProject === asId(state.selectedProjectId)) syncBeads();
+    if (!changedProject || changedProject === asId(state.selectedProjectId)) syncBeadsPanes();
     renderSpaces();
     return;
   }
@@ -2284,6 +2348,7 @@ function updatePaneDims(session, cols, rows) {
 
 function refitAll() {
   const doAll = () => state.panes.forEach((session) => {
+    if (session.paneKind === 'beads') return;  // no pty/terminal to fit or resize
     try {
       session.fit && session.fit();      // recompute cols/rows for the current box
       sendPaneResize(session);           // push the new size to the pty so the harness reflows
@@ -2329,6 +2394,18 @@ function createLeafEl() {
 function updateLeafEl(el, node) {
   el.dataset.node = node.id;
   el.dataset.pane = node.paneId;
+  el.dataset.kind = node.paneKind || 'terminal';
+  if (node.paneKind === 'beads') {
+    el.removeAttribute('data-thread-id');
+    el.dataset.status = 'idle';
+    el.dataset.focus = state.workspace.focusId === node.id ? 'true' : 'false';
+    el.dataset.empty = 'false';
+    const led = el.querySelector('.cs-pane-led'); if (led) led.dataset.status = 'idle';
+    const name = el.querySelector('.cs-pane-name'); if (name) name.textContent = 'Beads · backlog';
+    const harn = el.querySelector('.cs-pane-harness'); if (harn) harn.textContent = '';
+    const dims = el.querySelector('.cs-pane-dims'); if (dims) dims.textContent = '';
+    return;
+  }
   if (node.threadId) el.dataset.threadId = node.threadId;
   else el.removeAttribute('data-thread-id');
   el.dataset.status = statusClass(node.status || (node.threadId ? 'idle' : 'empty'));
@@ -2357,7 +2434,7 @@ function buildNodeEl(node, prev, used, mountQueue) {
     }
     used.set(node.id, el);
     updateLeafEl(el, node);
-    if (node.threadId && !state.panes.has(node.paneId) && !el.__mounted) {
+    if ((node.threadId || node.paneKind === 'beads') && !state.panes.has(node.paneId) && !el.__mounted) {
       mountQueue.push({ leaf: node, el });
     }
     return el;
@@ -2398,7 +2475,7 @@ function buildNodeEl(node, prev, used, mountQueue) {
 // live terminal on each render.
 function wsSignature(node) {
   if (!node) return '∅';
-  if (node.kind === 'leaf') return `L:${node.id}:${node.paneId}:${node.threadId || ''}`;
+  if (node.kind === 'leaf') return `L:${node.id}:${node.paneId}:${node.threadId || ''}:${node.paneKind || 't'}`;
   return `S:${node.id}:${node.dir}(${wsSignature(node.a)},${wsSignature(node.b)})`;
 }
 
@@ -2442,7 +2519,7 @@ function renderWorkspace() {
 
   // Teardown panes whose leaf no longer exists in the tree.
   const live = new Set();
-  eachLeaf(tree, (leaf) => { if (leaf.threadId) live.add(leaf.paneId); });
+  eachLeaf(tree, (leaf) => { if (leaf.threadId || leaf.paneKind === 'beads') live.add(leaf.paneId); });
   for (const paneId of [...state.panes.keys()]) {
     if (!live.has(paneId)) teardownPane(paneId);
   }

@@ -23,6 +23,7 @@ from src.coding_beads import BeadsError, get_beads_service
 from src.coding_beads_bridge import (
     emit_beads_changed,
     resolve_beads_project,
+    schedule_reconcile,
     set_beads_enabled,
 )
 
@@ -93,6 +94,11 @@ def register_beads_routes(router: APIRouter) -> None:
                 )
             except BeadsError as exc:
                 raise HTTPException(exc.status_code, exc.detail) from exc
+            # Catch up RAG if an agent mutated the backlog via raw `bd` in its PTY
+            # (that path skips emit_beads_changed). Fingerprint-gated + detached, so
+            # it costs nothing unless the backlog actually drifted, and never delays
+            # this response.
+            schedule_reconcile(owner, project_id, root_path)
         return {"beads": payload}
 
     @router.get("/projects/{project_id}/beads/graph")

@@ -36814,6 +36814,13 @@ button.code-station-pill:hover {
 .cs-ws-root[data-empty="true"] .cs-ws-empty { display: flex; }
 .cs-ws-empty p { margin: 0; font-size: 13px; }
 .cs-ws-empty-sub { font-size: 11px; color: color-mix(in srgb, var(--cs-terminal-fg) 28%, transparent); }
+.cs-ws-empty-btn {
+  pointer-events: auto; margin-top: 6px; cursor: pointer;
+  font-size: 11px; font-weight: 600; padding: 5px 12px; border-radius: 7px;
+  border: 1px solid color-mix(in srgb, var(--cs-accent) 45%, transparent);
+  background: color-mix(in srgb, var(--cs-accent) 10%, transparent); color: var(--cs-accent);
+}
+.cs-ws-empty-btn:hover { background: color-mix(in srgb, var(--cs-accent) 20%, transparent); }
 .cs-ws-empty-glyph { opacity: 0.5; animation: cs-pulse 4s var(--cs-ease) infinite; }
 .cs-ws-root[data-empty="true"].is-drop-hot { box-shadow: inset 0 0 0 2px var(--cs-accent); }
 
@@ -37359,6 +37366,19 @@ body.code-space-active > #chat-container { display: none !important; }
 /* ── Beads (bd) per-project backlog panel ─────────────────────────────────── */
 .cs-beads-panel { padding: 2px 10px 8px; display: flex; flex-direction: column; gap: 6px; }
 .cs-beads-panel.cs-beads-busy { opacity: 0.6; pointer-events: none; }
+
+/* Beads hosted as a first-class workspace pane (data-kind="beads"): the board
+   scrolls inside the pane body, and run/config/dims (terminal-only chrome) are
+   suppressed. The board gets more room here than it ever had in the sidebar. */
+.cs-pane[data-kind="beads"] .cs-pane-term { overflow-y: auto; padding: 0; display: block; }
+.cs-pane[data-kind="beads"] .cs-pane-term .cs-beads-panel { padding: 8px 12px 16px; gap: 8px; }
+.cs-pane[data-kind="beads"] .cs-pane-empty { display: none; }
+.cs-pane[data-kind="beads"] .cs-pane-dims,
+.cs-pane[data-kind="beads"] .cs-pane-btn[data-pane-action="run"],
+.cs-pane[data-kind="beads"] .cs-pane-btn[data-pane-action="config"] { display: none; }
+/* Roomier board: let the ready/backlog lists breathe in the wider pane. */
+.cs-pane[data-kind="beads"] .cs-beads-list { gap: 3px; }
+.cs-pane[data-kind="beads"] .cs-bead-item { font-size: 12px; }
 .cs-beads-counts { display: flex; flex-wrap: wrap; gap: 5px; }
 .cs-beads-count {
   font-size: 10px; font-weight: 600; padding: 2px 6px; border-radius: 6px;

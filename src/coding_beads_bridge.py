@@ -19,6 +19,7 @@ it. The seams:
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 from typing import Any
 
@@ -31,6 +32,15 @@ RAG_SOURCE_PREFIX = "beads:"
 
 # Strong refs to in-flight detached reindex tasks so they aren't GC'd mid-run.
 _REINDEX_TASKS: set[asyncio.Task] = set()
+
+# Fingerprint of the issue set last indexed into RAG, keyed by project id. Lets a
+# read-path reconcile (see :func:`schedule_reconcile`) skip the expensive
+# re-embedding unless the backlog actually drifted — which is how we catch issues
+# created by an agent running raw ``bd create`` in its PTY (that path bypasses the
+# bridge, so no ``emit_beads_changed`` fires). In-memory + best-effort: a process
+# restart just forces one reconcile on the next read, which is harmless.
+_RAG_FINGERPRINTS: dict[str, str] = {}
+
 
 
 def resolve_beads_project(owner: str, project_id: str) -> dict[str, Any]:
@@ -95,6 +105,20 @@ def _issue_document(issue: dict[str, Any]) -> str:
     return " ".join(parts)
 
 
+def _issues_fingerprint(issues: list[dict[str, Any]]) -> str:
+    """A cheap, order-independent digest of the open issue set's *indexed* fields.
+
+    Covers exactly what goes into the RAG document (id + title + type + status), so
+    the fingerprint changes iff a reindex would change the embedded text. Used by
+    the read-path reconcile to decide whether re-embedding is worth it."""
+    parts = sorted(
+        f"{i.get('id')}|{i.get('title', '')}|{i.get('issue_type', '')}|{i.get('status', '')}"
+        for i in issues
+        if i.get("id")
+    )
+    return hashlib.sha1("\n".join(parts).encode("utf-8")).hexdigest()
+
+
 def reindex_project_in_rag(owner: str, project_id: str, root_path: str) -> None:
     """Best-effort: replace this project's Beads docs in the RAG collection.
 
@@ -114,6 +138,9 @@ def reindex_project_in_rag(owner: str, project_id: str, root_path: str) -> None:
             rag.delete_by_source(source)
         except Exception:
             logger.debug("beads RAG delete_by_source failed", exc_info=True)
+        # Record the fingerprint even when the backlog is now empty, so a project
+        # that was emptied doesn't trigger a reconcile-reindex on every read.
+        _RAG_FINGERPRINTS[project_id] = _issues_fingerprint(issues)
         if not issues:
             return
         docs = [
@@ -151,6 +178,45 @@ def _schedule_reindex(owner: str, project_id: str, root_path: str) -> None:
         return  # no loop (sync context) — nothing the UI is waiting on anyway
     task = loop.create_task(
         asyncio.to_thread(reindex_project_in_rag, owner, project_id, root_path)
+    )
+    _REINDEX_TASKS.add(task)
+    task.add_done_callback(_REINDEX_TASKS.discard)
+
+
+def reconcile_project_in_rag(owner: str, project_id: str, root_path: str) -> bool:
+    """Re-enrich RAG only if the backlog drifted from what we last indexed.
+
+    This is the catch-up for the lowest-friction agent path: an agent that runs
+    raw ``bd create``/``bd close`` in its PTY mutates ``.beads/`` without going
+    through :func:`emit_beads_changed`, so RAG would otherwise go stale. A cheap
+    ``bd list`` + fingerprint compare gates the expensive re-embedding, so this is
+    safe to call from read paths. Returns ``True`` iff a reindex was performed.
+    Never raises."""
+    try:
+        issues = get_beads_service().list_issues(root_path, include_closed=False, limit=1000)
+    except BeadsError:
+        return False
+    except Exception:
+        logger.debug("beads reconcile list failed", exc_info=True)
+        return False
+    if _RAG_FINGERPRINTS.get(project_id) == _issues_fingerprint(issues):
+        return False  # nothing changed since the last index — skip re-embedding
+    reindex_project_in_rag(owner, project_id, root_path)
+    return True
+
+
+def schedule_reconcile(owner: str, project_id: str, root_path: str) -> None:
+    """Fire-and-forget the drift check off the request hot path (e.g. from a GET).
+
+    Mirrors :func:`_schedule_reindex` but routes through the fingerprint-gated
+    :func:`reconcile_project_in_rag`, so a read only pays for ``bd list`` (cheap)
+    unless the backlog actually moved. No running loop → silently does nothing."""
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    task = loop.create_task(
+        asyncio.to_thread(reconcile_project_in_rag, owner, project_id, root_path)
     )
     _REINDEX_TASKS.add(task)
     task.add_done_callback(_REINDEX_TASKS.discard)
@@ -206,7 +272,9 @@ async def emit_beads_changed(
 __all__ = [
     "RAG_SOURCE_PREFIX",
     "emit_beads_changed",
+    "reconcile_project_in_rag",
     "reindex_project_in_rag",
     "resolve_beads_project",
+    "schedule_reconcile",
     "set_beads_enabled",
 ]

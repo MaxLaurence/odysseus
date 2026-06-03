@@ -13,6 +13,18 @@ from src.coding_provider_tokens import (
 )
 from src.coding_provider_tool_common import MAX_MEMORY_TEXT, int_arg
 
+# Categories that denote *work* (a task/bug/backlog item), not a durable fact
+# about the user. Project work belongs in Beads — the repo-scoped, durable source
+# of truth whose dependency graph and `ready` queue memory cannot provide — never
+# in the owner memory store, whose LLM auditor consolidates/forgets entries and
+# would silently drop a backlog item. When a token is scoped to a project we make
+# that ownership split *structural* instead of relying on the ody-guide prompt: a
+# work-category memory write is refused and the agent is pointed at the beads tool.
+_WORK_CATEGORIES = frozenset(
+    {"task", "todo", "to_do", "todos", "bug", "issue", "issues", "backlog",
+     "work", "ticket", "feature", "chore", "story"}
+)
+
 
 async def handle_memory_tool(
     context: ProviderContext,
@@ -79,6 +91,18 @@ def call_memory_tool(
             if len(text) > MAX_MEMORY_TEXT:
                 raise CodingProviderError(400, f"text exceeds {MAX_MEMORY_TEXT} characters")
             category = str(args.get("category") or "fact").strip().lower() or "fact"
+            # Structural enforcement of the "memory = facts, Beads = work" split:
+            # a project-scoped token may not file work items into owner memory.
+            # Route them to the beads tool (`create`) so they land in the durable,
+            # dependency-aware backlog instead of the forgetful memory store.
+            if context.project_id and category in _WORK_CATEGORIES:
+                raise CodingProviderError(
+                    400,
+                    f"Refusing to store a '{category}' item in memory for a "
+                    "project-scoped agent: project work belongs in Beads, not the "
+                    "owner memory store (which consolidates/forgets entries). Use "
+                    "the `beads` tool — `create` to file it, `ready` to find work.",
+                )
             session_id = str(args.get("session_id") or context.session_id or "").strip() or None
             if session_id and session_id != context.session_id:
                 raise CodingProviderError(403, "memory session_id must match this coding thread")
@@ -106,7 +130,17 @@ def call_memory_tool(
                 raise CodingProviderError(400, f"text exceeds {MAX_MEMORY_TEXT} characters")
             memory["text"] = text
             if args.get("category") is not None:
-                memory["category"] = str(args.get("category") or "fact").strip().lower() or "fact"
+                new_category = str(args.get("category") or "fact").strip().lower() or "fact"
+                # Same split as `add`: don't let a project-scoped agent re-label an
+                # existing memory into a work category to smuggle a task in.
+                if context.project_id and new_category in _WORK_CATEGORIES:
+                    raise CodingProviderError(
+                        400,
+                        f"Refusing to re-categorize memory as '{new_category}' for a "
+                        "project-scoped agent: project work belongs in Beads, not the "
+                        "owner memory store. Use the `beads` tool to track it.",
+                    )
+                memory["category"] = new_category
             memory["timestamp"] = int(datetime.utcnow().timestamp())
             memory_manager.save(all_memories)
             if memory_vector and getattr(memory_vector, "healthy", False):

@@ -91,3 +91,8 @@ docs/windows-port/
 compound.config.json
 *.error.log
 _scratch/
+
+# Beads / Dolt files (added by bd init)
+.dolt/
+.beads-credential-key
+.beads/proxieddb/

@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "embedded",
+  "dolt_database": "odysseus",
+  "project_id": "2be35c3c-d42f-4869-bc96-8063d20b91d1"
+}

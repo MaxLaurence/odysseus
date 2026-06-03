@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Optional, Dict
 
 from src.constants import DATA_DIR
+from src.research_utils import is_low_quality
 
 logger = logging.getLogger(__name__)
 
@@ -181,13 +182,14 @@ class ResearchHandler:
 
     @staticmethod
     def _extract_sources(findings: list) -> list:
-        """Extract deduplicated [{url, title}] from findings."""
+        """Extract deduplicated [{url, title}] from findings, filtering low-quality ones."""
         seen = set()
         sources = []
         for f in findings:
             url = f.get("url", "")
             title = f.get("title", "") or url
-            if url and url not in seen:
+            summary = f.get("summary", "") or f.get("evidence", "")
+            if url and url not in seen and not is_low_quality(summary):
                 seen.add(url)
                 sources.append({"url": url, "title": title})
         return sources
@@ -348,7 +350,8 @@ class ResearchHandler:
             for f in findings:
                 url = f.get("url", "")
                 title = f.get("title", "") or url
-                if url and url not in seen_urls:
+                summary = f.get("summary", "") or f.get("evidence", "")
+                if url and url not in seen_urls and not is_low_quality(summary):
                     seen_urls.add(url)
                     source_lines.append(f"- [{title}]({url})")
             if source_lines:

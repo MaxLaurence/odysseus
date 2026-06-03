@@ -42,6 +42,7 @@ import secrets
 from datetime import datetime
 from typing import Dict
 
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse, FileResponse, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -75,6 +76,9 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ========= APP =========
+# Lifespan is defined below (after all helpers it references are in scope)
+# and passed to FastAPI so we can use the modern context-manager lifecycle
+# instead of the deprecated @app.on_event("startup"/"shutdown") decorators.
 app = FastAPI(
     title="AI Chat Application",
     description="Comprehensive AI chat with memory, research, and multi-modal capabilities",
@@ -791,6 +795,17 @@ async def get_version():
 async def health_check() -> Dict[str, str]:
     return {"status": "healthy", "timestamp": datetime.utcnow().isoformat()}
 
+@app.get("/api/ready")
+async def readiness_check() -> JSONResponse:
+    """Readiness / integrity self-check — DB, data dir, local-first storage.
+
+    Unlike /api/health (liveness), this returns 503 unless every critical
+    subsystem is whole, so an orchestrator can gate traffic on real readiness.
+    """
+    from src.readiness import check_readiness
+    result = check_readiness()
+    return JSONResponse(status_code=200 if result.get("ready") else 503, content=result)
+
 @app.get("/api/runtime")
 async def runtime_info() -> Dict[str, object]:
     in_docker = os.path.exists("/.dockerenv")
@@ -813,8 +828,19 @@ async def runtime_info() -> Dict[str, object]:
 
 # ========= LIFECYCLE =========
 
-@app.on_event("startup")
-async def startup_event():
+@asynccontextmanager
+async def _lifespan(app):
+    """Modern lifespan context manager replacing deprecated @app.on_event."""
+    # ── STARTUP ──
+    await _startup_event()
+    yield
+    # ── SHUTDOWN ──
+    await _shutdown_event()
+
+app.router.lifespan_context = _lifespan
+
+
+async def _startup_event():
     global upload_cleanup_task
     logger.info("Application starting up...")
     webhook_manager.set_loop(asyncio.get_running_loop())
@@ -1059,8 +1085,7 @@ async def startup_event():
     _startup_tasks.append(asyncio.create_task(_skill_audit_nightly_loop()))
     logger.info("Application startup complete")
 
-@app.on_event("shutdown")
-async def shutdown_event():
+async def _shutdown_event():
     logger.info("Application shutting down...")
     if upload_cleanup_task:
         upload_cleanup_task.cancel()

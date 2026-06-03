@@ -32,6 +32,10 @@ from src.coding_provider_agent import (
     call_agent_tool as _call_agent_tool,
     handle_agent_tool as _handle_agent_tool,
 )
+from src.coding_provider_beads import (
+    call_beads_tool as _call_beads_tool,
+    handle_beads_tool as _handle_beads_tool,
+)
 from src.coding_provider_tool_common import (
     SessionLocal,
     int_arg as _int,
@@ -96,6 +100,12 @@ PROVIDER_TOOL_CATALOG = [
         "capabilities": ["agent.state"],
         "description": "Report this run's semantic agent state (working|blocked|idle|done|unknown) for the herdr rollup.",
     },
+    {
+        "tool": "beads",
+        "actions": ["list", "ready", "show", "status", "graph", "create", "update", "close", "dep", "dep_remove"],
+        "capabilities": ["beads.read", "beads.write"],
+        "description": "Read or write this project's Beads (bd) issue backlog — the repo-scoped, dependency-aware source of truth for work. Use `ready` to find unblocked work, `create` to record discovered work, `close` as you finish.",
+    },
 ]
 
 TOOL_ALIASES = {
@@ -104,6 +114,8 @@ TOOL_ALIASES = {
     "discover": "provider",
     "messages": "thread_messages",
     "model": "model_config",
+    "bd": "beads",
+    "issues": "beads",
 }
 
 
@@ -219,6 +231,7 @@ TOOL_HANDLERS: dict[str, ProviderToolHandler] = {
     "model_config": _handle_model_config_tool,
     "task": _handle_task_tool,
     "agent": _handle_agent_tool,
+    "beads": _handle_beads_tool,
 }
 
 

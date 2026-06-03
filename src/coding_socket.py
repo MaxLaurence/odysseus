@@ -44,6 +44,7 @@ from typing import Any, Awaitable, Callable
 _SOCKET_LINE_LIMIT = 4 * 1024 * 1024
 
 from core.constants import DATA_DIR
+from src.coding_beads import BeadsError, get_beads_service
 from src.coding_runtime import CodingRuntimeError, get_coding_runtime_service
 from src.coding_workspace import get_coding_workspace_service
 
@@ -459,6 +460,52 @@ class OdySocketServer:
         run = await self._runtime.send_stdin(str(run_id), owner, data)
         return {"run": self._run_dict(run)}
 
+    # ---------------------------------------------------------------- beads
+    def _beads_root(self, params: dict[str, Any]) -> tuple[str, str]:
+        """Resolve ``(owner, root_path)`` for a space via the canonical Beads
+        resolver — the owner-scope gate before any ``bd`` call. A missing project
+        becomes a 404 CodingRuntimeError."""
+        from src.coding_beads_bridge import resolve_beads_project
+
+        owner = _resolve_owner(params)
+        space_id = params.get("space_id") or params.get("project_id")
+        if not space_id:
+            raise CodingRuntimeError(400, "space_id is required")
+        try:
+            info = resolve_beads_project(owner, space_id)
+        except BeadsError as exc:
+            raise CodingRuntimeError(exc.status_code, exc.detail) from exc
+        return owner, info["root_path"]
+
+    @staticmethod
+    async def _beads_call(fn, *args, **kwargs) -> Any:
+        """Run a blocking BeadsService call off the event loop, translating
+        ``BeadsError`` into the socket's ``CodingRuntimeError`` envelope."""
+        try:
+            return await asyncio.to_thread(fn, *args, **kwargs)
+        except BeadsError as exc:
+            raise CodingRuntimeError(exc.status_code, exc.detail) from exc
+
+    @staticmethod
+    def _beads_arg(params: dict[str, Any], key: str) -> Any:
+        """Required socket param → value, or a 400 CodingRuntimeError (never a
+        bare KeyError) so malformed frames get the same envelope as everything else."""
+        value = params.get(key)
+        if value is None or (isinstance(value, str) and not value.strip()):
+            raise CodingRuntimeError(400, f"{key} is required")
+        return value
+
+    async def _beads_changed(self, owner: str, params: dict[str, Any], root_path: str) -> None:
+        from src.coding_beads_bridge import emit_beads_changed
+
+        space_id = params.get("space_id") or params.get("project_id") or ""
+        try:
+            await emit_beads_changed(
+                owner, space_id, root_path, thread_id=params.get("thread_id"), run_id=params.get("run_id")
+            )
+        except Exception:
+            logger.debug("ody bead change broadcast failed", exc_info=True)
+
     # --------------------------------------------------------------- helpers
     @staticmethod
     def _run_dict(run: Any) -> dict[str, Any]:
@@ -557,6 +604,82 @@ class OdySocketServer:
                 run_id=p.get("run_id"), message=p.get("message"),
             )
 
+        # ---- beads (repo-scoped issue backlog; the source of truth for work)
+        async def bead_list(p):
+            _owner, root = self._beads_root(p)
+            issues = await self._beads_call(
+                get_beads_service().list_issues, root,
+                include_closed=bool(p.get("include_closed") or p.get("all")),
+                limit=int(p.get("limit") or 200),
+            )
+            return {"issues": issues, "count": len(issues)}
+
+        async def bead_ready(p):
+            _owner, root = self._beads_root(p)
+            issues = await self._beads_call(get_beads_service().ready, root, limit=int(p.get("limit") or 100))
+            return {"ready": issues, "count": len(issues)}
+
+        async def bead_show(p):
+            _owner, root = self._beads_root(p)
+            return {"issue": await self._beads_call(get_beads_service().show, root, self._beads_arg(p, "issue_id"))}
+
+        async def bead_status(p):
+            _owner, root = self._beads_root(p)
+            return {"summary": await self._beads_call(get_beads_service().summary, root)}
+
+        async def bead_graph(p):
+            _owner, root = self._beads_root(p)
+            return {"graph": await self._beads_call(get_beads_service().graph, root)}
+
+        async def bead_create(p):
+            owner, root = self._beads_root(p)
+            priority = p.get("priority")
+            issue = await self._beads_call(
+                get_beads_service().create, root, self._beads_arg(p, "title"),
+                issue_type=p.get("issue_type"),
+                priority=(int(priority) if priority is not None else None),
+                description=p.get("description"),
+                discovered_from=p.get("discovered_from"),
+            )
+            await self._beads_changed(owner, p, root)
+            return {"issue": issue}
+
+        async def bead_update(p):
+            owner, root = self._beads_root(p)
+            priority = p.get("priority")
+            issue = await self._beads_call(
+                get_beads_service().update, root, self._beads_arg(p, "issue_id"),
+                status=p.get("status"),
+                priority=(int(priority) if priority is not None else None),
+                title=p.get("title"),
+            )
+            await self._beads_changed(owner, p, root)
+            return {"issue": issue}
+
+        async def bead_close(p):
+            owner, root = self._beads_root(p)
+            ids = p.get("issue_ids") or [self._beads_arg(p, "issue_id")]
+            result = await self._beads_call(get_beads_service().close, root, list(ids), reason=p.get("reason"))
+            await self._beads_changed(owner, p, root)
+            return result
+
+        async def bead_dep(p):
+            owner, root = self._beads_root(p)
+            result = await self._beads_call(
+                get_beads_service().dep_add, root, self._beads_arg(p, "blocked_id"), self._beads_arg(p, "blocker_id"),
+                dep_type=p.get("type") or "blocks",
+            )
+            await self._beads_changed(owner, p, root)
+            return result
+
+        async def bead_dep_remove(p):
+            owner, root = self._beads_root(p)
+            result = await self._beads_call(
+                get_beads_service().dep_remove, root, self._beads_arg(p, "blocked_id"), self._beads_arg(p, "blocker_id"),
+            )
+            await self._beads_changed(owner, p, root)
+            return result
+
         self._dispatch = {
             "ping": ping,
             "space.list": space_list,
@@ -586,6 +709,16 @@ class OdySocketServer:
             "agent.read": self._agent_read,
             "agent.focus": agent_focus,
             "agent.report_state": agent_report_state,
+            "bead.list": bead_list,
+            "bead.ready": bead_ready,
+            "bead.show": bead_show,
+            "bead.status": bead_status,
+            "bead.graph": bead_graph,
+            "bead.create": bead_create,
+            "bead.update": bead_update,
+            "bead.close": bead_close,
+            "bead.dep": bead_dep,
+            "bead.dep_remove": bead_dep_remove,
             # events.subscribe is handled specially in _handle_line (streaming).
         }
 

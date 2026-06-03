@@ -2,6 +2,7 @@
 // Dynamic Code Station surface for /api/coding.
 
 import { createProviderTools } from './codeStationProviderTools.js';
+import { createBeadsPanel } from './codeStationBeads.js';
 import { renderThreadDetail as renderThreadDetailView } from './codeStationThreadDetail.js';
 import {
   closePaneWs,
@@ -29,6 +30,7 @@ const STREAM_EVENT_NAMES = [
   'recovered',
   'model_config_derived',
   'model_config_restored',
+  'beads_changed',
   'stdout',
   'stderr',
   'cmd',
@@ -41,6 +43,7 @@ const STREAM_EVENT_NAMES = [
 let API_BASE = '';
 let sessionModule = null;
 let uiModule = null;
+let beadsModule = null;
 let modelsModule = null;
 let providerToolsModule = null;
 
@@ -673,6 +676,27 @@ function syncProviderTools(options = {}) {
   return pending;
 }
 
+function ensureBeadsModule() {
+  if (beadsModule) return beadsModule;
+  beadsModule = createBeadsPanel({
+    api,
+    toast,
+    confirm: (message, options) => (
+      uiModule?.styledConfirm
+        ? uiModule.styledConfirm(message, options)
+        : Promise.resolve(window.confirm(message))
+    ),
+  });
+  return beadsModule;
+}
+
+function syncBeads() {
+  const projectId = asId(state.selectedProjectId || state.selectedProject?.id);
+  ensureBeadsModule().sync(projectId).catch((error) => {
+    console.debug('Beads refresh failed', error);
+  });
+}
+
 function connectPaneWs(session) {
   connectPaneTransport(session, { apiBase: API_BASE, statusLabel, setPaneStatus });
 }
@@ -753,6 +777,12 @@ function ensureModal() {
               <button type="button" class="code-station-icon-btn small" data-code-action="toggle-new-project" title="New space" aria-label="New space"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg></button>
             </div>
             <div id="cs-spaces-list" class="code-station-list cs-spaces-list"></div>
+            <div class="cs-section-head cs-beads-head" id="cs-beads-head" hidden>
+              <span class="cs-section-title" title="Beads (bd) — the repo-scoped, dependency-aware backlog">Work</span>
+              <span id="cs-beads-count" class="code-station-muted cs-section-count">0</span>
+              <span class="cs-section-spacer"></span>
+            </div>
+            <div id="cs-beads-panel" class="cs-beads-panel" hidden></div>
             <div class="cs-section-head cs-agents-head">
               <span class="cs-section-title">Agents</span>
               <span id="cs-thread-count" class="code-station-muted cs-section-count">0</span>
@@ -1070,6 +1100,7 @@ async function refreshAll() {
     state.selectedThreadId = null;
     renderAll();
     syncProviderTools({ reset: true, load: false });
+    syncBeads();
   }
 }
 
@@ -1199,6 +1230,7 @@ async function selectProject(projectId, options = {}) {
   renderAll();
   await refreshBadges();
   syncProviderTools({ reset: true, force: true });
+  syncBeads();
   if (!options.keepTab) setMobileTab('threads');
 }
 
@@ -2151,6 +2183,14 @@ function feedPane(session, payload, eventName = 'message', replay = false) {
   // It's a separate axis from run lifecycle, so update the agent + dots and stop —
   // don't let `state: working` masquerade as a run status below.
   const evtKind = String(payload.kind || eventName).toLowerCase();
+  // A backlog change (an agent ran `bd create`/`close`/etc.) rides the thread
+  // stream as `beads_changed`. Refresh the per-project panel + the space dots.
+  if (evtKind === 'beads_changed') {
+    const changedProject = asId(payload.project_id || payload.projectId);
+    if (!changedProject || changedProject === asId(state.selectedProjectId)) syncBeads();
+    renderSpaces();
+    return;
+  }
   if (evtKind === 'agent_state_changed' || evtKind === 'agent_state') {
     const next = String(payload.state || payload.agent_state || '').toLowerCase();
     if (next && session.threadId) {

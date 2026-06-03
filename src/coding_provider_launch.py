@@ -632,7 +632,11 @@ _ODY_SKILL_SUMMARY = (
     "`ody agent list --running-only` then `ody agent read <id>` / `ody pane read <run_id>` "
     "— do NOT use tmux/dtach or tail raw.log. Report state with "
     "`ody agent report-state <agent_id> --state working|blocked|idle|done`. "
-    "Full reference in the injected guide."
+    "For work tracking this project may have Beads (`bd`) enabled — the repo-scoped, "
+    "dependency-aware source of truth for tasks: run `ody bead ready --space <id>` (or "
+    "`bd ready`) to find the next unblocked work, `bd create … --discovered-from` to "
+    "record work you discover, and close issues as you finish. Project tasks go in "
+    "Beads, NOT the memory tool. Full reference in the injected guide."
 )
 
 _ODY_SKILL_MD = """\
@@ -720,6 +724,44 @@ into the read/send/split commands above.
 - `ody agent read <agent_id> [--source visible|recent|recent-unwrapped] [--lines <n>]`
 - `ody agent focus <agent_id>`
 - `ody agent report-state <agent_id> --state working|blocked|done|idle|unknown [--message <m>] [--run-id <id>]`
+
+## Tracking work (Beads)
+This project may have **Beads** (`bd`) enabled — a repo-scoped, dependency-aware
+issue tracker that is the **source of truth for work**. It lives in the repo
+(`.beads/`, travels with git), so a backlog item survives context compaction and
+moves with the branch. Drive it either with the `bd` CLI directly (it is on your
+PATH, run it in the repo) or via `ody bead …` (structured, talks to the control
+socket — use this to inspect another space's backlog):
+
+- `ody bead ready --space <space_id>` — **unblocked, actionable work. Start here.**
+- `ody bead list --space <space_id> [--include-closed]` — the backlog.
+- `ody bead status --space <space_id>` — counts (open/ready/blocked/closed).
+- `ody bead show <issue_id> --space <space_id>` — one issue + its dependencies.
+- `ody bead create --space <space_id> --title "<t>" [--type bug|feature|task] [--priority 0-3] [--discovered-from <issue_id>]`
+  — record work. When you find a new problem *while doing something else*, file
+  it with `--discovered-from <the issue you were on>` instead of losing it.
+- `ody bead update <issue_id> --space <space_id> [--status in_progress|blocked|...] [--priority 0-3] [--title <t>]`
+  — change status/priority/title (mark it `in_progress` when you pick it up).
+- `ody bead close <issue_id> --space <space_id>` — close as you finish.
+- `ody bead dep --space <space_id> --blocked <id> --blocker <id>` — wire a
+  dependency (`<blocked>` waits on `<blocker>`); `ody bead undep …` removes one.
+- `ody bead graph --space <space_id>` — the dependency DAG.
+
+Workflow: **before starting work, run `ody bead ready`** to pick the next
+unblocked item; **record discovered work** as you go (`bd create … --discovered-from`);
+**close issues** when done. The equivalent `bd` commands (`bd ready`, `bd create`,
+`bd close`, `bd dep`) work too — same store.
+
+## What goes where (do not mix these up)
+- **Beads** = *work*: tasks, bugs, the backlog, "what's actionable now". Repo-scoped
+  and durable. This is the ONLY place project work items belong.
+- **Memory** (`memory` provider tool) = durable facts about the *user* (preferences,
+  identity, goals) — cross-project and intentionally forgettable. Do NOT put project
+  tasks here: the memory store consolidates/forgets entries, which would silently
+  drop a backlog item.
+- **RAG / documents** = reference knowledge to read, not work to do.
+If the user asks you to "remember to fix X" about *this* project, create a Beads
+issue (`bd create`), not a memory entry.
 
 ## Events
 - `ody events subscribe --thread <thread_id> [--after-seq <n>] [--run-id <id>]`

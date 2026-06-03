@@ -37355,3 +37355,133 @@ body.code-space-active > #chat-container { display: none !important; }
      is already ≥16px and never zoomed — leave it so we don't shrink it. */
   .doc-email-richbody.doc-font-m { font-size: 16px !important; }
 }
+
+/* ── Beads (bd) per-project backlog panel ─────────────────────────────────── */
+.cs-beads-panel { padding: 2px 10px 8px; display: flex; flex-direction: column; gap: 6px; }
+.cs-beads-panel.cs-beads-busy { opacity: 0.6; pointer-events: none; }
+.cs-beads-counts { display: flex; flex-wrap: wrap; gap: 5px; }
+.cs-beads-count {
+  font-size: 10px; font-weight: 600; padding: 2px 6px; border-radius: 6px;
+  background: color-mix(in srgb, var(--fg) 7%, transparent);
+  color: color-mix(in srgb, var(--fg) 68%, transparent);
+}
+.cs-beads-count.ready { color: var(--cs-ok); background: color-mix(in srgb, var(--cs-ok) 14%, transparent); }
+.cs-beads-count.blocked { color: var(--cs-blocked, var(--cs-bad)); background: color-mix(in srgb, var(--cs-blocked, var(--cs-bad)) 13%, transparent); }
+.cs-beads-count.done { color: color-mix(in srgb, var(--fg) 50%, transparent); }
+.cs-beads-toolbar { display: flex; align-items: center; gap: 4px; }
+.cs-beads-btn {
+  font-size: 10px; font-weight: 600; padding: 3px 8px; cursor: pointer;
+  border: 1px solid var(--border); border-radius: 6px; background: transparent;
+  color: color-mix(in srgb, var(--fg) 72%, transparent);
+}
+.cs-beads-btn.small { padding: 2px 7px; }
+.cs-beads-btn:hover { border-color: color-mix(in srgb, var(--cs-accent) 45%, transparent); color: var(--fg); }
+.cs-beads-btn.is-active { color: var(--cs-accent); border-color: color-mix(in srgb, var(--cs-accent) 50%, transparent); background: color-mix(in srgb, var(--cs-accent) 10%, transparent); }
+.cs-beads-btn:disabled { opacity: 0.5; cursor: default; }
+.cs-beads-new-form { display: flex; flex-wrap: wrap; gap: 4px; }
+.cs-beads-new-form input[name="title"] { flex: 1 1 100%; }
+.cs-beads-new-form input, .cs-beads-new-form select {
+  font-size: 11px; padding: 3px 6px; border: 1px solid var(--border);
+  border-radius: 6px; background: color-mix(in srgb, var(--fg) 4%, transparent); color: var(--fg);
+}
+.cs-beads-list { display: flex; flex-direction: column; gap: 2px; }
+.cs-bead-item { display: flex; align-items: center; gap: 2px; padding: 0 4px 0 0; border-radius: 6px; font-size: 11px; }
+.cs-bead-item:hover { background: color-mix(in srgb, var(--fg) 6%, transparent); }
+.cs-bead-row-toggle {
+  flex: 1 1 auto; min-width: 0; display: flex; align-items: center; gap: 6px;
+  padding: 3px 4px; border: none; background: transparent; cursor: pointer;
+  font: inherit; color: inherit; text-align: left;
+}
+.cs-bead-dot { width: 7px; height: 7px; border-radius: 50%; flex: 0 0 auto; background: var(--cs-info); }
+.cs-bead-dot[data-bead-status="in_progress"] { background: var(--cs-warn); }
+.cs-bead-dot[data-bead-status="blocked"] { background: var(--cs-blocked, var(--cs-bad)); }
+.cs-bead-dot[data-bead-status="closed"] { background: color-mix(in srgb, var(--fg) 35%, transparent); }
+.cs-bead-dot[data-bead-status="deferred"] { background: color-mix(in srgb, var(--fg) 30%, transparent); }
+.cs-bead-prio { font-size: 9px; font-weight: 700; color: color-mix(in srgb, var(--fg) 55%, transparent); flex: 0 0 auto; }
+.cs-bead-title { flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cs-bead-deps { font-size: 9px; color: color-mix(in srgb, var(--fg) 50%, transparent); flex: 0 0 auto; }
+.cs-bead-close {
+  flex: 0 0 auto; border: none; background: transparent; cursor: pointer; font-size: 11px;
+  color: color-mix(in srgb, var(--fg) 45%, transparent); padding: 0 3px; opacity: 0; transition: opacity 0.12s var(--cs-ease);
+}
+.cs-bead-item:hover .cs-bead-close { opacity: 1; }
+.cs-bead-close:hover { color: var(--cs-ok); }
+.cs-beads-empty { display: flex; flex-direction: column; gap: 6px; align-items: flex-start; }
+.cs-beads-fineprint { font-size: 9px; }
+.cs-beads-allclear { font-size: 11px; padding: 4px 0; }
+.cs-beads-error { font-size: 11px; color: var(--cs-bad); }
+/* dependency DAG */
+.cs-bead-graph { display: flex; gap: 8px; overflow-x: auto; padding: 4px 0; }
+.cs-bead-graph-col { display: flex; flex-direction: column; gap: 4px; min-width: 92px; }
+.cs-bead-graph-layer { font-size: 8px; font-weight: 700; color: color-mix(in srgb, var(--fg) 40%, transparent); }
+.cs-bead-node {
+  display: flex; flex-direction: column; gap: 2px; font-size: 10px; padding: 4px 6px;
+  border: 1px solid var(--border); border-radius: 6px; background: color-mix(in srgb, var(--fg) 4%, transparent);
+  max-width: 150px;
+}
+.cs-bead-node-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cs-bead-graph-hint { font-size: 9px; padding-top: 2px; }
+.cs-bead-node-head { display: flex; align-items: center; gap: 5px; }
+.cs-bead-node-blockers {
+  font-size: 8px; color: color-mix(in srgb, var(--fg) 45%, transparent);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+/* backlog filter tabs */
+.cs-beads-filters { display: flex; gap: 4px; padding: 1px 0 2px; }
+.cs-beads-filter {
+  font-size: 9px; font-weight: 600; padding: 2px 7px; cursor: pointer;
+  border: 1px solid transparent; border-radius: 999px; background: color-mix(in srgb, var(--fg) 6%, transparent);
+  color: color-mix(in srgb, var(--fg) 60%, transparent);
+}
+.cs-beads-filter:hover { color: var(--fg); }
+.cs-beads-filter.is-active {
+  color: var(--cs-accent); border-color: color-mix(in srgb, var(--cs-accent) 45%, transparent);
+  background: color-mix(in srgb, var(--cs-accent) 12%, transparent);
+}
+/* visible status pill (status is never conveyed by colour alone) */
+.cs-bead-status {
+  font-size: 8px; font-weight: 700; letter-spacing: 0.03em; text-transform: uppercase;
+  padding: 1px 5px; border-radius: 4px; flex: 0 0 auto;
+  background: color-mix(in srgb, var(--fg) 8%, transparent); color: color-mix(in srgb, var(--fg) 60%, transparent);
+}
+.cs-bead-status[data-bead-status="in_progress"] { color: var(--cs-warn); background: color-mix(in srgb, var(--cs-warn) 16%, transparent); }
+.cs-bead-status[data-bead-status="blocked"] { color: var(--cs-blocked, var(--cs-bad)); background: color-mix(in srgb, var(--cs-blocked, var(--cs-bad)) 14%, transparent); }
+.cs-bead-status[data-bead-status="deferred"] { color: color-mix(in srgb, var(--fg) 42%, transparent); background: color-mix(in srgb, var(--fg) 11%, transparent); font-style: italic; }
+.cs-bead-status[data-bead-status="closed"] { color: var(--cs-ok); background: color-mix(in srgb, var(--cs-ok) 12%, transparent); }
+.cs-bead-item.is-expanded { background: color-mix(in srgb, var(--fg) 6%, transparent); }
+.cs-bead-row-toggle:focus-visible { outline: 2px solid var(--cs-accent); outline-offset: -1px; border-radius: 4px; }
+/* inline issue detail drawer */
+.cs-bead-detail {
+  display: flex; flex-direction: column; gap: 6px; margin: 1px 0 4px;
+  padding: 7px 8px; border-radius: 6px; border: 1px solid var(--border);
+  background: color-mix(in srgb, var(--fg) 3%, transparent);
+}
+.cs-bead-detail-controls { display: flex; gap: 8px; flex-wrap: wrap; }
+.cs-bead-detail-controls label {
+  display: flex; align-items: center; gap: 4px; font-size: 9px;
+  text-transform: uppercase; letter-spacing: 0.04em; color: color-mix(in srgb, var(--fg) 50%, transparent);
+}
+.cs-bead-detail select {
+  font-size: 11px; padding: 2px 5px; border: 1px solid var(--border);
+  border-radius: 5px; background: color-mix(in srgb, var(--fg) 4%, transparent); color: var(--fg);
+}
+.cs-bead-detail-label {
+  font-size: 9px; font-weight: 700; letter-spacing: 0.05em; text-transform: uppercase;
+  color: color-mix(in srgb, var(--fg) 50%, transparent); padding-bottom: 2px;
+}
+.cs-bead-detail-deps { display: flex; flex-direction: column; gap: 2px; }
+.cs-bead-dep-row { display: flex; align-items: center; gap: 6px; font-size: 11px; padding: 1px 0; }
+.cs-bead-dep-row .cs-bead-title { flex: 1 1 auto; min-width: 0; }
+.cs-bead-dep-remove {
+  flex: 0 0 auto; border: none; background: transparent; cursor: pointer; font-size: 13px; line-height: 1;
+  color: color-mix(in srgb, var(--fg) 40%, transparent); padding: 0 2px; opacity: 0; transition: opacity 0.12s var(--cs-ease);
+}
+.cs-bead-dep-row:hover .cs-bead-dep-remove { opacity: 1; }
+.cs-bead-dep-remove:hover { color: var(--cs-bad); }
+.cs-bead-detail-adddep { display: flex; gap: 4px; align-items: center; }
+.cs-bead-detail-adddep select { flex: 1 1 auto; min-width: 0; }
+.cs-beads-new-form textarea {
+  flex: 1 1 100%; resize: vertical; font: inherit; font-size: 11px; padding: 3px 6px;
+  border: 1px solid var(--border); border-radius: 6px;
+  background: color-mix(in srgb, var(--fg) 4%, transparent); color: var(--fg);
+}

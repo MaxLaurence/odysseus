@@ -30,6 +30,7 @@ from src.coding_provider_bridge import (
     ProviderBridgeScope,
     get_provider_bridge_service,
     scripts_dir,
+    with_beads_on_path,
     with_scripts_on_path,
 )
 from src.coding_pty_bridge import CodingPtyBridge, dtach_bin
@@ -170,6 +171,7 @@ class CodingRuntimeService:
         env.update(provider_env)
         env = _drop_private_odysseus_env(env)
         env = with_scripts_on_path(env)
+        env = with_beads_on_path(env)
         return env, self._provider_bridge.metadata_for_env(provider_env)
 
     def _revoke_run_provider_credentials(self, run_id: str, db=None) -> None:

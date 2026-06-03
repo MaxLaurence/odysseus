@@ -604,6 +604,9 @@ class CodingProject(TimestampMixin, Base):
     kind                = Column(String, nullable=False, default="root")   # 'root' | 'worktree'
     worktree_branch     = Column(String, nullable=True)
     worktree_path       = Column(Text, nullable=True)
+    # Opt-in Beads (`bd`) issue tracking. Off by default: enabling it runs `bd init`,
+    # which writes a `.beads/` dir into the repo, so it must be an explicit choice.
+    beads_enabled       = Column(Boolean, default=False, nullable=False)
 
     threads = relationship("CodingThread", back_populates="project", cascade="all, delete-orphan")
 
@@ -1744,6 +1747,7 @@ def _migrate_add_coding_space_columns():
             "kind":              "ALTER TABLE coding_projects ADD COLUMN kind TEXT DEFAULT 'root'",
             "worktree_branch":   "ALTER TABLE coding_projects ADD COLUMN worktree_branch TEXT",
             "worktree_path":     "ALTER TABLE coding_projects ADD COLUMN worktree_path TEXT",
+            "beads_enabled":     "ALTER TABLE coding_projects ADD COLUMN beads_enabled BOOLEAN DEFAULT 0",
         }
         added = False
         for col, ddl in adds.items():

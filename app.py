@@ -530,6 +530,9 @@ from routes.upload_routes import setup_upload_routes
 upload_router, upload_cleanup_func = setup_upload_routes(upload_handler)
 app.include_router(upload_router)
 upload_cleanup_task = None
+# Background task that exits the backend if the desktop launcher dies (see
+# src/process_lifecycle.py). None until armed in _startup_event.
+parent_watchdog_task = None
 
 # Emoji SVG proxy (same-origin, lazy-cached Twemoji) — lets the chat render
 # emojis as flat SVG instead of system color glyphs.
@@ -1083,10 +1086,31 @@ async def _startup_event():
                 logger.warning(f"Nightly skill audit failed: {e}")
 
     _startup_tasks.append(asyncio.create_task(_skill_audit_nightly_loop()))
+
+    # Parent-death watchdog + exit reaper: when the desktop wrapper launches us
+    # it exports ODYSSEUS_PARENT_PID. macOS has no PR_SET_PDEATHSIG, so without
+    # this a crashed/force-quit wrapper would leave the backend (and its MCP
+    # children) orphaned. The watchdog self-SIGTERMs on launcher death so the
+    # normal lifespan shutdown runs; the reaper sweeps any stragglers at exit.
+    global parent_watchdog_task
+    try:
+        from src.process_lifecycle import parent_death_watchdog, install_exit_reaper
+        parent_watchdog_task = asyncio.create_task(parent_death_watchdog())
+        install_exit_reaper()
+    except Exception as e:
+        logger.warning("Failed to arm parent-death watchdog: %s", e)
+
     logger.info("Application startup complete")
 
 async def _shutdown_event():
     logger.info("Application shutting down...")
+    # Stop the parent-death watchdog first so it can't re-signal us mid-shutdown.
+    if parent_watchdog_task:
+        parent_watchdog_task.cancel()
+        try:
+            await parent_watchdog_task
+        except asyncio.CancelledError:
+            pass
     if upload_cleanup_task:
         upload_cleanup_task.cancel()
         try:
@@ -1122,4 +1146,15 @@ async def _shutdown_event():
         await mcp_manager.disconnect_all()
     except Exception as e:
         logger.warning(f"MCP shutdown error: {e}")
+    # Safety net: reap any direct child processes (e.g. MCP-server subprocesses)
+    # that didn't exit when their stdio closed, so none outlive the backend.
+    # Detached coding sessions (dtach/tmux) reparent away and are intentionally
+    # left to coding_runtime_service.shutdown(), so they are not swept here.
+    try:
+        from src.process_lifecycle import reap_child_processes
+        reaped = await asyncio.to_thread(reap_child_processes)
+        if reaped:
+            logger.info("Reaped %d lingering child process(es) on shutdown", reaped)
+    except Exception as e:
+        logger.warning(f"Child-process reap error: {e}")
     logger.info("Application shutdown complete")

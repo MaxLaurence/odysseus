@@ -35,6 +35,7 @@ from src.coding_model_config import (
     restore_previous_model_config,
     thread_model_config,
 )
+from routes.coding_beads_routes import register_beads_routes
 from src.coding_runtime import CodingRuntimeError, get_coding_runtime_service
 from src.coding_workspace import get_coding_workspace_service
 from src.coding_worktrees import get_coding_worktree_service
@@ -128,6 +129,7 @@ def _project_dict(project: CodingProject) -> dict[str, Any]:
         "kind": getattr(project, "kind", None) or "root",
         "worktree_branch": getattr(project, "worktree_branch", None),
         "worktree_path": getattr(project, "worktree_path", None),
+        "beads_enabled": bool(getattr(project, "beads_enabled", False)),
         "created_at": _iso(project.created_at),
         "updated_at": _iso(project.updated_at),
     }
@@ -279,6 +281,7 @@ class ProjectPatch(BaseModel):
     default_harness: str | None = None
     default_endpoint_id: str | None = None
     default_model: str | None = None
+    beads_enabled: bool | None = None
 
 
 class ThreadCreate(BaseModel):
@@ -455,6 +458,10 @@ def setup_coding_routes() -> APIRouter:
                 project.default_endpoint_id = body.default_endpoint_id.strip()
             if body.default_model is not None:
                 project.default_model = body.default_model.strip()
+            if body.beads_enabled is not None:
+                # The flag records intent; `bd init` (which writes a `.beads/` dir
+                # into the repo) is run only by the dedicated /beads/init route.
+                project.beads_enabled = bool(body.beads_enabled)
             project.updated_at = datetime.utcnow()
             db.commit()
             db.refresh(project)
@@ -1132,4 +1139,5 @@ def setup_coding_routes() -> APIRouter:
         finally:
             db.close()
 
+    register_beads_routes(router)
     return router

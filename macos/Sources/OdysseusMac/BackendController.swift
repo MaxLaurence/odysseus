@@ -85,6 +85,10 @@ final class BackendController: ObservableObject {
             try FileManager.default.createDirectory(at: dataDir, withIntermediateDirectories: true)
             try FileManager.default.createDirectory(at: logsDir, withIntermediateDirectories: true)
 
+            // Reap a backend left over from a previous session before starting a
+            // new one, so orphans can't accumulate across launches.
+            await Self.reapStaleBackend(pidFile: Self.pidFileURL(appSupport: appSupport))
+
             let log = logsDir.appendingPathComponent("backend.log")
             FileManager.default.createFile(atPath: log.path, contents: nil)
             logURL = log
@@ -108,6 +112,7 @@ final class BackendController: ObservableObject {
             process.standardError = logHandle
             try process.run()
             backendProcess = process
+            Self.writePidFile(pid: process.processIdentifier, appSupport: appSupport)
             writeWrapperLog("launched backend pid=\(process.processIdentifier) port=\(port)")
 
             let localURL = URL(string: "http://127.0.0.1:\(port)")!
@@ -142,6 +147,9 @@ final class BackendController: ObservableObject {
         url = nil
         try? logHandle?.close()
         logHandle = nil
+        if let appSupport = try? Self.applicationSupportDirectory() {
+            try? FileManager.default.removeItem(at: Self.pidFileURL(appSupport: appSupport))
+        }
     }
 
     func stopSharing() {
@@ -298,6 +306,50 @@ final class BackendController: ObservableObject {
         let directory = base.appendingPathComponent("Odysseus", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         return directory
+    }
+
+    private static func pidFileURL(appSupport: URL) -> URL {
+        appSupport.appendingPathComponent("backend.pid")
+    }
+
+    private static func writePidFile(pid: Int32, appSupport: URL) {
+        let url = pidFileURL(appSupport: appSupport)
+        try? "\(pid)\n".data(using: .utf8)?.write(to: url, options: .atomic)
+    }
+
+    /// Verify a PID is actually one of our backend processes before signalling
+    /// it, so we never kill an unrelated process that happens to have reused the
+    /// recorded PID. Uses the executable path from `proc_pidpath`.
+    private static func isOurBackend(pid: Int32) -> Bool {
+        var buffer = [CChar](repeating: 0, count: Int(MAXPATHLEN))
+        let length = proc_pidpath(pid, &buffer, UInt32(MAXPATHLEN))
+        guard length > 0 else { return false }
+        return String(cString: buffer).contains("odysseus_backend")
+    }
+
+    /// Terminate a backend recorded in the pid file that's still alive from a
+    /// previous session (graceful SIGTERM, escalating to SIGKILL), then clear the
+    /// file. A no-op when the file is missing, the PID is dead, or the PID no
+    /// longer belongs to one of our backends.
+    private static func reapStaleBackend(pidFile: URL) async {
+        defer { try? FileManager.default.removeItem(at: pidFile) }
+        guard
+            let contents = try? String(contentsOf: pidFile, encoding: .utf8),
+            let pid = Int32(contents.trimmingCharacters(in: .whitespacesAndNewlines)),
+            pid > 1,
+            kill(pid, 0) == 0,        // still alive
+            isOurBackend(pid: pid)    // and actually ours
+        else { return }
+
+        kill(pid, SIGTERM)
+        // Give its graceful shutdown (which reaps its own MCP children) ~5s.
+        for _ in 0..<25 {
+            if kill(pid, 0) != 0 { return }
+            try? await Task.sleep(nanoseconds: 200_000_000)
+        }
+        if kill(pid, 0) == 0 {
+            kill(pid, SIGKILL)
+        }
     }
 
     private static func findFreePort() throws -> Int {
@@ -476,6 +528,10 @@ private enum BackendLaunch {
         env["ODYSSEUS_HOST"] = "127.0.0.1"
         env["ODYSSEUS_PORT"] = "\(port)"
         env["ODYSSEUS_INTERNAL_TOKEN"] = internalToken
+        // Lets the backend's parent-death watchdog notice if this wrapper dies
+        // (macOS has no PR_SET_PDEATHSIG) and shut itself down instead of
+        // orphaning. See src/process_lifecycle.py.
+        env["ODYSSEUS_PARENT_PID"] = "\(ProcessInfo.processInfo.processIdentifier)"
         env["DATA_DIR"] = dataDir.path
         env["DATABASE_URL"] = "sqlite:///\(dataDir.appendingPathComponent("app.db").path)"
         env["CHROMADB_PERSIST_PATH"] = dataDir.appendingPathComponent("chroma", isDirectory: true).path

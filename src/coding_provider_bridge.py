@@ -302,6 +302,31 @@ def with_scripts_on_path(env: dict[str, str]) -> dict[str, str]:
     return result
 
 
+def with_beads_on_path(env: dict[str, str]) -> dict[str, str]:
+    """Ensure the ``bd`` (Beads) binary is discoverable on a launched run's PATH.
+
+    Agents do per-repo work tracking by calling ``bd`` directly in their pane (the
+    lowest-friction layer of the integration). The packaged .app can launch with a
+    trimmed PATH that omits ``/opt/homebrew/bin``, so we resolve ``bd`` once (env
+    override → PATH → well-known dirs) and prepend its directory if it isn't
+    already reachable. No-op when ``bd`` isn't installed."""
+    try:
+        from src.coding_beads import bd_dir
+    except Exception:
+        return env
+    directory = bd_dir()
+    if not directory:
+        return env
+    result = dict(env)
+    path = result.get("PATH", "")
+    parts = [part for part in path.split(os.pathsep) if part]
+    if directory in parts:
+        return result
+    parts.append(directory)
+    result["PATH"] = os.pathsep.join(parts)
+    return result
+
+
 def _mint_backend_run_token(scope: ProviderBridgeScope) -> dict[str, str]:
     from src.coding_provider_tokens import TOKEN_PREFIX, mint_run_provider_token
 

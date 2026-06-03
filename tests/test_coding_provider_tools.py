@@ -73,20 +73,10 @@ def isolated_provider_coding_store(monkeypatch, tmp_path):
 
     engine = create_engine(database_url, connect_args={"check_same_thread": False})
     TestingSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-    Base.metadata.create_all(
-        bind=engine,
-        tables=[
-            Session.__table__,
-            ModelEndpoint.__table__,
-            ApiToken.__table__,
-            CodingProject.__table__,
-            CodingThread.__table__,
-            CodingRun.__table__,
-            CodingThreadEvent.__table__,
-            CodingModelConfigSnapshot.__table__,
-            CodingProviderToken.__table__,
-        ],
-    )
+    # Create the full schema: SQLite runs with PRAGMA foreign_keys=ON, so a
+    # CodingThread insert needs every table its FKs reference (e.g. coding_tabs)
+    # to exist, not just the handful we write to directly.
+    Base.metadata.create_all(bind=engine)
 
     monkeypatch.setattr(database, "engine", engine)
     monkeypatch.setattr(database, "SessionLocal", TestingSessionLocal)
@@ -634,9 +624,19 @@ def test_provider_runtime_launch_env_injects_secrets_without_cross_owner_leak(
             is_enabled=True,
             cached_models=json.dumps(["claude-3-5-sonnet"]),
         )
+        # The thread needs a real parent project: SQLite enforces the
+        # CodingThread.project_id FK (PRAGMA foreign_keys=ON), so an orphaned
+        # project_id would be rejected at commit.
+        project = CodingProject(
+            id="env-project",
+            owner="tester",
+            name="Env Project",
+            root_path=str(isolated_provider_coding_store.workspace),
+            default_harness="codex",
+        )
         thread = CodingThread(
             id="env-thread",
-            project_id="missing-project",
+            project_id=project.id,
             owner="tester",
             title="Env Thread",
             cwd=str(isolated_provider_coding_store.workspace),
@@ -648,7 +648,7 @@ def test_provider_runtime_launch_env_injects_secrets_without_cross_owner_leak(
             created_at=datetime.utcnow(),
             updated_at=datetime.utcnow(),
         )
-        db.add_all([endpoint, thread])
+        db.add_all([endpoint, project, thread])
         db.commit()
 
         safe_config = thread_model_config(db, thread)
@@ -1418,7 +1418,12 @@ def test_run_provider_credential_rejects_deleted_thread(
     )
 
     assert response.status_code == 401
-    assert "no longer has a thread" in response.json()["detail"]
+    # Deleting the thread cascade-deletes its provider tokens
+    # (CodingProviderToken.thread_id is ondelete="CASCADE" + the relationship is
+    # cascade="all, delete-orphan"), so the token row is gone and validation
+    # rejects it as unknown rather than reaching the "no longer has a thread"
+    # (orphaned-token) branch. Either way the credential is refused.
+    assert "Invalid provider token" in response.json()["detail"]
 
 
 def test_backend_mint_failure_does_not_inject_unusable_odyt_http_token(monkeypatch):

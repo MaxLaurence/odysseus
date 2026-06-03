@@ -79,19 +79,10 @@ def isolated_coding_store(monkeypatch, tmp_path):
 
     engine = create_engine(database_url, connect_args={"check_same_thread": False})
     TestingSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-    Base.metadata.create_all(
-        bind=engine,
-        tables=[
-            Session.__table__,
-            ModelEndpoint.__table__,
-            CodingProject.__table__,
-            CodingThread.__table__,
-            CodingRun.__table__,
-            CodingThreadEvent.__table__,
-            CodingModelConfigSnapshot.__table__,
-            CodingProviderToken.__table__,
-        ],
-    )
+    # Create the full schema: SQLite runs with PRAGMA foreign_keys=ON, so a
+    # CodingThread insert needs every table its FKs reference (e.g. coding_tabs)
+    # to exist, not just the handful we write to directly.
+    Base.metadata.create_all(bind=engine)
 
     monkeypatch.setattr(database, "engine", engine)
     monkeypatch.setattr(database, "SessionLocal", TestingSessionLocal)

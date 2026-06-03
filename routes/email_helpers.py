@@ -38,6 +38,19 @@ from src.constants import DATA_DIR as _APP_DATA_DIR
 
 logger = logging.getLogger(__name__)
 
+# imaplib caps a single response line at _MAXLINE (1 MB by default). A folder
+# with hundreds of thousands of messages returns its `SEARCH`/`UID SEARCH ALL`
+# result on one line that overruns it. The symptom is the SEARCH itself failing
+# ("command: SEARCH => got more than 1000000 bytes") or — when the oversized line
+# is left unread on the socket — the next command tripping over the leftover
+# bytes ("command: EXAMINE => got more than 1000000 bytes"; see email_pollers
+# #1613). `mcp_servers/email_server.py` raises this ceiling too, but that runs in
+# a separate process; the FastAPI backend and its scheduled tasks (extract_email
+# _events, mark_email_boundaries) go through this module instead, so bump the
+# process-global here as well. _MAXLINE is read at call time inside
+# imaplib.IMAP4.readline, so setting it at import covers every IMAP path.
+imaplib._MAXLINE = max(getattr(imaplib, "_MAXLINE", 0), 50_000_000)
+
 
 def _smtp_security_mode(cfg: dict) -> str:
     raw = str(cfg.get("smtp_security") or "").strip().lower()

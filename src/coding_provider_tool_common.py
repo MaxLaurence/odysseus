@@ -140,6 +140,18 @@ def int_arg(value: Any, default: int = 0) -> int:
         return default
 
 
+def str_arg(args: dict[str, Any], key: str, default: str | None = None) -> str | None:
+    """Stripped string for ``args[key]``, or ``default`` when absent/blank.
+
+    Collapses the ``str(args.get(k)).strip() if args.get(k) else None`` pattern
+    that otherwise repeats across every provider-tool write handler."""
+    value = args.get(key)
+    if value is None:
+        return default
+    text = str(value).strip()
+    return text or default
+
+
 async def manage_coding(action: str, owner: str, args: dict[str, Any]) -> dict[str, Any]:
     from src.tool_implementations import do_manage_coding
 
@@ -165,4 +177,5 @@ __all__ = [
     "manage_coding",
     "sanitize_result",
     "session_local",
+    "str_arg",
 ]

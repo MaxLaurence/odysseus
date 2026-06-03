@@ -111,6 +111,10 @@ class CodingWorkspaceService:
         # Tiny TTL cache so listing N spaces doesn't shell out to git N times per poll.
         self._branch_cache: dict[str, tuple[float, str | None]] = {}
         self._branch_ttl = 5.0
+        # Same idea for Beads: `bd status` boots a Dolt engine, so cache the
+        # per-project counts and only refresh every few seconds under polling.
+        self._beads_cache: dict[str, tuple[float, dict | None]] = {}
+        self._beads_ttl = 15.0
         # Per-tab locks serialize layout read-modify-write so concurrent pane ops
         # (e.g. two agents splitting the same tab over the socket) can't clobber.
         self._tab_locks: dict[str, threading.Lock] = {}
@@ -184,8 +188,32 @@ class CodingWorkspaceService:
         self._branch_cache[cache_key] = (now, branch)
         return branch
 
+    # ----------------------------------------------------------------- beads
+    def beads_summary(self, root_path: str | None, beads_enabled: bool) -> dict | None:
+        """Cached Beads counts for a space's rollup, or ``None`` when Beads is off
+        / unavailable. Best-effort: a `bd` failure yields ``None`` rather than
+        raising into the space-list hot path."""
+        if not beads_enabled or not root_path:
+            return None
+        now = time.time()
+        cached = self._beads_cache.get(root_path)
+        if cached and (now - cached[0]) < self._beads_ttl:
+            return cached[1]
+        summary: dict | None = None
+        try:
+            from src.coding_beads import get_beads_service
+
+            service = get_beads_service()
+            if service.available() and service.is_initialized(root_path):
+                summary = service.summary(root_path)
+        except Exception:
+            summary = None
+        self._beads_cache[root_path] = (now, summary)
+        return summary
+
     # --------------------------------------------------------------- spaces
     def space_dict(self, project: CodingProject) -> dict[str, Any]:
+        beads_enabled = bool(getattr(project, "beads_enabled", False))
         return {
             "id": project.id,
             "owner": project.owner,
@@ -200,6 +228,8 @@ class CodingWorkspaceService:
             "kind": getattr(project, "kind", None) or "root",
             "worktree_branch": getattr(project, "worktree_branch", None),
             "worktree_path": getattr(project, "worktree_path", None),
+            "beads_enabled": beads_enabled,
+            "beads": self.beads_summary(project.root_path, beads_enabled),
             "branch": self.git_branch(project.root_path, project.owner),
             "created_at": _iso(project.created_at),
             "updated_at": _iso(project.updated_at),

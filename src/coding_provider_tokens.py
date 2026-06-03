@@ -53,6 +53,8 @@ ALL_CAPABILITIES = {
     "task.release",
     "task.heartbeat",
     "agent.state",
+    "beads.read",
+    "beads.write",
 }
 
 READ_ONLY_CAPABILITIES = {
@@ -60,6 +62,7 @@ READ_ONLY_CAPABILITIES = {
     "terminal.read",
     "thread.messages.read",
     "model_config.read",
+    "beads.read",
 }
 
 CAPABILITY_GROUPS = {
@@ -71,6 +74,7 @@ CAPABILITY_GROUPS = {
         "terminal.read",
         "thread.messages.read",
         "model_config.read",
+        "beads.read",
     },
     "write": {
         "memory.write",
@@ -86,6 +90,7 @@ CAPABILITY_GROUPS = {
         "task.release",
         "task.heartbeat",
         "agent.state",
+        "beads.write",
     },
     "terminal.write": {"terminal.start", "terminal.stdin", "terminal.resize"},
     "model_config.write": {"model_config.derive", "model_config.restore"},

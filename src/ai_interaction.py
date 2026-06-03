@@ -45,6 +45,14 @@ def set_memory_manager(mgr, vector=None):
     _memory_vector = vector
 
 
+def get_memory_manager():
+    return _memory_manager
+
+
+def get_memory_vector():
+    return _memory_vector
+
+
 def set_rag_manager(rag_mgr, personal_docs_mgr=None):
     global _rag_manager, _personal_docs_manager
     _rag_manager = rag_mgr

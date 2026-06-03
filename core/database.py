@@ -637,6 +637,7 @@ class CodingThread(TimestampMixin, Base):
     pane_id           = Column(String, nullable=True)
     agent_state       = Column(String, nullable=False, default="idle")   # working|blocked|done|idle|unknown
     state_changed_at  = Column(DateTime, nullable=True)
+    issue_id          = Column(String, nullable=True)   # linked beads (bd) work-item id, if any
 
     project = relationship("CodingProject", back_populates="threads")
     session = relationship("Session", backref=backref("coding_threads", cascade="save-update, merge"))
@@ -1778,6 +1779,7 @@ def _migrate_add_coding_thread_agent_columns():
             "pane_id":          "ALTER TABLE coding_threads ADD COLUMN pane_id TEXT",
             "agent_state":      "ALTER TABLE coding_threads ADD COLUMN agent_state TEXT DEFAULT 'idle'",
             "state_changed_at": "ALTER TABLE coding_threads ADD COLUMN state_changed_at DATETIME",
+            "issue_id":         "ALTER TABLE coding_threads ADD COLUMN issue_id TEXT",
         }
         added = False
         for col, ddl in adds.items():

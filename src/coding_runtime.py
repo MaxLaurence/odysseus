@@ -308,6 +308,7 @@ class CodingRuntimeService:
         metadata: dict[str, Any] | None = None,
         cols: int | None = None,
         rows: int | None = None,
+        session_id: str | None = None,
     ) -> CodingRun:
         metadata = metadata if isinstance(metadata, dict) else {}
         async with self._lock:
@@ -330,6 +331,12 @@ class CodingRuntimeService:
                 project_id = project.id
                 if self._thread_delete_key(owner, thread.id) in self._deleting_threads:
                     raise CodingRuntimeError(409, "Thread deletion is in progress")
+
+                # Back-fill the originating chat session link if this thread
+                # has none yet, so a run started against a pre-existing
+                # unlinked thread still reports back to the right conversation.
+                if session_id and not (thread.session_id or "").strip():
+                    thread.session_id = session_id.strip()
 
                 if idempotency_key:
                     existing = (
@@ -407,6 +414,13 @@ class CodingRuntimeService:
                     "cols": max(20, min(int(cols), 400)) if cols else 120,
                     "rows": max(5, min(int(rows), 120)) if rows else 40,
                 }
+                # Per-RUN wake-on-done target: which chat session to report this
+                # run's completion into. Set ONLY when the run is started by the
+                # chat tool (do_manage_coding passes the trusted caller session);
+                # UI-initiated runs leave it unset, so they never inject
+                # unsolicited "your coding agent finished" turns into a chat.
+                if session_id and session_id.strip():
+                    run_metadata["report_to_session"] = session_id.strip()
                 run = CodingRun(
                     id=run_id,
                     thread_id=thread.id,

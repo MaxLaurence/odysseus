@@ -31,13 +31,14 @@ hiddenimports = [
     "uvicorn.lifespan.on",
     "fastembed",
     "chromadb",
+    "caldav",
 ]
 chromadb_hiddenimports = [
     module
     for module in collect_submodules("chromadb")
     if not module.startswith("chromadb.test")
 ]
-hiddenimports = sorted(set(hiddenimports + chromadb_hiddenimports + collect_submodules("fastembed")))
+hiddenimports = sorted(set(hiddenimports + chromadb_hiddenimports + collect_submodules("fastembed") + collect_submodules("caldav")))
 
 a = Analysis(
     [str(MACOS / "backend_launcher.py")],

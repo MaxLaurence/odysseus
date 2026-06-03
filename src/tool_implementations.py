@@ -1108,6 +1108,7 @@ def _coding_thread_dict(thread, model_config: Optional[Dict[str, Any]] = None) -
         "pinned_at": _coding_iso(thread.pinned_at),
         "status": thread.status or "idle",
         "last_run_id": thread.last_run_id,
+        "issue_id": getattr(thread, "issue_id", None),
         "metadata": _coding_json_loads(thread.metadata_json, {}),
         "created_at": _coding_iso(thread.created_at),
         "updated_at": _coding_iso(thread.updated_at),
@@ -1118,6 +1119,11 @@ def _coding_thread_dict(thread, model_config: Optional[Dict[str, Any]] = None) -
 
 
 def _coding_run_dict(run) -> Dict[str, Any]:
+    # Chat-facing serializer: this dict is fed to the LLM (and to the chat UI
+    # run card). Deliberately OMITS filesystem internals (run_dir, log_path,
+    # tmux_session) and the raw metadata blob (which carries launch-plan
+    # internals, endpoint URLs, and the report_to_session marker) — none of which
+    # the model should see. The routes layer has its own fuller serializer.
     return {
         "id": run.id,
         "thread_id": run.thread_id,
@@ -1126,16 +1132,12 @@ def _coding_run_dict(run) -> Dict[str, Any]:
         "status": run.status,
         "command": run.command,
         "cwd": run.cwd,
-        "tmux_session": run.tmux_session,
-        "run_dir": run.run_dir,
-        "log_path": run.log_path,
         "exit_code": run.exit_code,
         "error": run.error,
         "queued_at": _coding_iso(run.queued_at),
         "started_at": _coding_iso(run.started_at),
         "finished_at": _coding_iso(run.finished_at),
         "idempotency_key": run.idempotency_key,
-        "metadata": _coding_json_loads(run.metadata_json, {}),
     }
 
 
@@ -1184,13 +1186,20 @@ def _coding_log_tail(run, chars: int) -> str:
         return ""
 
 
-async def do_manage_coding(content: str, owner: Optional[str] = None) -> Dict:
+async def do_manage_coding(
+    content: str, owner: Optional[str] = None, session_id: Optional[str] = None
+) -> Dict:
     """Owner-scoped Coding Station tool wrapper.
 
     This intentionally mirrors routes/coding_routes.py but stays in-process so
     agent tools do not call back through HTTP. Runtime operations are delegated
     to src.coding_runtime; harness/model behavior is delegated to the coding
     harness and model-config modules.
+
+    ``session_id`` is the chat session that invoked the tool. It is defaulted
+    into thread creation so chat-spawned coding threads auto-link back to the
+    conversation (CodingThread.session_id), which is what lets a coding agent
+    report progress into this chat and powers the wake-on-done follow-up.
     """
     import uuid as _uuid
     from datetime import datetime
@@ -1220,6 +1229,14 @@ async def do_manage_coding(content: str, owner: Optional[str] = None) -> Dict:
         args = _parse_tool_args(content)
     except ValueError:
         return _coding_error("Invalid JSON arguments")
+
+    # Security: the chat<->coding link is ALWAYS the trusted invoking session.
+    # We deliberately do NOT honor an agent-supplied session_id — the link drives
+    # headless re-invocation (wake-on-done runs the chat agent + its tools) and
+    # the reverse chat-message path, so a forged value would be a confused-deputy
+    # vector into another session/owner. Overwrite, never merge.
+    _caller_session = (session_id or "").strip()
+    args["session_id"] = _caller_session or None
 
     action = str(args.get("action") or "list_projects").strip().lower().replace("-", "_")
     action = {
@@ -1305,8 +1322,24 @@ async def do_manage_coding(content: str, owner: Optional[str] = None) -> Dict:
                         replace=bool(args.get("replace", False)),
                         idempotency_key=args.get("idempotency_key"),
                         metadata=args.get("metadata") if isinstance(args.get("metadata"), dict) else None,
+                        session_id=(args.get("session_id") or "").strip() or None,
                     )
-                    return {"response": f"Queued coding run {run.id}", "run": _coding_run_dict(run), "exit_code": 0}
+                    if (args.get("session_id") or "").strip():
+                        # Chat-initiated → the wake-on-done monitor
+                        # (src/coding_followup.py) re-invokes this chat when the
+                        # run TERMINATES (a one-shot harness command, or any run
+                        # that exits). Interactive REPL harnesses (claude/codex/
+                        # pi/omp) stay open and won't auto-wake until they exit —
+                        # for those, deliver the task with send_stdin and check
+                        # progress with read_run. Don't busy-poll either way.
+                        _msg = (
+                            f"Queued coding run {run.id}, detached in the background. "
+                            f"You'll be auto-notified when the run finishes (exits); "
+                            f"meanwhile use read_run to check progress instead of looping."
+                        )
+                    else:
+                        _msg = f"Queued coding run {run.id}"
+                    return {"response": _msg, "run": _coding_run_dict(run), "exit_code": 0}
                 if action == "stop_run":
                     run = await runtime.stop_run((args.get("run_id") or "").strip(), owner_key, reason=args.get("reason") or "stopped")
                     return {"response": f"Stopped coding run {run.id}", "run": _coding_run_dict(run), "exit_code": 0}
@@ -1323,6 +1356,64 @@ async def do_manage_coding(content: str, owner: Optional[str] = None) -> Dict:
                 return {"response": f"Resized coding run {run.id}", "run": _coding_run_dict(run), "exit_code": 0}
             except CodingRuntimeError as exc:
                 return _coding_error(exc.detail, exc.status_code)
+
+        if action in {"beads", "memory"}:
+            # Let chat read/write the project's work tracker (beads) and shared
+            # memory in-process, reusing the same provider-tool seams the coding
+            # agent uses. manage_coding is already admin-gated + owner-scoped, so
+            # we mint a full-capability owner context for the owner's own project.
+            from src.coding_provider_tokens import (
+                CREDENTIAL_CLASS_EXPLICIT,
+                CodingProviderError,
+                ProviderContext,
+            )
+
+            project_id = (args.get("project_id") or "").strip()
+            if not project_id:
+                return _coding_error("project_id is required for beads/memory actions")
+            sub_action = str(
+                args.get("sub_action") or args.get("op") or "list"
+            ).strip()
+            sub_args = args.get("payload") if isinstance(args.get("payload"), dict) else {}
+            ctx = ProviderContext(
+                token_id="chat",
+                thread_id=(args.get("thread_id") or "").strip(),
+                project_id=project_id,
+                owner=owner_key,
+                session_id=_caller_session or None,
+                capabilities=frozenset(
+                    {"beads.read", "beads.write", "memory.read", "memory.write"}
+                ),
+                credential_class=CREDENTIAL_CLASS_EXPLICIT,
+                run_id=None,
+            )
+            try:
+                if action == "beads":
+                    from src.coding_provider_beads import call_beads_tool
+
+                    result = await call_beads_tool(ctx, sub_action, sub_args)
+                else:
+                    from src.ai_interaction import get_memory_manager, get_memory_vector
+                    from src.coding_provider_memory import call_memory_tool
+
+                    mgr = get_memory_manager()
+                    if mgr is None:
+                        return _coding_error("Memory is not available", 503)
+                    result = call_memory_tool(
+                        ctx, sub_action, sub_args, mgr, get_memory_vector()
+                    )
+                payload = {"response": f"{action} {sub_action}", "exit_code": 0}
+                if isinstance(result, dict):
+                    payload.update(result)
+                else:
+                    payload["result"] = result
+                return payload
+            except CodingProviderError as exc:
+                return _coding_error(
+                    getattr(exc, "detail", str(exc)), getattr(exc, "status_code", 400)
+                )
+            except Exception as exc:  # noqa: BLE001 — surface as tool error, never crash the turn
+                return _coding_error(f"{action} failed: {exc}")
 
         db = SessionLocal()
         try:
@@ -1472,6 +1563,7 @@ async def do_manage_coding(content: str, owner: Optional[str] = None) -> Dict:
                     model=(model or "").strip(),
                     pinned_at=datetime.utcnow() if bool(args.get("pinned", False)) else None,
                     status="idle",
+                    issue_id=(args.get("issue_id") or "").strip() or None,
                     metadata_json=json.dumps(metadata),
                 )
                 db.add(thread)
@@ -1575,6 +1667,8 @@ async def do_manage_coding(content: str, owner: Optional[str] = None) -> Dict:
                             return _coding_error(str(exc), 400)
                     if args.get("session_id") is not None:
                         thread.session_id = str(args.get("session_id") or "").strip() or None
+                    if args.get("issue_id") is not None:
+                        thread.issue_id = str(args.get("issue_id") or "").strip() or None
                     if args.get("model_endpoint_id") is not None:
                         thread.model_endpoint_id = str(args.get("model_endpoint_id") or "").strip()
                     if args.get("model") is not None:
@@ -1598,6 +1692,15 @@ async def do_manage_coding(content: str, owner: Optional[str] = None) -> Dict:
                 if error:
                     return error
                 payload: Dict[str, Any] = {"run": _coding_run_dict(run), "exit_code": 0}
+                # True running-vs-waiting: a run can be status="running" while
+                # actually blocked waiting for an LLM task slot.
+                try:
+                    from src.coding_task_slots import get_task_slot_service
+                    _rs = get_task_slot_service().snapshot(owner_key).get("run_states", {})
+                    if run.id in _rs:
+                        payload["slot_state"] = _rs[run.id]
+                except Exception:
+                    pass
                 include_events = bool(args.get("include_events", action == "read_run"))
                 if include_events:
                     after_seq = max(0, _coding_int(args.get("after_seq"), 0))
@@ -1623,9 +1726,25 @@ async def do_manage_coding(content: str, owner: Optional[str] = None) -> Dict:
                     .all()
                 )
                 queue = runtime.queue_snapshot(owner_key)
+                # Merge live LLM task-slot state so the caller sees true
+                # running-vs-waiting (terminals are uncapped; the slot pool is
+                # the real concurrency limit) instead of just run status.
+                try:
+                    from src.coding_task_slots import get_task_slot_service
+                    _slots = get_task_slot_service().snapshot(owner_key)
+                except Exception:
+                    _slots = {}
+                _rs = _slots.get("run_states", {}) if isinstance(_slots, dict) else {}
+
+                def _annotate(d):
+                    if d.get("id") in _rs:
+                        d["slot_state"] = _rs[d["id"]]
+                    return d
+
                 queue.update({
-                    "queued_runs": [_coding_run_dict(run) for run in queued],
-                    "active_runs": [_coding_run_dict(run) for run in active],
+                    "queued_runs": [_annotate(_coding_run_dict(run)) for run in queued],
+                    "active_runs": [_annotate(_coding_run_dict(run)) for run in active],
+                    "task_slots": _slots,
                 })
                 return {"response": "Coding queue snapshot", "queue": queue, "exit_code": 0}
 
@@ -3092,7 +3211,21 @@ async def do_manage_calendar(content: str, owner: Optional[str] = None) -> Dict:
 # Cookbook routes loopback. The agent's tool calls run in-process but
 # need to reach admin-gated cookbook routes; we ride the per-process
 # internal token so require_admin lets us through. See core/middleware.py.
-_COOKBOOK_BASE = "http://localhost:7000"
+def _resolve_cookbook_base() -> str:
+    """Base URL for the in-process loopback to our own backend.
+
+    The macOS launcher binds uvicorn to a dynamically-chosen free port and
+    exports it as ODYSSEUS_PORT (it can't use :7000 because macOS AirPlay
+    Receiver / ControlCenter squats on :7000 and answers 403 Forbidden to
+    every request). Hardcoding :7000 therefore points these tool calls at
+    AirPlay, not the backend. Mirror coding_provider_bridge.provider_tool_url():
+    prefer the real bound port from the environment, fall back to 7000.
+    """
+    port = (os.environ.get("ODYSSEUS_PORT") or os.environ.get("APP_PORT") or "7000").strip()
+    return f"http://localhost:{port}"
+
+
+_COOKBOOK_BASE = _resolve_cookbook_base()
 
 
 def _internal_headers(owner: Optional[str] = None) -> Dict[str, str]:
@@ -4313,7 +4446,7 @@ async def do_edit_image(content: str, owner: Optional[str] = None) -> Dict:
         payload["scale"] = args["scale"]
     try:
         async with httpx.AsyncClient(timeout=120) as client:
-            resp = await client.post(f"http://localhost:7000/api/gallery/{action}", json=payload)
+            resp = await client.post(f"{_COOKBOOK_BASE}/api/gallery/{action}", json=payload)
             data = resp.json()
         if data.get("success") or data.get("id"):
             return {"output": f"Image edited ({action}). New image ID: {data.get('id', '?')}", "exit_code": 0}
@@ -4489,7 +4622,7 @@ async def do_resolve_contact(content: str, owner: Optional[str] = None) -> Dict:
     async with httpx.AsyncClient(timeout=30) as client:
         # 2. Email history (sent/received)
         try:
-            resp = await client.get("http://localhost:7000/api/email/resolve-contact", params={"name": name})
+            resp = await client.get(f"{_COOKBOOK_BASE}/api/email/resolve-contact", params={"name": name})
             if resp.status_code == 200:
                 for c in (resp.json().get("contacts") or []):
                     email = (c.get("email") or "").strip().lower()

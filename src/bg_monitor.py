@@ -130,6 +130,58 @@ async def _run_followup(rec: dict) -> bool:
     return True
 
 
+async def _run_coding_followup(rec: dict) -> bool:
+    """Re-invoke the chat agent when a Code Station run it started finishes.
+
+    Same contract/guards as _run_followup (the bash path): defer if the session
+    is mid-stream, mark-after-success so a transient failure simply retries on the
+    next tick. The data layer is src/coding_followup.py."""
+    from src.ai_interaction import get_session_manager
+    from core.models import ChatMessage
+    from src import coding_followup
+
+    sm = get_session_manager()
+    if not sm:
+        return False  # not ready yet — retry
+    sess = sm.get_session(rec["session_id"])
+    if not sess:
+        # Linked chat session was deleted — nothing to continue. Mark handled so
+        # we don't retry forever.
+        logger.info("coding-followup: session %s gone for run %s — skipping",
+                    rec.get("session_id"), rec.get("run_id"))
+        return True
+
+    # Same race guard as the bash path: never write into a session mid-stream.
+    try:
+        from src import agent_runs
+        if agent_runs.is_active(sess.id):
+            logger.info("coding-followup: session %s busy (live turn) — deferring run %s",
+                        sess.id, rec.get("run_id"))
+            return False
+    except Exception:
+        pass
+
+    inject = coding_followup.build_followup_inject(rec)
+    context = sess.get_context_messages()
+    context.append({"role": "user", "content": inject})
+
+    full, tool_events = await _drain_agent(sess, context)
+
+    sm.add_message(sess.id, ChatMessage(
+        "assistant", full,
+        metadata={
+            "tool_events": tool_events,
+            "model": sess.model,
+            "coding_run_id": rec["run_id"],
+            "coding_thread_id": rec.get("thread_id"),
+        },
+    ))
+    sm.save_sessions()
+    logger.info("coding-followup: auto-reported run %s into session %s (%d chars, %d tools)",
+                rec["run_id"], sess.id, len(full), len(tool_events))
+    return True
+
+
 async def _loop():
     while True:
         try:
@@ -142,6 +194,17 @@ async def _loop():
                     logger.warning("bg-followup failed for %s (will retry): %s", rec.get("id"), e)
         except Exception as e:
             logger.warning("bg-monitor tick error: %s", e)
+        # Second source: finished Code Station runs linked to a chat session.
+        try:
+            from src import coding_followup
+            for rec in coding_followup.pending_coding_followups():
+                try:
+                    if await _run_coding_followup(rec):
+                        coding_followup.mark_coding_followed_up(rec["run_id"])
+                except Exception as e:
+                    logger.warning("coding-followup failed for %s (will retry): %s", rec.get("run_id"), e)
+        except Exception as e:
+            logger.warning("coding-monitor tick error: %s", e)
         await asyncio.sleep(POLL_INTERVAL_S)
 
 

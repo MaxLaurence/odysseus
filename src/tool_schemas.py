@@ -435,9 +435,10 @@ FUNCTION_TOOL_SCHEMAS = [
                             "update_thread", "delete_thread", "pin_thread", "unpin_thread",
                             "run_thread", "get_run", "read_run", "stop_run",
                             "send_stdin", "resize_run", "queue", "harnesses",
-                            "model_config", "derive_model_config", "restore_config"
+                            "model_config", "derive_model_config", "restore_config",
+                            "beads", "memory"
                         ],
-                        "description": "Coding Station action to perform."
+                        "description": "Coding Station action to perform. Use 'beads' to read/write the project's bd work tracker and 'memory' for the project's shared memory (both require project_id plus sub_action + payload)."
                     },
                     "project_id": {"type": "string", "description": "Project ID for project actions or thread listing/creation."},
                     "thread_id": {"type": "string", "description": "Thread ID for thread/run/model-config actions."},
@@ -458,7 +459,7 @@ FUNCTION_TOOL_SCHEMAS = [
                     "pinned": {"type": "boolean", "description": "Pin a new thread immediately."},
                     "metadata": {"type": "object", "description": "Thread/run metadata. For custom harnesses, metadata.command may supply the command."},
                     "status": {"type": "string", "enum": ["idle", "queued", "starting", "running", "stopping"], "description": "Thread status for update_thread."},
-                    "command": {"type": "string", "description": "Command for run_thread. If omitted, the harness default command is used."},
+                    "command": {"type": "string", "description": "Optional SHELL command that LAUNCHES the harness for run_thread (omit for the harness default CLI). This is NOT the coding task — deliver the task to an interactive harness via send_stdin after launch."},
                     "replace": {"type": "boolean", "description": "For run_thread, stop any active run in the thread before queuing the new run."},
                     "idempotency_key": {"type": "string", "description": "Optional idempotency key for run_thread."},
                     "data": {"type": "string", "description": "stdin text for send_stdin."},
@@ -467,7 +468,10 @@ FUNCTION_TOOL_SCHEMAS = [
                     "after_seq": {"type": "integer", "description": "Only include coding events after this sequence for read_thread/read_run."},
                     "include_events": {"type": "boolean", "description": "Include coding thread events in get/read responses."},
                     "log_chars": {"type": "integer", "description": "For read_run, include this many trailing log characters when available."},
-                    "limit": {"type": "integer", "description": "Maximum items for list_projects/list_threads."}
+                    "limit": {"type": "integer", "description": "Maximum items for list_projects/list_threads."},
+                    "issue_id": {"type": "string", "description": "Optional bd (beads) work-item id to link to a coding thread on create_thread/update_thread."},
+                    "sub_action": {"type": "string", "description": "For action=beads, the bd operation (e.g. list, ready, show, create, close, update, dep). For action=memory: list, add, search, get, edit, delete."},
+                    "payload": {"type": "object", "description": "Arguments for the beads/memory sub_action, e.g. {\"title\": \"...\", \"description\": \"...\"} for beads create, {\"id\": \"bd-12\"} for close/show, or {\"text\": \"...\"} for memory add."}
                 },
                 "required": ["action"]
             }

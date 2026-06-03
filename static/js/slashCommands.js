@@ -1234,6 +1234,9 @@ async function _cmdOpen(args, ctx) {
       research: ['tool-research-btn', 'rail-research'],
       compare: ['tool-compare-btn', 'rail-compare'],
       theme: ['tool-theme-btn', 'rail-theme'],
+      code: ['rail-code', 'tool-code-btn'],
+      coding: ['rail-code', 'tool-code-btn'],
+      codestation: ['rail-code', 'tool-code-btn'],
     };
     const ids = targets[target];
     if (ids && clickFirst(...ids)) return true;
@@ -5377,6 +5380,127 @@ async function _cmdHelp(args, ctx) {
   return true;
 }
 
+// ── Code Station (coding agents) ──
+// Direct client-side handlers (cookie-auth fetch against /api/coding/*),
+// except `new` which hands the request to the agent's manage_coding tool.
+
+async function _cmdCodeOpen(args, ctx) {
+  try {
+    // Idempotent: never toggle Code Station closed if it's already showing
+    // (codeStationModule.open() is a toggle).
+    const active = typeof document !== 'undefined' && document.body.classList.contains('code-space-active');
+    if (active) return true;
+    if (window.codeStationModule && typeof window.codeStationModule.open === 'function') {
+      await window.codeStationModule.open();
+    } else {
+      const el = document.getElementById('rail-code') || document.getElementById('tool-code-btn');
+      if (el) el.click();
+      else slashReply('Code Station is unavailable here.');
+    }
+  } catch (e) { console.warn('/code open failed', e); slashReply('Could not open Code Station.'); }
+  return true;
+}
+
+async function _cmdCodeList(args, ctx) {
+  try {
+    const res = await fetch(`${API_BASE}/api/coding/projects`, { credentials: 'same-origin' });
+    if (!res.ok) { slashReply('Could not load coding projects.'); return true; }
+    const data = await res.json();
+    const projects = data.projects || [];
+    if (!projects.length) { slashReply('No coding projects yet. Try <code>/code open</code>, or ask me to start a coding task.'); return true; }
+    const lines = projects.slice(0, 30).map(p => {
+      const name = ctx.esc(p.name || 'Untitled');
+      const root = ctx.esc(p.root_path || '');
+      return `${name}${root ? '  —  ' + root : ''}`;
+    });
+    if (projects.length > 30) lines.push(`... and ${projects.length - 30} more`);
+    slashReply(`<b>Coding projects</b><pre>${lines.join('\n')}</pre>`);
+  } catch (e) { console.warn('/code list failed', e); slashReply('Could not load coding projects.'); }
+  return true;
+}
+
+async function _cmdCodeStatus(args, ctx) {
+  try {
+    const res = await fetch(`${API_BASE}/api/coding/queue`, { credentials: 'same-origin' });
+    if (!res.ok) { slashReply('Could not load coding status.'); return true; }
+    const data = await res.json();
+    const q = data.queue || {};
+    const active = q.active_runs || [];
+    const queued = q.queued_runs || [];
+    const runStates = (q.task_slots && q.task_slots.run_states) || {};
+    const dot = (s) => ({ running: '●', starting: '◐', stopping: '◌', queued: '○' }[s] || '•');
+    const fmt = (r) => {
+      const thread = ctx.esc(r.thread_title || (r.thread_id || '').slice(0, 8) || '');
+      const proj = ctx.esc(r.project_name || '');
+      // True running-vs-waiting from the LLM task-slot pool (a run can show
+      // "running" while actually blocked waiting for a slot).
+      const slot = runStates[r.id];
+      const label = (r.status === 'running' && slot === 'waiting') ? 'waiting (slot)' : ctx.esc(r.status);
+      return `${dot(r.status)} ${label}  ${proj}${proj ? ' / ' : ''}${thread}  (run ${ctx.esc((r.id || '').slice(0, 8))})`;
+    };
+    const lines = [];
+    if (active.length) { lines.push('Active:'); active.forEach(r => lines.push('  ' + fmt(r))); }
+    if (queued.length) { lines.push('Queued:'); queued.forEach(r => lines.push('  ' + fmt(r))); }
+    if (!active.length && !queued.length) { slashReply('No active or queued coding runs.'); return true; }
+    const slots = (q.task_slots && q.task_slots.endpoints) || [];
+    if (slots.length) {
+      lines.push('');
+      lines.push('LLM task slots:');
+      slots.forEach(ep => {
+        const limit = (ep.limit === null || ep.limit === undefined) ? '∞' : ep.limit;
+        const waiting = ep.waiting ? `, ${ep.waiting} waiting` : '';
+        lines.push(`  ${ctx.esc(ep.endpoint_name || ep.endpoint || 'default')}: ${ep.active || 0}/${limit} active${waiting}`);
+      });
+    }
+    slashReply(`<b>Code Station status</b><pre>${lines.join('\n')}</pre>`);
+  } catch (e) { console.warn('/code status failed', e); slashReply('Could not load coding status.'); }
+  return true;
+}
+
+async function _cmdCodeNew(args, ctx) {
+  const desc = args.join(' ').trim();
+  if (!desc) { slashReply('Usage: /code new &lt;what you want the coding agent to do&gt;'); return true; }
+  // Hand off to the agent explicitly (mirror the skill path) rather than
+  // falling through — fall-through on a SUB-command re-sends the raw "/code
+  // new ..." text instead of this primed instruction.
+  const composed =
+    `Use the Code Station (manage_coding) to do this coding task: ${desc}. ` +
+    `Pick or create the right project, create a thread linked to this chat, ` +
+    `start a run, and deliver the task to the harness.`;
+  const msgInput = document.getElementById('message');
+  if (msgInput) {
+    msgInput.value = composed;
+    const form = document.getElementById('chat-form');
+    if (form && typeof form.requestSubmit === 'function') form.requestSubmit();
+    else if (form) form.dispatchEvent(new Event('submit', { cancelable: true, bubbles: true }));
+  }
+  return true; // handled — no fall-through
+}
+
+async function _cmdCodeStop(args, ctx) {
+  const id = (args[0] || '').trim();
+  try {
+    if (id) {
+      const res = await fetch(`${API_BASE}/api/coding/runs/${encodeURIComponent(id)}/stop`, { method: 'POST', credentials: 'same-origin' });
+      if (res.ok) await typewriterReply(`Stopped coding run ${ctx.esc(id.slice(0, 8))}`);
+      else slashReply('Could not stop that run — check the id with <code>/code status</code>.');
+      return true;
+    }
+    const qres = await fetch(`${API_BASE}/api/coding/queue`, { credentials: 'same-origin' });
+    const qdata = qres.ok ? await qres.json() : {};
+    const q = qdata.queue || {};
+    const runs = [...(q.active_runs || []), ...(q.queued_runs || [])];
+    if (!runs.length) { slashReply('No active coding runs to stop.'); return true; }
+    let stopped = 0;
+    for (const r of runs) {
+      const res = await fetch(`${API_BASE}/api/coding/runs/${encodeURIComponent(r.id)}/stop`, { method: 'POST', credentials: 'same-origin' });
+      if (res.ok) stopped++;
+    }
+    await typewriterReply(`Stopped ${stopped}/${runs.length} coding run${runs.length > 1 ? 's' : ''}`);
+  } catch (e) { console.warn('/code stop failed', e); slashReply('Could not stop coding runs.'); }
+  return true;
+}
+
 // ── Command registry ──────────────────────────────────────────────
 // Each top-level key is a command group.  Flat commands have a handler
 // directly; grouped commands use `subs`.  `default` is the sub run
@@ -5578,6 +5702,19 @@ const COMMANDS = {
     help: 'Open Cookbook; use "serve" to jump to model serving',
     handler: (args, ctx) => _cmdToolPanel('cookbook', args, ctx),
     usage: '/cookbook  ·  /cookbook serve qwen'
+  },
+  code: {
+    alias: ['coding', 'cs'],
+    category: 'Tools',
+    help: 'Code Station coding agents',
+    default: 'open',
+    subs: {
+      'open':   { handler: _cmdCodeOpen,   alias: ['o'],         help: 'Open Code Station',                 usage: '/code open' },
+      'list':   { handler: _cmdCodeList,   alias: ['ls', 'projects'], help: 'List coding projects',         usage: '/code list' },
+      'status': { handler: _cmdCodeStatus, alias: ['st', 'ps'],  help: 'Active + queued coding runs',        usage: '/code status' },
+      'new':    { handler: _cmdCodeNew,    alias: ['run', 'start'], help: 'Start a coding task (via agent)',  usage: '/code new <description>', noUserBubble: false },
+      'stop':   { handler: _cmdCodeStop,   alias: ['kill'],      help: 'Stop a run (or all active runs)',    usage: '/code stop [run-id]' },
+    }
   },
   email: {
     alias: ['mail', 'inbox'],

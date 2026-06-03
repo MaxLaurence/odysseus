@@ -855,7 +855,7 @@ async def execute_tool_block(
         result = await do_manage_calendar(content, owner=owner)
     elif tool == "manage_coding":
         desc = "manage_coding"
-        result = await do_manage_coding(content, owner=owner)
+        result = await do_manage_coding(content, owner=owner, session_id=session_id)
     elif tool == "download_model":
         desc = "download_model"
         result = await do_download_model(content, owner=owner)

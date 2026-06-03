@@ -1294,7 +1294,9 @@ async function createThread(form) {
   try {
     const data = await api(`/api/coding/projects/${encodeURIComponent(state.selectedProjectId)}/threads`, {
       method: 'POST',
-      body: { title, cwd, harness_id: harness },
+      // Link UI-created threads to the active chat so the thread's "Open Chat"
+      // button works and coding→chat reporting can find the conversation.
+      body: { title, cwd, harness_id: harness, session_id: currentModelInfo()?.session_id || '' },
     });
     form.reset();
     form.setAttribute('hidden', '');
@@ -1528,6 +1530,9 @@ function openChatForSelectedThread() {
   if (!sessionId) return;
   if (sessionModule?.selectSession) {
     sessionModule.selectSession(sessionId);
+    // Leave the Code Station workspace so the linked chat is actually visible
+    // (selectSession alone leaves it hidden behind code-space-active).
+    hideCodeSpace();
     toast('Opened linked chat');
   }
 }
@@ -3516,9 +3521,31 @@ export async function open() {
   }
 }
 
+// Deep-link entry point used by the chat "Open in Code Station" run card.
+// Unlike open() (which toggles), this guarantees the space is shown and then
+// selects the thread WITHOUT auto-launching a new run.
+export async function openThread(threadId, projectId) {
+  if (!threadId) return;
+  if (!state.initialized) init(window.location.origin, {});
+  if (!isCodeSpaceActive()) {
+    await open();
+  }
+  try {
+    if (projectId && state.selectedProjectId !== projectId) {
+      state.selectedProjectId = projectId;
+      await loadThreads(projectId);
+    }
+  } catch (_) {
+    /* fall through — selectThread fetches the thread by id regardless */
+  }
+  await selectThread(threadId, { autoLaunch: false });
+}
+
 export default {
   init,
   open,
   hide,
+  openThread,
+  selectThread,
   refreshBadges,
 };

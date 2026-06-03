@@ -19,6 +19,21 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/mcp", tags=["mcp"])
 
 
+def _oauth_redirect_uri() -> str:
+    """Loopback OAuth callback URL for Desktop-App credentials.
+
+    Must be byte-identical between the authorize request and the token
+    exchange or Google rejects the exchange. The backend binds to the port in
+    ODYSSEUS_PORT (the macOS launcher picks a free port dynamically because
+    macOS AirPlay Receiver squats on :7000 and 403s every request), so derive
+    the port from the environment instead of hardcoding :7000 — otherwise the
+    browser is redirected to AirPlay and the callback never lands. Google
+    permits any localhost port for Desktop/installed-app loopback redirects
+    (RFC 8252)."""
+    port = (os.environ.get("ODYSSEUS_PORT") or os.environ.get("APP_PORT") or "7000").strip()
+    return f"http://localhost:{port}/api/mcp/oauth/callback"
+
+
 def _load_disabled_map():
     """Load per-server disabled tool sets from DB."""
     db = SessionLocal()
@@ -365,7 +380,7 @@ def setup_mcp_routes(mcp_manager: McpManager):
 
             # For Desktop App creds, redirect to localhost — the user will
             # paste the resulting URL back if they're on a different device.
-            redirect_uri = "http://localhost:7000/api/mcp/oauth/callback"
+            redirect_uri = _oauth_redirect_uri()
 
             params = {
                 "client_id": client_id,
@@ -433,7 +448,7 @@ def setup_mcp_routes(mcp_manager: McpManager):
             client_id = keys["client_id"]
             client_secret = keys["client_secret"]
 
-            redirect_uri = "http://localhost:7000/api/mcp/oauth/callback"
+            redirect_uri = _oauth_redirect_uri()
 
             async with httpx.AsyncClient() as client:
                 resp = await client.post(
@@ -548,7 +563,7 @@ def _oauth_authorize_page(auth_url: str, server_id: str, host: str) -> str:
   <div class="divider"></div>
   <form method="POST" action="http://{host}/api/mcp/oauth/exchange/{server_id}">
     <p>Paste the URL from your browser after signing in:</p>
-    <input type="text" name="callback_url" placeholder="http://localhost:7000/api/mcp/oauth/callback?code=..." required>
+    <input type="text" name="callback_url" placeholder="http://{host}/api/mcp/oauth/callback?code=..." required>
     <br><button type="submit">Connect</button>
   </form>
 </div></body></html>"""

@@ -1040,6 +1040,7 @@ import createResearchSynapse from './researchSynapse.js';
         'deep_research': 'Researching',
         'list_models': 'Browsing',
         'ui_control': 'Adjusting',
+        'manage_coding': 'Code Station',
       };
       function _thinkingLabel() {
         if (!_lastToolName) {
@@ -2081,6 +2082,35 @@ import createResearchSynapse from './researchSynapse.js';
                     details.className = 'agent-tool-output';
                     details.innerHTML = `<summary>Screenshot</summary><img src="${json.screenshot}" style="max-width:100%;border-radius:6px;margin-top:6px;border:1px solid var(--border)" />`;
                     contentEl.appendChild(details);
+                  }
+                }
+                // --- Render a Code Station run card (status chip + deep-link) ---
+                if (json.coding_card && currentToolBubble) {
+                  const contentEl = currentToolBubble.querySelector('.agent-thread-content');
+                  if (contentEl) {
+                    const c = json.coding_card;
+                    const status = String(c.status || '');
+                    const dot = ({ running: '●', starting: '◐', queued: '○', stopping: '◌', exited: '✓', failed: '✗', cancelled: '⊘' })[status] || '•';
+                    const title = esc(c.thread_title || (c.thread_id ? String(c.thread_id).slice(0, 8) : 'Coding'));
+                    const runShort = c.run_id ? esc(String(c.run_id).slice(0, 8)) : '';
+                    const card = document.createElement('div');
+                    card.className = 'coding-run-card coding-status-' + esc(status || 'unknown');
+                    card.innerHTML =
+                      `<span class="coding-chip">${dot} ${esc(status || '—')}</span>` +
+                      `<span class="coding-thread-title">${title}</span>` +
+                      (runShort ? `<span class="coding-run-id">run ${runShort}</span>` : '') +
+                      (c.thread_id ? `<button type="button" class="coding-open-btn" data-thread="${esc(String(c.thread_id))}"${c.project_id ? ` data-project="${esc(String(c.project_id))}"` : ''}>Open in Code Station</button>` : '');
+                    const btn = card.querySelector('.coding-open-btn');
+                    if (btn) {
+                      btn.addEventListener('click', async () => {
+                        try {
+                          const m = window.codeStationModule;
+                          if (m && typeof m.openThread === 'function') await m.openThread(btn.dataset.thread, btn.dataset.project || '');
+                          else if (m && typeof m.open === 'function') await m.open();
+                        } catch (e) { console.warn('open coding thread failed', e); }
+                      });
+                    }
+                    contentEl.appendChild(card);
                   }
                 }
                 // --- Reload sessions after manage_session tool (delete, rename, etc.) ---

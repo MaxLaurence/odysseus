@@ -321,6 +321,16 @@ If `dtend` omitted, defaults to dtstart+1h (or +1d when `all_day: true`). \
 For a RECURRING event pass `rrule` as an iCalendar RRULE string, e.g. `"FREQ=WEEKLY;BYDAY=MO"` (every Monday), `"FREQ=DAILY;COUNT=10"`, or `"FREQ=MONTHLY;BYMONTHDAY=1"` — create ONE event with the rrule, do not loop creating many events. \
 If the user asks for a reminder/alarm before the event, pass `reminder_minutes` as an integer; do not write reminder text into the event description and do NOT also call `manage_notes` for the same reminder because calendar reminders are routed through Notes automatically. \
 `calendar` accepts a name ("Main") or short-id prefix.""",
+    "manage_coding": """\
+```manage_coding
+{"action": "run_thread", "thread_id": "<id>"}
+```
+Observe and control the **Code Station** — Odysseus's coding-agent workspace where terminal coding agents (claude, codex, pi, omp, gemini, generic) run on the user's projects. This is the ONLY way to drive Code Station from chat; never use shell/git/app_api for coding-agent work. \
+START a task: `{"action":"list_projects"}` → pick/create a project → `{"action":"create_thread","project_id":"<id>","title":"<short>","harness_id":"claude"}` → `{"action":"run_thread","thread_id":"<id>"}` to launch the harness CLI. IMPORTANT: `command` is the optional SHELL command that LAUNCHES the harness (omit it for the harness's default CLI) — it is NOT the coding task. Interactive harnesses (claude/codex/pi/omp) open a REPL, so DELIVER THE TASK with `{"action":"send_stdin","run_id":"<id>","data":"<the task instruction>\\n"}` after launch. run_thread is NON-BLOCKING (returns a run id immediately). When a run TERMINATES you're auto-notified in this chat; for a still-open interactive REPL, use read_run to check progress rather than looping. \
+CHECK IN: `{"action":"read_run","run_id":"<id>"}` → live status, structured events, terminal log tail (slot_state = running vs waiting on an LLM slot); `{"action":"read_thread","thread_id":"<id>"}`; `{"action":"queue"}` for all active/queued runs. \
+STEER/STOP: `{"action":"send_stdin","run_id":"<id>","data":"<text>\\n"}` to type into the agent; `{"action":"stop_run","run_id":"<id>"}`. \
+WORK TRACKING: `{"action":"beads","project_id":"<id>","sub_action":"list|create|close","payload":{...}}` for the project's bd issues; link a thread to an issue via create_thread/update_thread `issue_id`. \
+Other actions: create/update/archive projects; create/update/pin threads; harnesses, model_config. Threads you create auto-link to THIS chat so completion reports come back here. Use whenever the user says "have an agent fix/implement X", "start a coding agent on <project>", "how's that coding run going", "stop that run".""",
     "create_session": "- ```create_session``` — Create a new chat. Line 1 = chat name, line 2 = model name. Use for background/parallel work.",
     "list_sessions": "- ```list_sessions``` — List chats sorted MOST-RECENT FIRST (the UI calls them 'chats') with clickable chat-title links. Output includes a relative \"last active\" timestamp per row, so the first row is the user's most recent chat. Content = optional filter keyword (matches chat name). When answering, preserve the `[title](#session-id)` links exactly; do not convert them into plain text.",
     "send_to_session": "- ```send_to_session``` — Send a message to another session. Line 1 = session_id, rest = message. Use for orchestrating work across sessions.",
@@ -2190,6 +2200,25 @@ async def stream_agent_loop(
             if result.get("images"):
                 img = result["images"][0]
                 tool_output_data["screenshot"] = f"data:{img['mimeType']};base64,{img['data']}"
+            # Forward a SANITIZED Code Station run/thread card so the chat can
+            # render a status chip + "Open in Code Station" deep-link instead of
+            # a raw JSON blob. Deliberately omits run_dir/log_path/tmux_session.
+            if block.tool_type == "manage_coding" and isinstance(result, dict):
+                _run = result.get("run") if isinstance(result.get("run"), dict) else None
+                _last = result.get("last_run") if isinstance(result.get("last_run"), dict) else None
+                _thread = result.get("thread") if isinstance(result.get("thread"), dict) else None
+                _r = _run or _last
+                if _r or _thread:
+                    _tid = (_r or {}).get("thread_id") or (_thread or {}).get("id")
+                    tool_output_data["coding_card"] = {
+                        "run_id": (_r or {}).get("id"),
+                        "status": (_r or {}).get("status"),
+                        "harness_id": (_r or {}).get("harness_id"),
+                        "exit_code": (_r or {}).get("exit_code"),
+                        "thread_id": _tid,
+                        "thread_title": (_thread or {}).get("title"),
+                        "project_id": (_thread or {}).get("project_id") or (_r or {}).get("project_id"),
+                    }
             yield f'data: {json.dumps(tool_output_data)}\n\n'
 
             # Native document tools open in the editor + carry the REAL doc id.

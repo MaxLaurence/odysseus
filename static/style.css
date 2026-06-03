@@ -8703,6 +8703,63 @@ body.hide-thinking .thinking-section { display: none !important; }
 .agent-thread-node.open .agent-thread-chevron {
   transform: rotate(90deg);
 }
+/* Code Station run card — chat-side render of manage_coding run/thread results */
+.coding-run-card {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-top: 6px;
+  padding: 6px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--fg) 4%, transparent);
+  font-size: 0.85em;
+}
+.coding-run-card .coding-chip {
+  font-weight: 600;
+  letter-spacing: 0.2px;
+  padding: 1px 8px;
+  border-radius: 999px;
+  border: 1px solid color-mix(in srgb, var(--fg) 20%, transparent);
+  white-space: nowrap;
+}
+.coding-run-card.coding-status-running .coding-chip,
+.coding-run-card.coding-status-starting .coding-chip {
+  color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 45%, transparent);
+}
+.coding-run-card.coding-status-failed .coding-chip,
+.coding-run-card.coding-status-cancelled .coding-chip {
+  color: var(--color-error);
+  border-color: color-mix(in srgb, var(--color-error) 45%, transparent);
+}
+.coding-run-card.coding-status-exited .coding-chip {
+  color: var(--color-success);
+  border-color: color-mix(in srgb, var(--color-success) 45%, transparent);
+}
+.coding-run-card .coding-thread-title {
+  font-weight: 600;
+  color: var(--fg);
+}
+.coding-run-card .coding-run-id {
+  opacity: 0.55;
+  font-variant-numeric: tabular-nums;
+}
+.coding-run-card .coding-open-btn {
+  margin-left: auto;
+  padding: 3px 10px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--fg);
+  cursor: pointer;
+  font-size: 0.95em;
+}
+.coding-run-card .coding-open-btn:hover {
+  background: color-mix(in srgb, var(--accent) 12%, var(--bg));
+  border-color: color-mix(in srgb, var(--accent) 40%, var(--border));
+}
 .agent-thread-wave {
   font-family: monospace;
   font-size: 0.85em;

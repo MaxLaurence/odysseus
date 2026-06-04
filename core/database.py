@@ -607,6 +607,12 @@ class CodingProject(TimestampMixin, Base):
     # Opt-in Beads (`bd`) issue tracking. Off by default: enabling it runs `bd init`,
     # which writes a `.beads/` dir into the repo, so it must be an explicit choice.
     beads_enabled       = Column(Boolean, default=False, nullable=False)
+    # Project-level defaults for new threads. default_effort is a normalized effort
+    # level (minimal|low|medium|high|max|""); default_auth_mode is how the agent CLI
+    # authenticates: "none" (CLI's own native store), "endpoint" (Odysseus
+    # ModelEndpoint api-key), or "subscription" (the owner's managed CLI OAuth login).
+    default_effort      = Column(String, nullable=True)
+    default_auth_mode   = Column(String, nullable=False, default="none")
 
     threads = relationship("CodingThread", back_populates="project", cascade="all, delete-orphan")
 
@@ -628,6 +634,13 @@ class CodingThread(TimestampMixin, Base):
     harness_id        = Column(String, nullable=False, default="generic")
     model_endpoint_id = Column(String, nullable=True)
     model             = Column(String, nullable=True)
+    # Normalized reasoning effort (minimal|low|medium|high|max|""=inherit). Translated
+    # per-harness at launch (see src/coding_effort.py): Codex -> model_reasoning_effort
+    # arg; Claude -> MAX_THINKING_TOKENS env; others best-effort/no-op.
+    effort            = Column(String, nullable=True)
+    # How this thread's agent CLI authenticates: "none" (CLI native store),
+    # "endpoint" (Odysseus ModelEndpoint api-key), "subscription" (owner CLI OAuth).
+    auth_mode         = Column(String, nullable=False, default="none")
     pinned_at         = Column(DateTime, nullable=True, index=True)
     status            = Column(String, nullable=False, default="idle")
     last_run_id       = Column(String, nullable=True)
@@ -761,6 +774,35 @@ class CodingProviderToken(Base):
         UniqueConstraint('token_hash', name='uq_coding_provider_tokens_hash'),
         Index('ix_coding_provider_tokens_owner_thread', 'owner', 'thread_id', 'created_at'),
         Index('ix_coding_provider_tokens_prefix_active', 'token_prefix', 'revoked_at', 'expires_at'),
+    )
+
+
+class CodingProviderAuth(TimestampMixin, Base):
+    """Per-owner subscription-login status for a coding-agent provider (claude|codex).
+
+    The actual OAuth credential is written by the provider's OWN CLI into an isolated
+    config dir under DATA_DIR/coding_auth/<owner_slug>/<provider> (exported as
+    CLAUDE_CONFIG_DIR / CODEX_HOME at agent launch). This row tracks STATUS only, so
+    the UI can show a login pill without ever reading the on-disk secret. The optional
+    token_encrypted column holds a `claude setup-token` OAuth token for the
+    CLAUDE_CODE_OAUTH_TOKEN injection path when that is preferred over a config dir.
+    """
+    __tablename__ = "coding_provider_auth"
+
+    id              = Column(String, primary_key=True, index=True)
+    owner           = Column(String, nullable=True, index=True)
+    provider        = Column(String, nullable=False)            # "claude" | "codex"
+    status          = Column(String, nullable=False, default="logged_out")  # logged_in|logged_out|pending|error
+    config_dir      = Column(Text, nullable=True)
+    account_label   = Column(String, nullable=True)             # masked email / plan label if exposed
+    token_encrypted = Column(EncryptedText, nullable=True)      # optional claude OAuth token
+    last_login_at   = Column(DateTime, nullable=True)
+    last_checked_at = Column(DateTime, nullable=True)
+    error           = Column(Text, nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint('owner', 'provider', name='uq_coding_provider_auth_owner_provider'),
+        Index('ix_coding_provider_auth_owner_provider', 'owner', 'provider'),
     )
 
 
@@ -1795,6 +1837,43 @@ def _migrate_add_coding_thread_agent_columns():
         logging.getLogger(__name__).warning(f"coding_threads agent-columns migration failed: {e}")
 
 
+def _migrate_add_coding_provider_auth_columns():
+    """Add effort/auth_mode to coding_threads and default_effort/default_auth_mode to
+    coding_projects. Guarded + idempotent (the new coding_provider_auth table itself is
+    created by create_all and needs no backfill)."""
+    import sqlite3
+    db_path = DATABASE_URL.replace("sqlite:///", "")
+    if not os.path.exists(db_path):
+        return
+    try:
+        conn = sqlite3.connect(db_path)
+        added = False
+        tcols = [row[1] for row in conn.execute("PRAGMA table_info(coding_threads)").fetchall()]
+        thread_adds = {
+            "effort":    "ALTER TABLE coding_threads ADD COLUMN effort TEXT",
+            "auth_mode": "ALTER TABLE coding_threads ADD COLUMN auth_mode TEXT DEFAULT 'none'",
+        }
+        for col, ddl in thread_adds.items():
+            if tcols and col not in tcols:
+                conn.execute(ddl)
+                added = True
+        pcols = [row[1] for row in conn.execute("PRAGMA table_info(coding_projects)").fetchall()]
+        project_adds = {
+            "default_effort":    "ALTER TABLE coding_projects ADD COLUMN default_effort TEXT",
+            "default_auth_mode": "ALTER TABLE coding_projects ADD COLUMN default_auth_mode TEXT DEFAULT 'none'",
+        }
+        for col, ddl in project_adds.items():
+            if pcols and col not in pcols:
+                conn.execute(ddl)
+                added = True
+        conn.commit()
+        if added:
+            logging.getLogger(__name__).info("Migrated: added effort/auth_mode columns to coding_threads/coding_projects")
+        conn.close()
+    except Exception as e:
+        logging.getLogger(__name__).warning(f"coding provider auth-columns migration failed: {e}")
+
+
 # WARNING: Foreign-key enforcement is enabled globally for all SQLite connections.
 # Any future migrations or schema changes that temporarily violate foreign-key
 # constraints will fail. To perform such operations, foreign_keys must be
@@ -1835,6 +1914,7 @@ def init_db():
     _migrate_add_crew_member_id()
     _migrate_add_coding_space_columns()
     _migrate_add_coding_thread_agent_columns()
+    _migrate_add_coding_provider_auth_columns()
     _migrate_add_assistant_columns()
     _migrate_add_email_smtp_security()
     _migrate_seed_email_account()

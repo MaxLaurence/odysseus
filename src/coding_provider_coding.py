@@ -49,7 +49,7 @@ async def call_coding_tool(context: ProviderContext, action: str, args: dict[str
         scoped_args = {
             key: value
             for key, value in args.items()
-            if key in {"title", "cwd", "harness_id", "model_endpoint_id", "model", "metadata", "status"}
+            if key in {"title", "cwd", "harness_id", "model_endpoint_id", "model", "effort", "auth_mode", "provider", "metadata", "status"}
         }
         scoped_args["thread_id"] = context.thread_id
         return await manage_coding("update_thread", context.owner, scoped_args)

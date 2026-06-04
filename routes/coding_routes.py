@@ -28,7 +28,15 @@ from core.database import (
 )
 from core.middleware import INTERNAL_TOOL_HEADER, INTERNAL_TOOL_TOKEN, require_admin
 from src.auth_helpers import require_user
+from src.coding_effort import normalize_effort
 from src.coding_harnesses import get_harness, list_harnesses
+from src.coding_providers import (
+    cascade_auth_mode,
+    cascade_effort,
+    expand_provider_selector,
+    list_providers_for_harness,
+    normalize_auth_mode,
+)
 from src.coding_model_config import (
     apply_current_model_config,
     derive_odysseus_model_config,
@@ -123,6 +131,8 @@ def _project_dict(project: CodingProject) -> dict[str, Any]:
         "default_harness": project.default_harness or "generic",
         "default_endpoint_id": project.default_endpoint_id or "",
         "default_model": project.default_model or "",
+        "default_effort": getattr(project, "default_effort", None) or "",
+        "default_auth_mode": getattr(project, "default_auth_mode", None) or "none",
         "archived": bool(project.archived),
         # getattr-guarded so a partially-migrated DB can't 500 every /projects call.
         "parent_project_id": getattr(project, "parent_project_id", None),
@@ -146,6 +156,8 @@ def _thread_dict(thread: CodingThread, model_config: dict[str, Any] | None = Non
         "harness_id": thread.harness_id or "generic",
         "model_endpoint_id": thread.model_endpoint_id or "",
         "model": thread.model or "",
+        "effort": getattr(thread, "effort", None) or "",
+        "auth_mode": getattr(thread, "auth_mode", None) or "none",
         "pinned_at": _iso(thread.pinned_at),
         "status": thread.status or "idle",
         "last_run_id": thread.last_run_id,
@@ -272,6 +284,8 @@ class ProjectCreate(BaseModel):
     default_harness: str | None = "generic"
     default_endpoint_id: str | None = ""
     default_model: str | None = ""
+    default_effort: str | None = None
+    default_auth_mode: str | None = None
 
 
 class ProjectPatch(BaseModel):
@@ -281,6 +295,8 @@ class ProjectPatch(BaseModel):
     default_harness: str | None = None
     default_endpoint_id: str | None = None
     default_model: str | None = None
+    default_effort: str | None = None
+    default_auth_mode: str | None = None
     beads_enabled: bool | None = None
 
 
@@ -291,6 +307,9 @@ class ThreadCreate(BaseModel):
     session_id: str | None = None
     model_endpoint_id: str | None = None
     model: str | None = None
+    effort: str | None = None
+    auth_mode: str | None = None
+    provider: str | None = None
     pinned: bool = False
     metadata: dict[str, Any] | None = None
 
@@ -302,6 +321,9 @@ class ThreadPatch(BaseModel):
     session_id: str | None = None
     model_endpoint_id: str | None = None
     model: str | None = None
+    effort: str | None = None
+    auth_mode: str | None = None
+    provider: str | None = None
     metadata: dict[str, Any] | None = None
     status: str | None = None
 
@@ -312,6 +334,9 @@ class RunCreate(BaseModel):
     harness_id: str | None = None
     model_endpoint_id: str | None = None
     model: str | None = None
+    effort: str | None = None
+    auth_mode: str | None = None
+    provider: str | None = None
     replace: bool = False
     idempotency_key: str | None = None
     metadata: dict[str, Any] | None = None
@@ -411,6 +436,8 @@ def setup_coding_routes() -> APIRouter:
                 default_harness=harness_id,
                 default_endpoint_id=(body.default_endpoint_id or "").strip(),
                 default_model=(body.default_model or "").strip(),
+                default_effort=normalize_effort(body.default_effort) or None,
+                default_auth_mode=normalize_auth_mode(body.default_auth_mode),
                 archived=False,
             )
             db.add(project)
@@ -458,6 +485,10 @@ def setup_coding_routes() -> APIRouter:
                 project.default_endpoint_id = body.default_endpoint_id.strip()
             if body.default_model is not None:
                 project.default_model = body.default_model.strip()
+            if body.default_effort is not None:
+                project.default_effort = normalize_effort(body.default_effort) or None
+            if body.default_auth_mode is not None:
+                project.default_auth_mode = normalize_auth_mode(body.default_auth_mode)
             if body.beads_enabled is not None:
                 # The flag records intent; `bd init` (which writes a `.beads/` dir
                 # into the repo) is run only by the dedicated /beads/init route.
@@ -659,11 +690,16 @@ def setup_coding_routes() -> APIRouter:
             except ValueError as exc:
                 raise HTTPException(400, str(exc)) from exc
             default_config = derive_odysseus_model_config(db, owner)
-            endpoint_id = (
-                body.model_endpoint_id
-                if body.model_endpoint_id is not None
-                else (project.default_endpoint_id or default_config.get("endpoint_id") or "")
-            )
+            provider_sel = expand_provider_selector(body.provider)
+            explicit_auth_mode = provider_sel["auth_mode"] if provider_sel else body.auth_mode
+            if provider_sel is not None:
+                endpoint_id = provider_sel["model_endpoint_id"]
+            else:
+                endpoint_id = (
+                    body.model_endpoint_id
+                    if body.model_endpoint_id is not None
+                    else (project.default_endpoint_id or default_config.get("endpoint_id") or "")
+                )
             model = (
                 body.model
                 if body.model is not None
@@ -679,6 +715,8 @@ def setup_coding_routes() -> APIRouter:
                 harness_id=harness_id,
                 model_endpoint_id=(endpoint_id or "").strip(),
                 model=(model or "").strip(),
+                effort=cascade_effort(body.effort, project) or None,
+                auth_mode=cascade_auth_mode(explicit_auth_mode, project),
                 pinned_at=datetime.utcnow() if body.pinned else None,
                 status="idle",
                 metadata_json=json.dumps(body.metadata or {}),
@@ -731,10 +769,18 @@ def setup_coding_routes() -> APIRouter:
                     raise HTTPException(400, str(exc)) from exc
             if body.session_id is not None:
                 thread.session_id = body.session_id.strip() or None
+            provider_sel = expand_provider_selector(body.provider)
+            if provider_sel is not None:
+                thread.auth_mode = provider_sel["auth_mode"]
+                thread.model_endpoint_id = provider_sel["model_endpoint_id"]
             if body.model_endpoint_id is not None:
                 thread.model_endpoint_id = body.model_endpoint_id.strip()
             if body.model is not None:
                 thread.model = body.model.strip()
+            if body.effort is not None:
+                thread.effort = normalize_effort(body.effort) or None
+            if body.auth_mode is not None:
+                thread.auth_mode = normalize_auth_mode(body.auth_mode)
             if body.metadata is not None:
                 thread.metadata_json = json.dumps(body.metadata)
             if body.status is not None:
@@ -794,6 +840,9 @@ def setup_coding_routes() -> APIRouter:
     async def run_thread(request: Request, thread_id: str, body: RunCreate):
         require_admin(request)
         owner = _owner(request)
+        provider_sel = expand_provider_selector(body.provider)
+        endpoint_id = provider_sel["model_endpoint_id"] if provider_sel else body.model_endpoint_id
+        auth_mode = provider_sel["auth_mode"] if provider_sel else body.auth_mode
         try:
             run = await runtime.enqueue_run(
                 thread_id=thread_id,
@@ -801,8 +850,10 @@ def setup_coding_routes() -> APIRouter:
                 command=body.command,
                 cwd=body.cwd,
                 harness_id=body.harness_id,
-                model_endpoint_id=body.model_endpoint_id,
+                model_endpoint_id=endpoint_id,
                 model=body.model,
+                effort=body.effort,
+                auth_mode=auth_mode,
                 replace=body.replace,
                 idempotency_key=body.idempotency_key,
                 metadata=body.metadata,
@@ -1074,6 +1125,18 @@ def setup_coding_routes() -> APIRouter:
     async def get_harnesses(request: Request):
         _owner(request)
         return {"harnesses": list_harnesses()}
+
+    @router.get("/providers")
+    async def get_providers(request: Request, harness_id: str = Query("")):
+        """Provider catalog for a harness: subscription option (claude/codex, with
+        login status) + the owner's LLM ModelEndpoints, each with its model list,
+        plus the effort levels for the effort picker."""
+        owner = _owner(request)
+        db = SessionLocal()
+        try:
+            return list_providers_for_harness(db, owner, harness_id)
+        finally:
+            db.close()
 
     @router.get("/model-config")
     async def get_model_config(request: Request):

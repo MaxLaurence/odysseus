@@ -36287,6 +36287,148 @@ button.code-station-pill:hover {
   display: grid;
   gap: 8px;
 }
+
+/* Provider/effort hint line under the agent/provider dropdowns. */
+.code-station-provider-hint:empty { display: none; }
+.code-station-provider-hint {
+  font-size: 10.5px;
+  margin-top: -2px;
+}
+
+/* Subscription (OAuth) login rows for claude/codex. */
+.cs-subscription-panel {
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px solid color-mix(in srgb, var(--border) 80%, transparent);
+  display: grid;
+  gap: 6px;
+}
+.cs-subscription-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.cs-subscription-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 5px 0;
+}
+.cs-subscription-info {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  flex-wrap: wrap;
+}
+.cs-subscription-info strong { font-size: 11.5px; }
+.cs-subscription-actions {
+  display: flex;
+  gap: 6px;
+  flex-shrink: 0;
+}
+#code-subscription-note:empty { display: none; }
+#code-subscription-note { font-size: 10.5px; }
+
+/* Subscription (OAuth) rows in the Add Models admin panel. */
+.adm-sub-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 11px 0;
+  flex-wrap: wrap;
+  border-top: 1px solid color-mix(in srgb, var(--border) 55%, transparent);
+}
+.adm-sub-row:first-of-type { border-top: none; padding-top: 4px; }
+.adm-sub-main { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+.adm-sub-headline { display: flex; align-items: center; gap: 8px; }
+.adm-sub-name { font-weight: 650; font-size: 12.5px; }
+.adm-sub-account {
+  font-size: 10.5px;
+  color: color-mix(in srgb, var(--fg) 45%, transparent);
+  max-width: 320px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.adm-sub-actions { display: flex; gap: 6px; flex-shrink: 0; align-items: center; flex-wrap: wrap; }
+.adm-sub-pill {
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 1px solid color-mix(in srgb, var(--border) 80%, transparent);
+  color: color-mix(in srgb, var(--fg) 55%, transparent);
+  white-space: nowrap;
+}
+.adm-sub-pill.adm-sub-ok {
+  color: var(--green, #3fb950);
+  border-color: color-mix(in srgb, var(--green, #3fb950) 45%, transparent);
+  background: color-mix(in srgb, var(--green, #3fb950) 12%, transparent);
+}
+.adm-sub-pill.adm-sub-pending {
+  color: var(--yellow, #d29922);
+  border-color: color-mix(in srgb, var(--yellow, #d29922) 45%, transparent);
+  background: color-mix(in srgb, var(--yellow, #d29922) 12%, transparent);
+}
+.adm-sub-pill.adm-sub-err {
+  color: var(--red, #f85149);
+  border-color: color-mix(in srgb, var(--red, #f85149) 45%, transparent);
+  background: color-mix(in srgb, var(--red, #f85149) 12%, transparent);
+}
+/* "Add as provider" — the row's primary action, but a calm accent OUTLINE so two
+   rows don't read as two loud solid-red buttons. */
+.admin-btn-sm.adm-sub-primary {
+  color: var(--red, #f85149);
+  border-color: color-mix(in srgb, var(--red, #f85149) 55%, transparent);
+  background: color-mix(in srgb, var(--red, #f85149) 8%, transparent);
+  font-weight: 600;
+}
+.admin-btn-sm.adm-sub-primary:hover {
+  background: color-mix(in srgb, var(--red, #f85149) 16%, transparent);
+}
+.admin-btn-sm.adm-sub-primary:disabled { opacity: 0.45; }
+.admin-btn-sm.adm-sub-ghost { opacity: 0.8; }
+
+/* Self-contained subscription-login PTY overlay (outside the pane split-tree). */
+.cs-auth-terminal-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: color-mix(in srgb, #000 55%, transparent);
+}
+.cs-auth-terminal-box {
+  width: min(900px, 92vw);
+  height: min(560px, 80vh);
+  display: flex;
+  flex-direction: column;
+  background: var(--bg, #111);
+  border: 1px solid var(--border, #333);
+  border-radius: 10px;
+  overflow: hidden;
+  box-shadow: 0 18px 60px rgba(0, 0, 0, 0.5);
+}
+.cs-auth-terminal-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 8px 12px;
+  border-bottom: 1px solid color-mix(in srgb, var(--border) 80%, transparent);
+  font-size: 12px;
+}
+.cs-auth-terminal-body {
+  flex: 1;
+  min-height: 0;
+  padding: 6px 8px;
+}
 .cs-provider-head,
 .cs-provider-head-actions,
 .cs-provider-section-head,

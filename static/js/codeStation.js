@@ -59,6 +59,13 @@ const state = {
   selectedRunId: null,
   harnesses: DEFAULT_HARNESSES.slice(),
   modelConfig: null,
+  // Provider catalog for the selected thread's agent (harness): subscription option
+  // + configured endpoints, each with models. Reloaded when the agent changes.
+  providers: [],
+  providersHarness: '',
+  effortLevels: ['minimal', 'low', 'medium', 'high', 'max'],
+  effortSupported: false,
+  authStatus: null,        // { claude: {...}, codex: {...} } subscription login status
   queue: [],
   queueLoaded: false,
   queueByProject: [],
@@ -513,6 +520,9 @@ function normalizeThread(thread) {
     cwd: thread?.cwd || thread?.working_directory || thread?.workdir || '',
     harness: thread?.harness_id || thread?.harness || thread?.runner || 'generic',
     model: thread?.model || modelConfig?.model || modelConfig?.model_name || '',
+    model_endpoint_id: thread?.model_endpoint_id || '',
+    effort: thread?.effort || '',
+    auth_mode: thread?.auth_mode || 'none',
     model_config: modelConfig,
     pinned: Boolean(thread?.pinned || thread?.is_pinned || thread?.pin_order != null || thread?.pinned_at),
     session_id: thread?.session_id || thread?.chat_session_id || '',
@@ -833,9 +843,17 @@ function ensureModal() {
             </div>
             <span id="code-thread-project-label" class="cs-tree-hidden"></span>
             <form id="code-thread-form" class="code-station-form code-station-create-form cs-inline-form" hidden>
-              <input id="code-thread-new-title" name="title" autocomplete="off" placeholder="Thread title" required>
+              <input id="code-thread-new-title" name="title" autocomplete="off" placeholder="Title (optional — auto-titled)">
               <input id="code-thread-new-cwd" name="cwd" autocomplete="off" placeholder="Working dir (optional)">
-              <select id="code-thread-new-harness" name="harness" aria-label="Harness"></select>
+              <select id="code-thread-new-harness" name="harness" aria-label="Agent"></select>
+              <select id="code-thread-new-effort" name="effort" aria-label="Effort">
+                <option value="">Effort: default</option>
+                <option value="minimal">minimal</option>
+                <option value="low">low</option>
+                <option value="medium">medium</option>
+                <option value="high">high</option>
+                <option value="max">max</option>
+              </select>
               <button type="submit">Create &amp; open</button>
             </form>
             <div id="cs-pinned-wrap" class="cs-pinned-wrap" hidden>
@@ -957,6 +975,23 @@ async function handleAction(action, button) {
   const providerTools = ensureProviderToolsModule();
   if (providerTools.canHandleAction(action)) {
     await providerTools.handleAction(action, button);
+    return;
+  }
+  if (action === 'auth-login') {
+    await startSubscriptionLogin(button?.dataset?.provider, button);
+    return;
+  }
+  if (action === 'auth-logout') {
+    await logoutSubscription(button?.dataset?.provider, button);
+    return;
+  }
+  if (action === 'auth-refresh') {
+    await loadAuthStatus();
+    renderSubscriptionLogin();
+    return;
+  }
+  if (action === 'auth-terminal') {
+    openAuthTerminalOverlay(button?.dataset?.provider);
     return;
   }
   if (action === 'delete-thread') {
@@ -1135,7 +1170,7 @@ function destroyModal() {
 }
 
 async function refreshAll() {
-  await Promise.allSettled([loadProjects(), loadSpaces(), loadHarnesses(), loadModelConfig(), refreshBadges()]);
+  await Promise.allSettled([loadProjects(), loadSpaces(), loadHarnesses(), loadModelConfig(), loadAuthStatus(), refreshBadges()]);
   if (!selectedProjectExists()) {
     state.selectedProjectId = state.projects.find((project) => !project.archived)?.id || state.projects[0]?.id || null;
   }
@@ -1178,6 +1213,233 @@ async function loadHarnesses() {
 async function loadModelConfig() {
   const data = await api('/api/coding/model-config');
   state.modelConfig = data?.model_config || data?.config || data || null;
+}
+
+// Mirror of server-side expand_provider_selector: map a provider selector id to the
+// (auth_mode, model_endpoint_id) it implies, for optimistic local state updates.
+function expandProviderClient(provider) {
+  const raw = (provider || '').trim();
+  if (!raw) return {};
+  if (raw === 'subscription' || raw.startsWith('subscription:')) return { auth_mode: 'subscription', model_endpoint_id: '' };
+  if (raw.startsWith('endpoint:')) return { auth_mode: 'endpoint', model_endpoint_id: raw.slice('endpoint:'.length) };
+  if (raw === 'none' || raw === 'endpoint') return { auth_mode: raw, model_endpoint_id: '' };
+  return { auth_mode: 'endpoint', model_endpoint_id: raw };
+}
+
+// Load the provider catalog (subscription + endpoints) + effort levels for an agent.
+async function loadProviders(harness) {
+  const h = harness || 'generic';
+  try {
+    const data = await api(`/api/coding/providers?harness_id=${encodeURIComponent(h)}`);
+    state.providers = Array.isArray(data?.providers) ? data.providers : [];
+    state.providersHarness = h;
+    if (Array.isArray(data?.effort_levels) && data.effort_levels.length) {
+      state.effortLevels = data.effort_levels;
+    }
+    state.effortSupported = Boolean(data?.effort_supported);
+  } catch (_) {
+    state.providers = [];
+    state.providersHarness = h;
+    state.effortSupported = false;
+  }
+}
+
+// Subscription login status for all providers (claude/codex), used by the UI.
+async function loadAuthStatus() {
+  try {
+    const data = await api('/api/coding/provider/auth/status');
+    state.authStatus = data?.providers || null;
+  } catch (_) {
+    state.authStatus = null;
+  }
+  return state.authStatus;
+}
+
+const SUBSCRIPTION_PROVIDERS = ['claude', 'codex'];
+const _authPolls = new Map(); // provider -> interval id
+
+function escHtml(value) {
+  return String(value == null ? '' : value).replace(/[&<>"']/g, (ch) => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+  })[ch]);
+}
+
+// Render the account-level subscription-login rows (claude/codex) into the detail.
+function renderSubscriptionLogin() {
+  const host = q('#code-subscription-login');
+  if (!host) return;
+  const statuses = state.authStatus || {};
+  const rows = SUBSCRIPTION_PROVIDERS.map((provider) => {
+    const s = statuses[provider] || {};
+    const available = s.available !== false;
+    const status = s.status || 'logged_out';
+    const loggedIn = Boolean(s.logged_in);
+    let pillText = loggedIn ? 'logged in' : status === 'pending' ? 'awaiting browser…' : status === 'error' ? 'error' : 'not logged in';
+    if (!available) pillText = 'CLI not found';
+    const pillClass = loggedIn ? 'running' : status === 'pending' ? 'queued' : status === 'error' ? 'error' : 'muted';
+    const label = s.account_label ? ` — ${escHtml(s.account_label)}` : '';
+    const loginDisabled = !available ? ' disabled' : '';
+    const loginLabel = loggedIn ? 'Re-login' : 'Login';
+    return `
+      <div class="cs-subscription-row" data-provider="${provider}">
+        <div class="cs-subscription-info">
+          <strong>${provider === 'claude' ? 'Claude' : 'Codex'} subscription</strong>
+          <span class="code-station-pill ${pillClass}">${escHtml(pillText)}${label}</span>
+        </div>
+        <div class="cs-subscription-actions">
+          <button type="button" data-code-action="auth-login" data-provider="${provider}"${loginDisabled}>${loginLabel}</button>
+          <button type="button" data-code-action="auth-terminal" data-provider="${provider}"${!available ? ' disabled' : ''}>Terminal</button>
+          ${loggedIn ? `<button type="button" data-code-action="auth-logout" data-provider="${provider}">Logout</button>` : ''}
+        </div>
+      </div>`;
+  }).join('');
+  host.innerHTML = `
+    <div class="cs-subscription-head">
+      <span class="code-station-label">Subscription login</span>
+      <button type="button" class="code-station-icon-btn small" data-code-action="auth-refresh" title="Refresh login status" aria-label="Refresh login status">↻</button>
+    </div>
+    ${rows}
+    <div id="code-subscription-note" class="code-station-muted"></div>`;
+}
+
+function setSubscriptionNote(text) {
+  const note = q('#code-subscription-note');
+  if (note) note.textContent = text || '';
+}
+
+async function startSubscriptionLogin(provider, button) {
+  if (!provider) return;
+  setButtonBusy(button, true);
+  try {
+    await api(`/api/coding/provider/auth/${encodeURIComponent(provider)}/login`, { method: 'POST', body: {} });
+    setSubscriptionNote(`A browser window should open to finish the ${provider} login. This updates automatically when done.`);
+    await loadAuthStatus();
+    renderSubscriptionLogin();
+    pollAuthStatus(provider);
+  } catch (err) {
+    toast(err?.message || `Could not start ${provider} login`);
+  } finally {
+    setButtonBusy(button, false);
+  }
+}
+
+async function logoutSubscription(provider, button) {
+  if (!provider) return;
+  setButtonBusy(button, true);
+  try {
+    await api(`/api/coding/provider/auth/${encodeURIComponent(provider)}/logout`, { method: 'POST', body: {} });
+    stopAuthPoll(provider);
+    await loadAuthStatus();
+    renderSubscriptionLogin();
+    // Login state changed → refresh the provider catalog so dropdowns reflect it.
+    await loadProviders(state.providersHarness || state.selectedThread?.harness || 'generic').catch(() => {});
+    renderThreadDetail();
+    toast(`Logged out of ${provider}`);
+  } finally {
+    setButtonBusy(button, false);
+  }
+}
+
+function stopAuthPoll(provider) {
+  const id = _authPolls.get(provider);
+  if (id) { clearInterval(id); _authPolls.delete(provider); }
+}
+
+// Poll login status until the backend's watcher detects completion (it captures the
+// CLI's credential automatically — no terminal interaction needed on the happy path).
+function pollAuthStatus(provider) {
+  stopAuthPoll(provider);
+  let ticks = 0;
+  const id = setInterval(async () => {
+    ticks += 1;
+    if (ticks > 80) { stopAuthPoll(provider); return; } // ~4 min cap (3s ticks)
+    let s = null;
+    try {
+      s = await api(`/api/coding/provider/auth/${encodeURIComponent(provider)}/status`);
+    } catch (_) { return; }
+    if (state.authStatus) state.authStatus[provider] = s; else state.authStatus = { [provider]: s };
+    renderSubscriptionLogin();
+    if (s?.logged_in) {
+      stopAuthPoll(provider);
+      setSubscriptionNote(`${provider} login complete.`);
+      toast(`Logged in to ${provider}`);
+      await loadProviders(state.providersHarness || state.selectedThread?.harness || 'generic').catch(() => {});
+      renderThreadDetail();
+    } else if (s?.status === 'error') {
+      stopAuthPoll(provider);
+      setSubscriptionNote(`${provider} login failed: ${s?.error || 'unknown error'}`);
+    }
+  }, 3000);
+  _authPolls.set(provider, id);
+}
+
+// Open the subscription-login PTY in a self-contained overlay terminal. Reuses the
+// engine-agnostic terminal factory but stays OUT of the pane split-tree (the login
+// session is not a CodingRun). Lets the user see the login URL / complete any
+// interactive step (e.g. `claude setup-token`) the browser flow can't finish on its own.
+function openAuthTerminalOverlay(provider) {
+  if (!provider) return;
+  if (typeof WebSocket === 'undefined') { toast('Terminal not supported in this browser'); return; }
+  // Remove any existing overlay first.
+  document.getElementById('cs-auth-terminal-overlay')?.remove();
+
+  const overlay = document.createElement('div');
+  overlay.id = 'cs-auth-terminal-overlay';
+  overlay.className = 'cs-auth-terminal-overlay';
+  overlay.innerHTML = `
+    <div class="cs-auth-terminal-box">
+      <div class="cs-auth-terminal-head">
+        <strong>${provider === 'claude' ? 'Claude' : 'Codex'} login terminal</strong>
+        <button type="button" class="code-station-icon-btn small" id="cs-auth-terminal-close" aria-label="Close">✕</button>
+      </div>
+      <div class="cs-auth-terminal-body" id="cs-auth-terminal-body"></div>
+    </div>`;
+  document.body.appendChild(overlay);
+
+  const termEl = overlay.querySelector('#cs-auth-terminal-body');
+  let pane;
+  try {
+    pane = createPaneTerminal(termEl);
+  } catch (err) {
+    toast(`Could not open terminal: ${err?.message || err}`);
+    overlay.remove();
+    return;
+  }
+  const { term, fitAddon } = pane;
+  try { fitAddon?.fit?.(); } catch (_) { /* noop */ }
+  const enc = new TextEncoder();
+  const cols = term.cols || 100;
+  const rows = term.rows || 30;
+  const wsBase = (API_BASE || window.location.origin).replace(/^http/, 'ws').replace(/\/$/, '');
+  const ws = new WebSocket(`${wsBase}/api/coding/provider/auth/${encodeURIComponent(provider)}/attach?cols=${cols}&rows=${rows}`);
+  ws.binaryType = 'arraybuffer';
+
+  const cleanup = () => {
+    try { ws.close(); } catch (_) { /* noop */ }
+    try { term.dispose?.(); } catch (_) { /* noop */ }
+    overlay.remove();
+    // Refresh login status after the user closes the terminal.
+    loadAuthStatus().then(() => renderSubscriptionLogin()).catch(() => {});
+  };
+  overlay.querySelector('#cs-auth-terminal-close').addEventListener('click', cleanup);
+  overlay.addEventListener('click', (e) => { if (e.target === overlay) cleanup(); });
+
+  ws.onopen = () => {
+    try { ws.send(JSON.stringify({ type: 'resize', cols, rows })); } catch (_) { /* noop */ }
+    pollAuthStatus(provider); // detect completion while the terminal is open
+  };
+  ws.onmessage = (event) => {
+    if (typeof event.data === 'string') {
+      try {
+        const ctrl = JSON.parse(event.data);
+        if (ctrl?.type === 'exit') term.write('\r\n\x1b[90m- login session ended -\x1b[0m\r\n');
+      } catch (_) { /* ignore */ }
+      return;
+    }
+    try { term.write(new Uint8Array(event.data)); } catch (_) { /* noop */ }
+  };
+  ws.onerror = () => { try { term.write('\r\n\x1b[31m- connection error -\x1b[0m\r\n'); } catch (_) { /* noop */ } };
+  term.onData?.((data) => { if (ws.readyState === WebSocket.OPEN) ws.send(enc.encode(data)); });
 }
 
 async function createProject(form) {
@@ -1285,10 +1547,12 @@ async function createThread(form) {
     toast('Select a project first');
     return;
   }
+    // Title is optional: a blank thread is auto-titled from its first task.
   const title = form.elements.title.value.trim();
-  if (!title) return;
   const cwd = form.elements.cwd.value.trim();
   const harness = form.elements.harness.value || 'generic';
+  const effortEl = form.elements.effort;
+  const effort = effortEl ? (effortEl.value || '') : '';
   const button = form.querySelector('button[type="submit"]');
   setButtonBusy(button, true);
   try {
@@ -1296,7 +1560,7 @@ async function createThread(form) {
       method: 'POST',
       // Link UI-created threads to the active chat so the thread's "Open Chat"
       // button works and coding→chat reporting can find the conversation.
-      body: { title, cwd, harness_id: harness, session_id: currentModelInfo()?.session_id || '' },
+      body: { title, cwd, harness_id: harness, effort, session_id: currentModelInfo()?.session_id || '' },
     });
     form.reset();
     form.setAttribute('hidden', '');
@@ -1327,6 +1591,8 @@ async function selectThread(threadId, options = {}) {
   }
   state.selectedRunId = state.selectedThread?.run_id || '';
   state.selectedRun = normalizeRun(state.selectedThread?.run) || null;
+  // Load the provider catalog for this thread's agent so the detail dropdowns populate.
+  await loadProviders(state.selectedThread?.harness || 'generic').catch(() => {});
   renderAll();
   syncProviderTools({ reset: true, force: true });
   if (options.open !== false) {
@@ -1387,14 +1653,21 @@ async function saveSelectedThread(button) {
   const title = q('#code-thread-title')?.value.trim() || '';
   const cwd = q('#code-thread-cwd')?.value.trim() || '';
   const harness = q('#code-thread-harness')?.value || 'generic';
+  // Omit `provider` when the selector is absent (don't accidentally reset auth_mode);
+  // when present it carries the explicit selection ('none' | 'subscription:x' | 'endpoint:id').
+  const provider = q('#code-thread-provider')?.value || undefined;
   const model = q('#code-thread-model')?.value.trim() || '';
+  const effort = q('#code-thread-effort')?.value || '';
+  const optimisticAuth = expandProviderClient(provider);
   setButtonBusy(button, true);
   try {
     const data = await api(`/api/coding/threads/${encodeURIComponent(state.selectedThreadId)}`, {
       method: 'PATCH',
-      body: { title, cwd, harness_id: harness, model },
+      body: { title, cwd, harness_id: harness, provider, model, effort },
     });
-    state.selectedThread = normalizeThread(data?.thread || { ...state.selectedThread, title, cwd, harness_id: harness, model });
+    state.selectedThread = normalizeThread(data?.thread || {
+      ...state.selectedThread, title, cwd, harness_id: harness, model, effort, ...optimisticAuth,
+    });
     const idx = state.threads.findIndex((thread) => thread.id === state.selectedThreadId);
     if (idx >= 0) state.threads[idx] = state.selectedThread;
     renderAll();
@@ -1457,6 +1730,9 @@ async function runSelectedThread(button) {
   if (!state.selectedThreadId) return;
   const session = focusedSession();
   const harness = q('#code-thread-harness')?.value || state.selectedThread?.harness || 'generic';
+  const provider = q('#code-thread-provider')?.value || undefined;
+  const model = q('#code-thread-model')?.value.trim() || undefined;
+  const effort = q('#code-thread-effort')?.value || undefined;
   const command = q('#code-run-command')?.value || '';
   setButtonBusy(button, true);
   paneNote(`Queueing ${harness} run…`);
@@ -1472,7 +1748,7 @@ async function runSelectedThread(button) {
     const rows = session?.term?.rows || undefined;
     const data = await api(`/api/coding/threads/${encodeURIComponent(state.selectedThreadId)}/run`, {
       method: 'POST',
-      body: { harness_id: harness, command, cols, rows },
+      body: { harness_id: harness, provider, model, effort, command, cols, rows },
     });
     const run = normalizeRun(data?.run || data);
     const runId = asId(data?.run_id ?? run?.id ?? data?.id);
@@ -1612,8 +1888,10 @@ function xtermReady() {
     && window.FitAddon && typeof window.FitAddon.FitAddon === 'function';
 }
 
+const GHOSTTY_WASM_PATH = '/static/lib/ghostty/ghostty-vt.wasm';
+
 // ---- terminal engine: Ghostty (WASM VT core) with xterm.js fallback ----
-// ghostty-web ships a self-contained WASM terminal core + Canvas2D renderer behind an
+// ghostty-web ships a WASM terminal core + Canvas2D renderer behind an
 // xterm.js-compatible API (write / onData / onResize / resize / focus / clear / dispose /
 // cols / rows / loadAddon). It replaces xterm's renderer — the source of the persistent
 // resize/scroll glitches — while the tmux + PTY-over-WebSocket backend stays untouched.
@@ -1621,6 +1899,8 @@ function xtermReady() {
 function ghosttyPresent() {
   return typeof window !== 'undefined'
     && window.GhosttyWeb
+    && window.GhosttyWeb.Ghostty
+    && typeof window.GhosttyWeb.Ghostty.load === 'function'
     && typeof window.GhosttyWeb.Terminal === 'function'
     && typeof window.GhosttyWeb.FitAddon === 'function';
 }
@@ -1628,19 +1908,20 @@ function ghosttyPresent() {
 let _ghosttyInitPromise = null;
 let _ghosttyInitDone = false;
 let _ghosttyInitFailed = false;
+let _ghosttyInstance = null;
 
 // Kick off (exactly once) the async WASM instantiation ghostty-web needs before
 // `new Terminal()`. Resolves true when the Ghostty engine is usable, false to fall back.
 function ensureTerminalEngine() {
   if (_ghosttyInitPromise) return _ghosttyInitPromise;
-  if (!ghosttyPresent() || typeof window.GhosttyWeb.init !== 'function') {
+  if (!ghosttyPresent()) {
     _ghosttyInitFailed = true;
     _ghosttyInitPromise = Promise.resolve(false);
     return _ghosttyInitPromise;
   }
   _ghosttyInitPromise = Promise.resolve()
-    .then(() => window.GhosttyWeb.init())
-    .then(() => { _ghosttyInitDone = true; return true; })
+    .then(() => window.GhosttyWeb.Ghostty.load(GHOSTTY_WASM_PATH))
+    .then((ghostty) => { _ghosttyInstance = ghostty; _ghosttyInitDone = true; return true; })
     .catch((err) => {
       _ghosttyInitFailed = true;
       try { console.error('[code-station] Ghostty WASM init failed; using xterm.js', err); } catch (_) { /* noop */ }
@@ -1651,7 +1932,7 @@ function ensureTerminalEngine() {
 
 // True once the Ghostty engine is instantiated and ready to create terminals.
 function ghosttyReady() {
-  return _ghosttyInitDone && !_ghosttyInitFailed && ghosttyPresent();
+  return _ghosttyInitDone && !_ghosttyInitFailed && !!_ghosttyInstance && ghosttyPresent();
 }
 
 // Which engine a freshly-mounted pane should use right now:
@@ -1671,6 +1952,7 @@ function activeTerminalEngine() {
 function createPaneTerminal(termEl) {
   if (ghosttyReady()) {
     const term = new window.GhosttyWeb.Terminal({
+      ghostty: _ghosttyInstance,
       cursorBlink: true,
       fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace',
       fontSize: 12,
@@ -3074,10 +3356,61 @@ function renderThreadDetail() {
     currentModel: thread ? currentModelInfo() : {},
     backendModelConfig: state.modelConfig,
     harnesses: state.harnesses,
+    providers: state.providers,
+    effortLevels: state.effortLevels,
+    effortSupported: state.effortSupported,
     statusClass,
   });
+  wireThreadDetailControls();
+  renderSubscriptionLogin();
+  if (thread && state.authStatus == null) {
+    // Lazy-load subscription status the first time a thread detail renders.
+    loadAuthStatus().then(() => renderSubscriptionLogin()).catch(() => {});
+  }
   syncProviderTools({ load: false });
   setTerminalControls(Boolean(thread && state.selectedRunId));
+}
+
+// Wire change handlers for the Agent/Provider/Model/Effort dropdowns. Re-run on each
+// detail render (the DOM is replaced). Changing the Agent reloads the provider catalog;
+// changing the Provider refreshes the model suggestions + login hint.
+function wireThreadDetailControls() {
+  const detail = q('#code-thread-detail');
+  if (!detail) return;
+  const harnessSel = detail.querySelector('#code-thread-harness');
+  const providerSel = detail.querySelector('#code-thread-provider');
+  const modelList = detail.querySelector('#code-thread-model-list');
+  const hint = detail.querySelector('#code-thread-provider-hint');
+
+  if (harnessSel) {
+    harnessSel.addEventListener('change', async () => {
+      const h = harnessSel.value || 'generic';
+      if (state.selectedThread) state.selectedThread.harness = h;
+      await loadProviders(h).catch(() => {});
+      renderThreadDetail();
+    });
+  }
+  if (providerSel) {
+    providerSel.addEventListener('change', () => {
+      const pid = providerSel.value;
+      const provider = state.providers.find((p) => p.id === pid);
+      if (modelList) {
+        modelList.replaceChildren();
+        for (const m of (provider?.models || [])) {
+          const opt = document.createElement('option');
+          opt.value = m;
+          modelList.appendChild(opt);
+        }
+      }
+      if (hint) {
+        if (provider && provider.kind === 'subscription' && !provider.logged_in) {
+          hint.textContent = `Not logged in to ${provider.provider}. Use the Subscription login section below.`;
+        } else {
+          hint.textContent = '';
+        }
+      }
+    });
+  }
 }
 
 function renderRunStatus() {
@@ -3548,4 +3881,5 @@ export default {
   openThread,
   selectThread,
   refreshBadges,
+  openAuthTerminalOverlay,
 };

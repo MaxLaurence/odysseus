@@ -22,6 +22,8 @@ from core.database import (
     CodingThreadEvent,
     SessionLocal,
 )
+from src.coding_autotitle import maybe_autotitle_thread
+from src.coding_effort import normalize_effort
 from src.coding_harnesses import build_harness_command, get_harness
 from src.coding_model_config import build_launch_env, thread_model_config
 from src.coding_provider_launch import build_coding_agent_launch_plan
@@ -166,7 +168,17 @@ class CodingRuntimeService:
     ) -> tuple[dict[str, str], dict[str, Any]]:
         env = _sanitize_base_launch_env(os.environ.copy())
         if thread:
-            env.update(build_launch_env(db, run.owner, thread.model_endpoint_id, thread.model))
+            env.update(
+                build_launch_env(
+                    db,
+                    run.owner,
+                    thread.model_endpoint_id,
+                    thread.model,
+                    harness_id=run.harness_id or thread.harness_id,
+                    auth_mode=getattr(thread, "auth_mode", None) or "none",
+                    effort=getattr(thread, "effort", None) or "",
+                )
+            )
         provider_env = self._issue_provider_bridge_env(run, thread)
         env.update(provider_env)
         env = _drop_private_odysseus_env(env)
@@ -303,6 +315,8 @@ class CodingRuntimeService:
         harness_id: str | None = None,
         model_endpoint_id: str | None = None,
         model: str | None = None,
+        effort: str | None = None,
+        auth_mode: str | None = None,
         replace: bool = False,
         idempotency_key: str | None = None,
         metadata: dict[str, Any] | None = None,
@@ -376,6 +390,12 @@ class CodingRuntimeService:
                     thread.model_endpoint_id = model_endpoint_id.strip()
                 if model is not None:
                     thread.model = model.strip()
+                if effort is not None:
+                    thread.effort = normalize_effort(effort)
+                if auth_mode is not None:
+                    cleaned_auth = (auth_mode or "").strip().lower()
+                    if cleaned_auth in ("none", "endpoint", "subscription"):
+                        thread.auth_mode = cleaned_auth
 
                 run_id = str(uuid.uuid4())
                 run_dir = self.run_dir(run_id)
@@ -396,6 +416,8 @@ class CodingRuntimeService:
                     endpoint_url=model_config.get("endpoint_url") or "",
                     run_dir=run_dir,
                     default_harness_command=default_harness_command,
+                    effort=getattr(thread, "effort", None) or "",
+                    auth_mode=getattr(thread, "auth_mode", None) or "none",
                 )
                 built_command = launch_plan.command
                 run_metadata = {
@@ -662,6 +684,9 @@ class CodingRuntimeService:
         # this HTTP route is a fallback for programmatic input.
         await self._pty_bridge.send_input(run.tmux_session, data.replace("\n", "\r").encode("utf-8"))
         await self.append_event(run.thread_id, run.id, "stdin", {"bytes": len(data.encode("utf-8"))})
+        # The first programmatic task delivered to an interactive harness is a good
+        # auto-title signal (chat-driven runs deliver the task this way).
+        await self._maybe_autotitle(run.thread_id, owner, data, run_id=run.id)
         return await self._get_owned_run(run_id, owner)
 
     async def resize(self, run_id: str, owner: str, cols: int, rows: int) -> CodingRun:
@@ -1332,7 +1357,50 @@ class CodingRuntimeService:
             raise CodingRuntimeError(409, f"Cannot clean up active run {run.id}: no runtime resource is tracked")
 
     async def attach_pty(self, websocket, run_id: str, owner: str, cols: int = 120, rows: int = 40) -> None:
-        await self._pty_bridge.attach_pty(websocket, run_id, owner, cols, rows)
+        # Capture the first interactive line typed into the pane so UI-driven threads
+        # (whose keystrokes stream over this WebSocket, not via the HTTP send_stdin
+        # route) still get auto-titled. The callback fires once per first line.
+        buffer: dict[str, str] = {"text": ""}
+        fired = {"done": False}
+
+        def _on_first_input(data: bytes) -> None:
+            if fired["done"]:
+                return
+            try:
+                chunk = data.decode("utf-8", errors="ignore")
+            except Exception:
+                return
+            buffer["text"] += chunk
+            if "\r" in buffer["text"] or "\n" in buffer["text"]:
+                line = buffer["text"].replace("\r", "\n").split("\n", 1)[0].strip()
+                fired["done"] = True
+                if len(line) >= 4:
+                    asyncio.create_task(self._maybe_autotitle_from_run(run_id, owner, line))
+
+        await self._pty_bridge.attach_pty(websocket, run_id, owner, cols, rows, on_input=_on_first_input)
+
+    async def _maybe_autotitle_from_run(self, run_id: str, owner: str, text: str) -> None:
+        db = SessionLocal()
+        try:
+            run = db.query(CodingRun).filter(CodingRun.id == run_id).first()
+            thread_id = run.thread_id if run else None
+        finally:
+            db.close()
+        if thread_id:
+            await self._maybe_autotitle(thread_id, owner, text)
+
+    async def _maybe_autotitle(self, thread_id: str, owner: str, text: str, *, run_id: str | None = None) -> None:
+        """Best-effort, fire-and-forget: title a still-default thread from a task."""
+        try:
+            new_title = await maybe_autotitle_thread(text, thread_id, owner)
+        except Exception:
+            logger.debug("auto-title raised for thread %s", thread_id, exc_info=True)
+            return
+        if new_title:
+            try:
+                await self.append_event(thread_id, run_id, "thread_titled", {"title": new_title})
+            except Exception:
+                logger.debug("failed to broadcast thread_titled for %s", thread_id, exc_info=True)
 
     async def _get_run(self, run_id: str) -> CodingRun | None:
         db = SessionLocal()

@@ -177,7 +177,11 @@ if AUTH_ENABLED:
         "/api/version",
         "/login",
     }
-    AUTH_EXEMPT_PREFIXES = ["/static"]
+    # /api/llm-oauth/* is the OpenAI-compatible subscription gateway. It is called
+    # server-to-server by llm_core (no session cookie) and self-authenticates via its
+    # own opaque `odyoauth:` bearer token (decrypts to owner+provider). See
+    # routes/llm_oauth_routes.py + src/coding_oauth_gateway.py.
+    AUTH_EXEMPT_PREFIXES = ["/static", "/api/llm-oauth"]
     # Dynamic paths whose own handler proves identity via a path-embedded
     # secret instead of the session/bearer auth. The route handler at
     # routes/task_routes.py validates the per-task `webhook_token` itself
@@ -654,6 +658,10 @@ from routes.coding_routes import setup_coding_routes
 app.include_router(setup_coding_routes())
 from routes.coding_provider_routes import setup_coding_provider_routes
 app.include_router(setup_coding_provider_routes(memory_manager, session_manager, memory_vector=memory_vector))
+from routes.coding_auth_routes import setup_coding_auth_routes
+app.include_router(setup_coding_auth_routes())
+from routes.llm_oauth_routes import setup_llm_oauth_routes
+app.include_router(setup_llm_oauth_routes())
 
 # Cookbook (model download/serve/cache, cookbook state sync)
 from routes.cookbook_routes import setup_cookbook_routes

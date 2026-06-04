@@ -166,6 +166,11 @@ def _is_ollama_native_url(url: str) -> bool:
     path = (parsed.path or "").rstrip("/")
     if _host_match(url, "ollama.com"):
         return True
+    # The Odysseus subscription gateway lives on a loopback /api/llm-oauth path; its
+    # leading "/api/" must NOT be mistaken for native Ollama (which would force the
+    # Ollama request format/URL and break the OpenAI-compatible gateway).
+    if path.startswith("/api/llm-oauth"):
+        return False
     local_ollama_host = host in {"localhost", "127.0.0.1", "0.0.0.0", "::1"} or parsed.port == 11434
     return local_ollama_host and (path == "/api" or path.startswith("/api/"))
 
@@ -306,6 +311,14 @@ def _detect_provider(url: str) -> str:
     Unknown hosts fall back to the OpenAI-compatible default, which the
     majority of providers implement.
     """
+    # Odysseus subscription provider: an opaque `odyoauth://<claude|codex>` address
+    # handled IN-PROCESS (no real HTTP host). Detected by scheme so there's no loopback
+    # port to go stale.
+    try:
+        if (urlparse(url or "").scheme or "").lower() == "odyoauth":
+            return "odysseus_oauth"
+    except Exception:
+        pass
     if _is_ollama_native_url(url):
         return "ollama"
     if _host_match(url, "anthropic.com"):
@@ -557,11 +570,18 @@ def _build_anthropic_payload(model, messages, temperature, max_tokens, stream=Fa
     return payload
 
 def _build_anthropic_headers(headers):
-    """Convert Bearer auth to x-api-key for Anthropic."""
+    """Build Anthropic auth headers.
+
+    Default: convert ``Authorization: Bearer <key>`` to ``x-api-key`` (API-key auth).
+    OAuth (Claude subscription): when an ``anthropic-beta`` header is present (the
+    subscription gateway sets ``oauth-2025-04-20``), KEEP ``Authorization: Bearer``
+    as-is — subscription OAuth tokens authenticate via Bearer, not x-api-key.
+    """
     h = {"Content-Type": "application/json", "anthropic-version": "2023-06-01"}
+    is_oauth = bool(headers) and any(k.lower() == "anthropic-beta" for k in headers)
     if headers:
         for k, v in headers.items():
-            if k.lower() == "authorization" and isinstance(v, str) and v.startswith("Bearer "):
+            if (not is_oauth) and k.lower() == "authorization" and isinstance(v, str) and v.startswith("Bearer "):
                 h["x-api-key"] = v[7:]
             else:
                 h[k] = v
@@ -792,10 +812,36 @@ def normalize_model_id(endpoint_url: str, requested: str, timeout: int = LLMConf
             return a
     return None
 
+def _run_coro_blocking(coro):
+    """Run an async coroutine to completion from a SYNC context. Uses asyncio.run when
+    there's no running loop (the usual case — sync llm_call runs in FastAPI's threadpool);
+    otherwise runs it on a fresh loop in a worker thread so we never deadlock."""
+    import asyncio
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coro)
+    import concurrent.futures
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+        return ex.submit(lambda: asyncio.run(coro)).result()
+
+
 def llm_call(url: str, model: str, messages: List[Dict], temperature: float = LLMConfig.DEFAULT_TEMPERATURE,
-             max_tokens: int = LLMConfig.DEFAULT_MAX_TOKENS, headers: Optional[Dict] = None, 
+             max_tokens: int = LLMConfig.DEFAULT_MAX_TOKENS, headers: Optional[Dict] = None,
              timeout: int = LLMConfig.DEFAULT_TIMEOUT, prompt_type: Optional[str] = None) -> str:
     """Synchronous LLM call with optional prompt type enhancement."""
+    if _detect_provider(url) == "odysseus_oauth":
+        from src.coding_oauth_gateway import GatewayError, subscription_complete
+        parsed = _odysseus_oauth_identity(headers if isinstance(headers, dict) else None)
+        if not parsed:
+            raise HTTPException(401, "Subscription endpoint is missing its credential token")
+        owner, sub = parsed
+        try:
+            return _run_coro_blocking(subscription_complete(owner, sub, {
+                "model": model, "messages": messages, "temperature": temperature, "max_tokens": max_tokens,
+            }))
+        except GatewayError as exc:
+            raise HTTPException(exc.status_code, exc.detail)
     h = _provider_headers(_detect_provider(url))
     # Tolerate headers that arrive as a JSON string (some sessions stored them
     # double-encoded) — otherwise h.update() throws "dictionary update sequence
@@ -939,6 +985,49 @@ async def llm_call_async_with_fallback(candidates, messages, **kwargs) -> str:
     raise last_err if last_err else HTTPException(503, "All fallback candidates failed")
 
 
+def _odysseus_oauth_identity(headers: Optional[Dict]):
+    """Parse (owner, subscription_provider) from an odyoauth endpoint's bearer token.
+
+    The endpoint's api_key is an ``odyoauth:`` token (encodes owner+provider); it reaches
+    here as ``Authorization: Bearer …`` in the per-call headers. Returns None if absent."""
+    auth = ""
+    if isinstance(headers, dict):
+        auth = headers.get("Authorization") or headers.get("authorization") or ""
+    try:
+        from src.coding_oauth_gateway import parse_gateway_token
+        return parse_gateway_token(auth)
+    except Exception:
+        return None
+
+
+async def _resolve_oauth_credential(headers: Optional[Dict]):
+    """For an odyoauth endpoint, resolve ((owner, provider), live_credential).
+
+    Returns (None, None) if the token is missing/garbled; ((owner, provider), None) if the
+    owner isn't logged in. The credential is the dict from resolve_subscription_credential
+    (provider/base_url/access_token/headers)."""
+    parsed = _odysseus_oauth_identity(headers)
+    if not parsed:
+        return None, None
+    owner, sub = parsed
+    from src.coding_provider_oauth import resolve_subscription_credential
+    cred = await resolve_subscription_credential(owner, sub)
+    return (owner, sub), cred
+
+
+def _prepend_claude_code_system(payload: Dict) -> None:
+    """Subscription OAuth tokens are scoped to Claude Code: Anthropic 401s them unless the
+    `system` array LEADS with the Claude Code identity block. Prepend it as system[0],
+    keeping the app's own system prompt (and its prompt-cache breakpoint) as the next block."""
+    from src.coding_oauth_gateway import CLAUDE_CODE_SYSTEM
+    blocks = payload.get("system")
+    if isinstance(blocks, str):
+        blocks = [{"type": "text", "text": blocks}]
+    elif not isinstance(blocks, list):
+        blocks = []
+    payload["system"] = [{"type": "text", "text": CLAUDE_CODE_SYSTEM}] + blocks
+
+
 async def llm_call_async(
     url: str,
     model: str,
@@ -952,6 +1041,19 @@ async def llm_call_async(
 ) -> str:
     """Asynchronous LLM call using httpx with connection pooling, timeout, retry logic, and performance logging."""
     provider = _detect_provider(url)
+    if provider == "odysseus_oauth":
+        # Claude/Codex subscription, handled in-process (no HTTP host).
+        from src.coding_oauth_gateway import GatewayError, subscription_complete
+        parsed = _odysseus_oauth_identity(headers)
+        if not parsed:
+            raise HTTPException(401, "Subscription endpoint is missing its credential token")
+        owner, sub = parsed
+        try:
+            return await subscription_complete(owner, sub, {
+                "model": model, "messages": messages, "temperature": temperature, "max_tokens": max_tokens,
+            })
+        except GatewayError as exc:
+            raise HTTPException(exc.status_code, exc.detail)
     messages_copy = _sanitize_llm_messages(messages)
 
     # Consolidate multiple system messages into one at the start.
@@ -1061,6 +1163,46 @@ async def stream_llm(url: str, model: str, messages: List[Dict], temperature: fl
       - data: [DONE]                       — end of stream
     """
     provider = _detect_provider(url)
+    _oauth_claude = False
+    if provider == "odysseus_oauth":
+        # Claude/Codex subscription. To get FULL tool support (the agent needs native
+        # tool_calls, not flattened text), Claude is routed through llm_core's own
+        # Anthropic path below — we just swap in the OAuth bearer + the Claude Code system
+        # block. Codex uses the ChatGPT Responses backend, streamed via the gateway, whose
+        # function calls we re-emit as the app's internal tool_calls SSE.
+        ident, cred = await _resolve_oauth_credential(headers)
+        if ident is None:
+            yield 'data: ' + json.dumps({"delta": "[odysseus] subscription endpoint missing credential token"}) + '\n\n'
+            yield "data: [DONE]\n\n"
+            return
+        owner, sub = ident
+        if cred is None:
+            yield 'data: ' + json.dumps({"delta": f"[odysseus] not logged in to {sub} subscription"}) + '\n\n'
+            yield "data: [DONE]\n\n"
+            return
+        if cred.get("provider") == "anthropic":
+            provider = "anthropic"
+            url = cred["base_url"]
+            headers = {"Authorization": f"Bearer {cred['access_token']}", **(cred.get("headers") or {})}
+            _oauth_claude = True
+            # fall through to the native Anthropic streaming path
+        else:
+            from src.coding_oauth_gateway import subscription_stream_events
+            async for evt in subscription_stream_events(owner, sub, {
+                "model": model, "messages": messages, "temperature": temperature,
+                "max_tokens": max_tokens, "tools": tools,
+            }, cred=cred):
+                etype = evt.get("type")
+                if etype == "text":
+                    if evt.get("text"):
+                        yield 'data: ' + json.dumps({"delta": evt["text"]}) + '\n\n'
+                elif etype == "tool_calls":
+                    yield 'data: ' + json.dumps({"type": "tool_calls", "calls": evt.get("calls") or []}) + '\n\n'
+                elif etype == "error":
+                    yield f'event: error\ndata: {json.dumps({"error": evt.get("error", "subscription error"), "status": evt.get("status", 502)})}\n\n'
+                    return
+            yield "data: [DONE]\n\n"
+            return
     messages_copy = _sanitize_llm_messages(messages)
 
     # Consolidate multiple system messages into one at the start.
@@ -1081,6 +1223,8 @@ async def stream_llm(url: str, model: str, messages: List[Dict], temperature: fl
         target_url = _normalize_anthropic_url(url)
         h = _build_anthropic_headers(headers)
         payload = _build_anthropic_payload(model, messages_copy, temperature, max_tokens, stream=True, tools=tools)
+        if _oauth_claude:
+            _prepend_claude_code_system(payload)
     elif provider == "ollama":
         target_url = _normalize_ollama_url(url)
         h = {"Content-Type": "application/json"}

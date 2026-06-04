@@ -446,7 +446,14 @@ def _classify_endpoint(base_url: str) -> str:
     Includes the Tailscale CGNAT range (100.64.0.0/10) so tailnet-hosted
     servers (e.g. Cookbook serve endpoints) get reachability-probed too."""
     try:
-        host = urlparse(base_url).hostname or ""
+        parsed = urlparse(base_url)
+        # The subscription OAuth gateway is served IN-PROCESS on loopback, but it is NOT
+        # a Cookbook local model server — classify it as 'api' so it isn't pulled into the
+        # local-server reachability probe (which would wrongly mark it offline) or shown
+        # under the "Local" section.
+        if "/api/llm-oauth" in (parsed.path or ""):
+            return "api"
+        host = parsed.hostname or ""
         if host in _LOCAL_HOSTS or host.startswith(_PRIVATE_PREFIXES):
             return "local"
         if _TAILSCALE_RE.match(host):
@@ -460,6 +467,14 @@ def _classify_endpoint(base_url: str) -> str:
 def _probe_endpoint(base_url: str, api_key: str = None, timeout: int = 5) -> List[str]:
     """Probe a base URL's /models endpoint and return list of model IDs.
     For Anthropic, queries their /v1/models API, falling back to hardcoded list."""
+    # Subscription (odyoauth://) endpoints have no HTTP /models — return their curated
+    # set so they're never wrongly marked offline by an (impossible) HTTP probe.
+    if (base_url or "").startswith("odyoauth://"):
+        try:
+            from src.coding_oauth_gateway import curated_models
+            return curated_models(base_url.split("://", 1)[1].split("/", 1)[0])
+        except Exception:
+            return []
     from src.endpoint_resolver import resolve_url
     base = resolve_url(_normalize_base(base_url))
     if _detect_provider(base) == "anthropic":
@@ -544,6 +559,9 @@ def _probe_endpoint(base_url: str, api_key: str = None, timeout: int = 5) -> Lis
 
 def _ping_endpoint(base_url: str, api_key: str = None, timeout: float = 1.5) -> Dict[str, Any]:
     """Reachability probe that does not require installed/listed models."""
+    # Subscription (odyoauth://) endpoints are in-process — always reachable.
+    if (base_url or "").startswith("odyoauth://"):
+        return {"reachable": True, "status_code": 200, "error": None}
     from src.endpoint_resolver import resolve_url
     base = resolve_url(_normalize_base(base_url))
     headers = {}

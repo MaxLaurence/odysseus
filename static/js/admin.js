@@ -302,6 +302,9 @@ function _isLocalEndpoint(url) {
   if (!url) return false;
   try {
     const u = new URL(url);
+    // Subscription OAuth gateway: served on loopback but it's a cloud-subscription
+    // provider, not a local model server — keep it out of the "Local" section.
+    if (u.pathname.includes('/api/llm-oauth')) return false;
     const h = u.hostname.toLowerCase();
     if (h === 'localhost' || h === '127.0.0.1' || h === '0.0.0.0') return true;
     if (h.endsWith('.local')) return true;
@@ -1018,12 +1021,17 @@ function initEndpointForm() {
   // Collapsible Add-Models subsections (API / Local). Both start collapsed
   // so the card is compact; the last-used state is remembered per section
   // in localStorage so a frequent API-adder doesn't re-expand every time.
-  document.querySelectorAll('#adm-add-api, #adm-add-local').forEach((sec) => {
+  document.querySelectorAll('#adm-add-api, #adm-add-local, #adm-add-subscription').forEach((sec) => {
     const head = sec.querySelector('.adm-section-toggle');
     if (!head) return;
     const key = 'odysseus.addModels.' + sec.id + '.open';
-    let open = false;
-    try { open = localStorage.getItem(key) === '1'; } catch {}
+    // The Subscription (OAuth) section defaults to OPEN for discoverability; others
+    // default collapsed. A stored preference always wins.
+    let open = sec.id === 'adm-add-subscription';
+    try {
+      const stored = localStorage.getItem(key);
+      if (stored !== null) open = stored === '1';
+    } catch {}
     const apply = () => {
       sec.classList.toggle('collapsed', !open);
       head.setAttribute('aria-expanded', open ? 'true' : 'false');
@@ -2041,11 +2049,131 @@ function initDangerZone() {
 }
 
 /* ═══════════════════════════════════════════
+   SUBSCRIPTION (OAuth) PROVIDERS — Claude / Codex
+   Logs in via the provider's own CLI OAuth flow (per owner), then exposes it as a
+   gateway-backed ModelEndpoint usable across the whole app.
+   ═══════════════════════════════════════════ */
+const SUB_PROVIDERS = [
+  { id: 'claude', label: 'Claude' },
+  { id: 'codex', label: 'ChatGPT (Codex)' },
+];
+let _subStatus = {};
+const _subPolls = {};
+
+async function loadSubscriptionAuth() {
+  const host = el('adm-subscription-login');
+  if (!host) return;
+  try {
+    const res = await fetch('/api/coding/provider/auth/status', { credentials: 'same-origin' });
+    const data = res.ok ? await res.json() : null;
+    _subStatus = (data && data.providers) || {};
+  } catch (_) { _subStatus = {}; }
+  renderSubscriptionAuth();
+}
+
+function renderSubscriptionAuth() {
+  const host = el('adm-subscription-login');
+  if (!host) return;
+  host.innerHTML = SUB_PROVIDERS.map((p) => {
+    const s = _subStatus[p.id] || {};
+    const available = s.available !== false;
+    const loggedIn = !!s.logged_in;
+    const status = s.status || 'logged_out';
+    let pill = loggedIn ? 'Logged in' : status === 'pending' ? 'Awaiting browser…' : status === 'error' ? 'Error' : 'Not logged in';
+    if (!available) pill = 'CLI not found';
+    const cls = loggedIn ? 'adm-sub-ok' : status === 'pending' ? 'adm-sub-pending' : status === 'error' ? 'adm-sub-err' : 'adm-sub-muted';
+    // Keep the secondary line short — never dump a raw account UUID.
+    let account = (s.account_label || '').trim();
+    if (account.length > 36) account = account.slice(0, 33) + '…';
+    return `<div class="adm-sub-row" data-provider="${p.id}">
+      <div class="adm-sub-main">
+        <div class="adm-sub-headline">
+          <span class="adm-sub-name">${esc(p.label)}</span>
+          <span class="adm-sub-pill ${cls}">${esc(pill)}</span>
+        </div>
+        ${account ? `<div class="adm-sub-account" title="${esc(s.account_label || '')}">${esc(account)}</div>` : ''}
+      </div>
+      <div class="adm-sub-actions">
+        <button class="admin-btn-sm" data-sub-login="${p.id}"${available ? '' : ' disabled'}>${loggedIn ? 'Re-login' : 'Login'}</button>
+        <button class="admin-btn-sm" data-sub-terminal="${p.id}"${available ? '' : ' disabled'}>Terminal</button>
+        <button class="admin-btn-sm adm-sub-primary" data-sub-add="${p.id}"${loggedIn ? '' : ' disabled'} title="Add as a model provider usable across the app">Add as provider</button>
+        ${loggedIn ? `<button class="admin-btn-sm adm-sub-ghost" data-sub-logout="${p.id}">Logout</button>` : ''}
+      </div>
+    </div>`;
+  }).join('') + `<div id="adm-sub-msg" class="adm-ep-inline-msg"></div>`;
+  host.querySelectorAll('[data-sub-login]').forEach((b) => b.addEventListener('click', () => subLogin(b.dataset.subLogin)));
+  host.querySelectorAll('[data-sub-terminal]').forEach((b) => b.addEventListener('click', () => window.codeStationModule?.openAuthTerminalOverlay?.(b.dataset.subTerminal)));
+  host.querySelectorAll('[data-sub-add]').forEach((b) => b.addEventListener('click', () => subAddProvider(b.dataset.subAdd, b)));
+  host.querySelectorAll('[data-sub-logout]').forEach((b) => b.addEventListener('click', () => subLogout(b.dataset.subLogout)));
+}
+
+function _subMsg(text) { const m = el('adm-sub-msg'); if (m) m.textContent = text || ''; }
+
+async function subLogin(provider) {
+  try {
+    const res = await fetch(`/api/coding/provider/auth/${provider}/login`, {
+      method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' }, body: '{}',
+    });
+    if (!res.ok) { const d = await res.json().catch(() => ({})); _subMsg(d.detail || 'Login failed to start'); return; }
+    _subMsg('A browser window should open to finish login. Use "Terminal" to see the prompt; this updates automatically.');
+    window.codeStationModule?.openAuthTerminalOverlay?.(provider);
+    _pollSub(provider);
+  } catch (e) { _subMsg('Login error: ' + e.message); }
+}
+
+function _pollSub(provider) {
+  if (_subPolls[provider]) clearInterval(_subPolls[provider]);
+  let n = 0;
+  _subPolls[provider] = setInterval(async () => {
+    n += 1;
+    if (n > 80) { clearInterval(_subPolls[provider]); return; }  // ~4 min cap
+    let s = null;
+    try { s = await (await fetch(`/api/coding/provider/auth/${provider}/status`, { credentials: 'same-origin' })).json(); } catch (_) { return; }
+    _subStatus[provider] = s;
+    renderSubscriptionAuth();
+    if (s && s.logged_in) {
+      clearInterval(_subPolls[provider]);
+      _subMsg(`${provider} logged in — adding as a model provider…`);
+      await subAddProvider(provider);
+    } else if (s && s.status === 'error') {
+      clearInterval(_subPolls[provider]);
+      _subMsg(`${provider} login failed: ${s.error || ''}`);
+    }
+  }, 3000);
+}
+
+async function subAddProvider(provider, btn) {
+  if (btn) btn.disabled = true;
+  try {
+    const res = await fetch(`/api/coding/provider/auth/${provider}/endpoint`, {
+      method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' }, body: '{}',
+    });
+    const d = await res.json().catch(() => ({}));
+    if (!res.ok) { _subMsg(d.detail || 'Could not add provider'); return; }
+    _subMsg(`Added "${d.name}" — usable across the app.`);
+    await loadEndpoints();
+    try { await settingsModule.refreshAiModelEndpoints?.(); } catch (_) { /* noop */ }
+  } catch (e) { _subMsg('Add failed: ' + e.message); }
+  finally { if (btn) btn.disabled = false; }
+}
+
+async function subLogout(provider) {
+  try {
+    await fetch(`/api/coding/provider/auth/${provider}/logout`, {
+      method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' }, body: '{}',
+    });
+  } catch (_) { /* noop */ }
+  await loadSubscriptionAuth();
+}
+
+function initSubscriptionAuth() { loadSubscriptionAuth(); }
+
+/* ═══════════════════════════════════════════
    INIT & REFRESH
    ═══════════════════════════════════════════ */
 function initAll() {
   modalEl = el('settings-modal');
-  const inits = [initSignupToggle, initAddUser, initEndpointForm, initMcpForm, initCalDAV, initBackup, initDangerZone, () => settingsModule.initIntegrations()];
+  const inits = [initSignupToggle, initAddUser, initEndpointForm, initSubscriptionAuth, initMcpForm, initCalDAV, initBackup, initDangerZone, () => settingsModule.initIntegrations()];
   for (const fn of inits) {
     try { fn(); } catch (e) { console.error('Admin init error in', fn.name || 'anonymous', e); }
   }
@@ -2056,6 +2184,7 @@ function initAll() {
 function refreshAll() {
   loadUsers();
   loadEndpoints();
+  loadSubscriptionAuth();
   loadBuiltinTools();
   loadMcpServers();
 }

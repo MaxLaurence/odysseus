@@ -131,8 +131,28 @@ def thread_model_config(db, thread) -> dict[str, Any]:
     return config
 
 
-def build_launch_env(db, owner: str | None, endpoint_id: str | None, model: str | None) -> dict[str, str]:
-    """Build per-run env, including secrets only for process injection."""
+def build_launch_env(
+    db,
+    owner: str | None,
+    endpoint_id: str | None,
+    model: str | None,
+    *,
+    harness_id: str | None = "",
+    auth_mode: str | None = "none",
+    effort: str | None = "",
+) -> dict[str, str]:
+    """Build per-run env, including secrets only for process injection.
+
+    ``auth_mode`` controls how the agent CLI authenticates:
+      - "subscription": inject the owner's managed CLI OAuth login (isolated config
+        dir / token); do NOT inject an endpoint api-key.
+      - "endpoint" / "none": inject the configured ModelEndpoint api-key (legacy
+        behavior — "none" stays endpoint-driven so pre-existing threads are unchanged).
+    ``harness_id`` selects harness-specific env (Claude gets ANTHROPIC_* + thinking
+    budget); ``effort`` is the normalized reasoning level.
+    """
+    harness = (harness_id or "").strip().lower()
+    auth_mode = (auth_mode or "none").strip().lower() or "none"
     endpoint = None
     endpoint_id = (endpoint_id or "").strip()
     if endpoint_id:
@@ -146,12 +166,39 @@ def build_launch_env(db, owner: str | None, endpoint_id: str | None, model: str 
     config = _endpoint_config(endpoint, model or "")
     env = dict(config["env"])
     api_key = getattr(endpoint, "api_key", None) if endpoint else None
-    if api_key:
+
+    if auth_mode == "subscription":
+        # Subscription login: point the CLI at the owner's isolated OAuth credential
+        # dir / token instead of an api-key. Imported lazily to avoid an import cycle.
+        try:
+            from src.coding_auth_service import subscription_launch_env
+            env.update(subscription_launch_env(db, owner, harness))
+        except Exception:
+            pass
+    elif api_key:
         env["OPENAI_API_KEY"] = api_key
         env["CODEX_API_KEY"] = api_key
         host = (urlparse(config["endpoint_url"]).hostname or "").lower()
-        if host.endswith("anthropic.com"):
+        if harness == "claude":
+            # Claude harness against ANY api-key endpoint: wire the Anthropic envs so
+            # a non-anthropic.com proxy works too (closes the ANTHROPIC_BASE_URL gap).
+            if config["endpoint_url"]:
+                env["ANTHROPIC_BASE_URL"] = config["endpoint_url"]
             env["ANTHROPIC_API_KEY"] = api_key
+            if config["model"]:
+                env["ANTHROPIC_MODEL"] = config["model"]
+        elif host.endswith("anthropic.com"):
+            env["ANTHROPIC_API_KEY"] = api_key
+
+    # Effort: Claude applies it via env (Codex effort is a launch arg, set in the
+    # launch plan). Harnesses without a wired knob get nothing.
+    if harness == "claude":
+        try:
+            from src.coding_effort import claude_effort_env
+            env.update(claude_effort_env(effort))
+        except Exception:
+            pass
+
     return env
 
 

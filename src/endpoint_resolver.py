@@ -6,6 +6,7 @@ Consolidates the 4+ copies of normalize_base / resolve_endpoint logic into one p
 
 import json
 import logging
+import os
 import socket
 import subprocess
 from typing import Optional, Tuple, Dict
@@ -15,6 +16,28 @@ from src.database import SessionLocal, ModelEndpoint
 from src.llm_core import _detect_provider, _host_match
 
 logger = logging.getLogger(__name__)
+
+
+def _gateway_live_port() -> str:
+    """The port THIS backend is actually bound to (set by the launcher). Never 7000 —
+    macOS AirPlay holds it; dev defaults to 7860."""
+    return (os.environ.get("ODYSSEUS_PORT") or os.environ.get("APP_PORT") or "7860").strip()
+
+
+def _rewrite_gateway_url(url: str) -> Optional[str]:
+    """If ``url`` is a subscription-gateway URL, force it onto the LIVE loopback port.
+
+    The gateway is served in-process on a port the launcher picks per run, so a port
+    baked into the stored endpoint URL goes stale across restarts (-> connection
+    refused). Rewriting to 127.0.0.1:<current ODYSSEUS_PORT> on every use makes the
+    loopback call always reach this very backend. Returns None for non-gateway URLs."""
+    try:
+        parsed = urlparse(url or "")
+    except Exception:
+        return None
+    if "/api/llm-oauth" not in (parsed.path or ""):
+        return None
+    return urlunparse(parsed._replace(netloc=f"127.0.0.1:{_gateway_live_port()}"))
 
 # Model-name substrings that are NOT chat/generation models. When an endpoint
 # has no explicit model configured we pick the first CHAT model from its list —
@@ -116,6 +139,12 @@ def _resolve_tailscale_host(hostname: str) -> Optional[str]:
 
 def resolve_url(url: str) -> str:
     """If a URL's hostname can't be resolved via DNS, try Tailscale."""
+    # odyoauth:// subscription endpoints are opaque/in-process — leave untouched.
+    if (url or "").startswith("odyoauth://"):
+        return url
+    gateway = _rewrite_gateway_url(url)
+    if gateway is not None:
+        return gateway
     parsed = urlparse(url)
     hostname = parsed.hostname
     if not hostname:
@@ -133,6 +162,8 @@ def resolve_url(url: str) -> str:
 def normalize_base(url: str) -> str:
     """Strip known API path suffixes from a base URL."""
     url = (url or "").strip().rstrip("/")
+    if url.startswith("odyoauth://"):
+        return url  # opaque subscription address — no suffixes to strip
     for suffix in ["/models", "/chat/completions", "/completions", "/v1/messages"]:
         if url.endswith(suffix):
             url = url[: -len(suffix)].rstrip("/")
@@ -167,6 +198,8 @@ def build_chat_url(base: str) -> str:
     """Return the correct chat endpoint URL for a given base."""
     base = resolve_url(base)
     provider = _detect_provider(base)
+    if provider == "odysseus_oauth":
+        return base  # opaque; llm_core handles odyoauth in-process (no HTTP URL)
     if provider == "anthropic":
         return _anthropic_api_root(base) + "/v1/messages"
     if provider == "ollama":
@@ -178,6 +211,8 @@ def build_models_url(base: str) -> str:
     """Return the provider-specific model-list endpoint URL for a base."""
     base = resolve_url(base)
     provider = _detect_provider(base)
+    if provider == "odysseus_oauth":
+        return base
     if provider == "anthropic":
         return _anthropic_api_root(base) + "/v1/models"
     if provider == "ollama":
@@ -189,6 +224,12 @@ def build_headers(api_key: Optional[str], base: str) -> Dict[str, str]:
     """Build auth headers for an endpoint."""
     provider = _detect_provider(base)
     headers: Dict[str, str] = {}
+    if provider == "odysseus_oauth":
+        # Carry the odyoauth capability token (owner+provider) so llm_core can resolve
+        # the real subscription credential in-process.
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+        return headers
     if provider == "anthropic":
         if api_key:
             headers["x-api-key"] = api_key

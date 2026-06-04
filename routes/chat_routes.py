@@ -62,8 +62,13 @@ def _stream_set(session_id: str, **fields) -> None:
 def _session_url_matches_endpoint(session_url: str, endpoint_base: str) -> bool:
     if not session_url or not endpoint_base:
         return False
-    sess = session_url.rstrip("/")
-    base = _normalize_base(endpoint_base).rstrip("/")
+    from src.endpoint_resolver import resolve_url
+    # Normalize BOTH sides through resolve_url so a subscription-gateway URL matches
+    # regardless of the loopback port it was stored with (the packaged app's port
+    # changes per launch — without this the orphan guard wrongly reports "endpoint
+    # was removed" after a restart).
+    sess = resolve_url(session_url.rstrip("/")).rstrip("/")
+    base = _normalize_base(resolve_url(endpoint_base)).rstrip("/")
     variants = {
         base,
         base + "/chat/completions",

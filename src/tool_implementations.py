@@ -1105,6 +1105,8 @@ def _coding_thread_dict(thread, model_config: Optional[Dict[str, Any]] = None) -
         "harness_id": thread.harness_id or "generic",
         "model_endpoint_id": thread.model_endpoint_id or "",
         "model": thread.model or "",
+        "effort": getattr(thread, "effort", None) or "",
+        "auth_mode": getattr(thread, "auth_mode", None) or "none",
         "pinned_at": _coding_iso(thread.pinned_at),
         "status": thread.status or "idle",
         "last_run_id": thread.last_run_id,
@@ -1319,6 +1321,8 @@ async def do_manage_coding(
                         harness_id=args.get("harness_id"),
                         model_endpoint_id=args.get("model_endpoint_id"),
                         model=args.get("model"),
+                        effort=args.get("effort"),
+                        auth_mode=args.get("auth_mode"),
                         replace=bool(args.get("replace", False)),
                         idempotency_key=args.get("idempotency_key"),
                         metadata=args.get("metadata") if isinstance(args.get("metadata"), dict) else None,
@@ -1539,16 +1543,26 @@ async def do_manage_coding(
                 except ValueError as exc:
                     return _coding_error(str(exc), 400)
                 default_config = derive_odysseus_model_config(db, owner_key)
-                endpoint_id = (
-                    args.get("model_endpoint_id")
-                    if args.get("model_endpoint_id") is not None
-                    else (project.default_endpoint_id or default_config.get("endpoint_id") or "")
-                )
+                # A `provider` selector (subscription:<x> / endpoint:<id>) maps to
+                # auth_mode + endpoint and overrides explicit endpoint/auth_mode args.
+                from src.coding_providers import cascade_auth_mode, cascade_effort, expand_provider_selector
+                provider_sel = expand_provider_selector(args.get("provider"))
+                explicit_auth_mode = provider_sel["auth_mode"] if provider_sel else args.get("auth_mode")
+                if provider_sel is not None:
+                    endpoint_id = provider_sel["model_endpoint_id"]
+                else:
+                    endpoint_id = (
+                        args.get("model_endpoint_id")
+                        if args.get("model_endpoint_id") is not None
+                        else (project.default_endpoint_id or default_config.get("endpoint_id") or "")
+                    )
                 model = (
                     args.get("model")
                     if args.get("model") is not None
                     else (project.default_model or default_config.get("model") or "")
                 )
+                effort = cascade_effort(args.get("effort"), project)
+                auth_mode = cascade_auth_mode(explicit_auth_mode, project)
                 metadata = args.get("metadata") if isinstance(args.get("metadata"), dict) else {}
                 title = (args.get("title") or project.name or "Coding Thread").strip()
                 thread = CodingThread(
@@ -1561,6 +1575,8 @@ async def do_manage_coding(
                     harness_id=harness_id,
                     model_endpoint_id=(endpoint_id or "").strip(),
                     model=(model or "").strip(),
+                    effort=effort or None,
+                    auth_mode=auth_mode,
                     pinned_at=datetime.utcnow() if bool(args.get("pinned", False)) else None,
                     status="idle",
                     issue_id=(args.get("issue_id") or "").strip() or None,
@@ -1669,10 +1685,20 @@ async def do_manage_coding(
                         thread.session_id = str(args.get("session_id") or "").strip() or None
                     if args.get("issue_id") is not None:
                         thread.issue_id = str(args.get("issue_id") or "").strip() or None
+                    from src.coding_effort import normalize_effort
+                    from src.coding_providers import expand_provider_selector, normalize_auth_mode
+                    provider_sel = expand_provider_selector(args.get("provider"))
+                    if provider_sel is not None:
+                        thread.auth_mode = provider_sel["auth_mode"]
+                        thread.model_endpoint_id = provider_sel["model_endpoint_id"]
                     if args.get("model_endpoint_id") is not None:
                         thread.model_endpoint_id = str(args.get("model_endpoint_id") or "").strip()
                     if args.get("model") is not None:
                         thread.model = str(args.get("model") or "").strip()
+                    if args.get("effort") is not None:
+                        thread.effort = normalize_effort(str(args.get("effort") or "")) or None
+                    if args.get("auth_mode") is not None:
+                        thread.auth_mode = normalize_auth_mode(str(args.get("auth_mode") or ""))
                     if args.get("metadata") is not None:
                         if not isinstance(args.get("metadata"), dict):
                             return _coding_error("metadata must be an object")

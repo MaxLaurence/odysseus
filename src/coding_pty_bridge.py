@@ -336,8 +336,19 @@ class CodingPtyBridge:
 
     # ---- WebSocket bridge -----------------------------------------------
 
-    async def attach_pty(self, websocket, run_id: str, owner: str, cols: int = 120, rows: int = 40) -> None:
-        """Bridge a WebSocket to the run's dtach session through a real PTY."""
+    async def attach_pty(
+        self,
+        websocket,
+        run_id: str,
+        owner: str,
+        cols: int = 120,
+        rows: int = 40,
+        on_input: Callable[[bytes], None] | None = None,
+    ) -> None:
+        """Bridge a WebSocket to the run's dtach session through a real PTY.
+
+        ``on_input`` (optional) is called with each chunk of input bytes the client
+        sends — used by the runtime to auto-title a thread from the first typed line."""
         cols = max(20, min(int(cols or 120), 400))
         rows = max(5, min(int(rows or 40), 120))
         run = await self._get_owned_run(run_id, owner)
@@ -375,6 +386,52 @@ class CodingPtyBridge:
                 pass
             return
 
+        await self._bridge_ws(websocket, name, cols, rows, on_input=on_input)
+
+    async def attach_session(
+        self,
+        websocket,
+        name: str,
+        *,
+        cols: int = 100,
+        rows: int = 30,
+        log_path: Path | None = None,
+    ) -> None:
+        """Bridge a WebSocket to an arbitrary (non-run) dtach session by name.
+
+        Used for the subscription-login PTYs (``CodingAuthService``), which are not
+        backed by a ``CodingRun``. Identical transport to ``attach_pty`` but without
+        the run lookup; replays ``log_path`` history when the session is not alive."""
+        cols = max(20, min(int(cols or 100), 400))
+        rows = max(5, min(int(rows or 30), 120))
+        if not name or not await self.has_session(name):
+            try:
+                if log_path and Path(log_path).exists():
+                    data = Path(log_path).read_bytes()
+                    for i in range(0, len(data), 65536):
+                        await websocket.send_bytes(data[i:i + 65536])
+            except Exception:
+                self._logger.debug("session history replay failed", exc_info=True)
+            try:
+                await websocket.send_json({"type": "exit", "exit_code": None})
+            except Exception:
+                pass
+            return
+        await self._bridge_ws(websocket, name, cols, rows)
+
+    async def _bridge_ws(
+        self,
+        websocket,
+        name: str,
+        cols: int,
+        rows: int,
+        on_input: Callable[[bytes], None] | None = None,
+    ) -> None:
+        """Shared PTY<->WebSocket bridge for a live dtach session (used by both
+        ``attach_pty`` and ``attach_session``). Detaching leaves the session alive.
+
+        ``on_input`` (optional) observes client input bytes; failures are swallowed so
+        a buggy observer can never wedge the terminal."""
         master, slave = pty.openpty()
         self._set_winsize(master, rows, cols)
         proc = await self._spawn_attach(name, slave)
@@ -402,6 +459,14 @@ class CodingPtyBridge:
 
         loop.add_reader(master, _on_readable)
 
+        def _observe_input(data: bytes) -> None:
+            if on_input is None:
+                return
+            try:
+                on_input(data)
+            except Exception:
+                self._logger.debug("on_input observer raised", exc_info=True)
+
         async def _pump_out() -> None:
             while True:
                 data = await out_queue.get()
@@ -416,6 +481,7 @@ class CodingPtyBridge:
                     return
                 if msg.get("bytes") is not None:
                     os.write(master, msg["bytes"])
+                    _observe_input(msg["bytes"])
                 elif msg.get("text") is not None:
                     try:
                         ctrl = json.loads(msg["text"])
@@ -433,7 +499,9 @@ class CodingPtyBridge:
                         except Exception:
                             pass
                     elif ctrl.get("type") == "input" and ctrl.get("data") is not None:
-                        os.write(master, str(ctrl["data"]).encode("utf-8"))
+                        payload = str(ctrl["data"]).encode("utf-8")
+                        os.write(master, payload)
+                        _observe_input(payload)
 
         out_task = asyncio.create_task(_pump_out())
         in_task = asyncio.create_task(_pump_in())

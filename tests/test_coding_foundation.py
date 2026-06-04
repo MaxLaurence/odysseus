@@ -497,7 +497,7 @@ def test_launch_environment_strips_private_odysseus_env_and_preserves_provider_a
     monkeypatch.setattr(
         coding_runtime,
         "build_launch_env",
-        lambda _db, _owner, _endpoint_id, _model: {
+        lambda _db, _owner, _endpoint_id, _model, **_kwargs: {
             "OPENAI_API_KEY": "model-token",
             "OPENAI_MODEL": "model-from-thread",
             "ODYSSEUS_INTERNAL_TOKEN": "model-should-not-pass",

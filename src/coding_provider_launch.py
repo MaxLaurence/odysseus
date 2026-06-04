@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from src.coding_effort import codex_effort_config_args, effort_supported, normalize_effort
 from src.coding_provider_bridge import scripts_dir
 
 
@@ -255,21 +256,34 @@ def build_coding_agent_launch_plan(
     endpoint_url: str | None = "",
     run_dir: Path | None = None,
     default_harness_command: bool = True,
+    effort: str | None = None,
+    auth_mode: str | None = None,
 ) -> CodingAgentLaunchPlan:
     """Return a harness command plus visible launch metadata.
 
     We only rewrite default Pi/Codex harness commands. A caller-provided shell
     command is treated as an explicit override, but still gets the provider
     bridge environment and `odysseus-tool` on PATH at runtime.
+
+    ``effort`` is a normalized reasoning level (see src/coding_effort.py): for Codex
+    it becomes a ``-c model_reasoning_effort=`` launch arg; for Claude it is applied
+    via env (built in coding_model_config) so only metadata is recorded here.
+    ``auth_mode`` ("none"|"endpoint"|"subscription") is recorded for observability;
+    the credential env it implies is injected in coding_model_config.build_launch_env.
     """
     harness = (harness_id or "").strip().lower()
     configured_model = (model or "").strip()
     endpoint_url = (endpoint_url or "").strip().rstrip("/")
+    normalized_effort = normalize_effort(effort)
+    normalized_auth_mode = (auth_mode or "none").strip().lower() or "none"
     metadata: dict[str, Any] = {
         "harness_id": harness,
         "base_command": base_command,
         "default_harness_command": bool(default_harness_command),
         "configured_model": configured_model,
+        "effort": normalized_effort,
+        "effort_applied": bool(normalized_effort) and effort_supported(harness),
+        "auth_mode": normalized_auth_mode,
         "model_explicit": False,
         "provider_tools": {
             "mode": "cli",
@@ -329,6 +343,10 @@ def build_coding_agent_launch_plan(
             parts.extend(["--model", configured_model])
             metadata["model_explicit"] = True
             metadata["model_arg"] = "--model"
+        effort_args = codex_effort_config_args(normalized_effort)
+        if effort_args:
+            parts.extend(effort_args)
+            metadata["effort_arg"] = effort_args[-1]
         if endpoint_url:
             parts.extend(["--config", f"openai_base_url={_toml_string(endpoint_url)}"])
             metadata["endpoint_config_arg"] = "openai_base_url"
@@ -363,6 +381,12 @@ def build_coding_agent_launch_plan(
         # Per-turn task-slot gating via `--settings` (leaves global/project config
         # and auth intact): UserPromptSubmit acquires, Stop/StopFailure releases.
         parts = ["claude"]
+        if configured_model:
+            # `--model` overrides the ANTHROPIC_MODEL env and the session default,
+            # so model selection works for both subscription and api-key auth.
+            parts.extend(["--model", configured_model])
+            metadata["model_explicit"] = True
+            metadata["model_arg"] = "--model"
         if run_dir is not None:
             acquire, release = _write_task_hook_scripts(run_dir)
             state_script = _write_state_hook_script(run_dir)

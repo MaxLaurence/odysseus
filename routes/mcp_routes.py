@@ -13,6 +13,7 @@ import httpx
 from core.database import McpServer, SessionLocal
 from core.middleware import require_admin
 from src.mcp_manager import McpManager
+from src.settings_scrub import scrub_settings
 
 logger = logging.getLogger(__name__)
 
@@ -78,7 +79,7 @@ def setup_mcp_routes(mcp_manager: McpManager):
                     "transport": srv.transport,
                     "command": srv.command,
                     "args": json.loads(srv.args) if srv.args else [],
-                    "env": json.loads(srv.env) if srv.env else {},
+                    "env": scrub_settings(json.loads(srv.env) if srv.env else {}),
                     "url": srv.url,
                     "is_enabled": srv.is_enabled,
                     "status": status.get("status", "disconnected"),

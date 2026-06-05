@@ -695,6 +695,40 @@ def test_require_admin_allows_when_auth_explicitly_disabled(monkeypatch):
     assert require_admin(_Req()) is None
 
 
+def test_internal_admin_token_requires_direct_loopback(monkeypatch):
+    from types import SimpleNamespace
+
+    from fastapi import HTTPException
+    from core.middleware import INTERNAL_TOOL_HEADER, INTERNAL_TOOL_TOKEN, require_admin
+
+    monkeypatch.setenv("AUTH_ENABLED", "true")
+
+    class _Mgr:
+        is_configured = True
+
+        def is_admin(self, _user):
+            return False
+
+    def _req(host, headers=None):
+        return SimpleNamespace(
+            headers={INTERNAL_TOOL_HEADER: INTERNAL_TOOL_TOKEN, **(headers or {})},
+            client=SimpleNamespace(host=host),
+            state=SimpleNamespace(current_user=None),
+            app=SimpleNamespace(state=SimpleNamespace(auth_manager=_Mgr())),
+        )
+
+    assert require_admin(_req("127.0.0.1")) is None
+    with pytest.raises(HTTPException):
+        require_admin(_req("100.64.0.8"))
+    for header, value in (
+        ("x-forwarded-for", "100.64.0.8"),
+        ("x-forwarded-proto", "https"),
+        ("fly-client-ip", "100.64.0.8"),
+    ):
+        with pytest.raises(HTTPException):
+            require_admin(_req("127.0.0.1", {header: value}))
+
+
 def test_internal_tool_owner_header_logic_requires_known_user():
     """Pin the owner-attribution branch used by app.AuthMiddleware without
     booting the full FastAPI app."""

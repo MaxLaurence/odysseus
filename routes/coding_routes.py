@@ -26,7 +26,7 @@ from core.database import (
     ModelEndpoint,
     SessionLocal,
 )
-from core.middleware import INTERNAL_TOOL_HEADER, INTERNAL_TOOL_TOKEN, require_admin
+from core.middleware import INTERNAL_TOOL_HEADER, INTERNAL_TOOL_TOKEN, is_direct_loopback_host, require_admin
 from src.auth_helpers import require_user
 from src.coding_effort import normalize_effort
 from src.coding_harnesses import get_harness, list_harnesses
@@ -49,7 +49,6 @@ from src.coding_workspace import get_coding_workspace_service
 from src.coding_worktrees import get_coding_worktree_service
 from src.coding_task_slots import get_task_slot_service
 from src.settings import DEFAULT_SETTINGS, load_settings, save_settings
-
 
 def _json_loads(value: str | None, fallback: Any) -> Any:
     if not value:
@@ -76,9 +75,15 @@ def _websocket_client_host(websocket: WebSocket) -> str:
     return (client.host if client else "") or ""
 
 
+def _websocket_trusted_loopback(websocket: WebSocket) -> bool:
+    return is_direct_loopback_host(_websocket_client_host(websocket), websocket.headers)
+
+
 def _websocket_internal_owner(websocket: WebSocket) -> str | None:
     try:
         if websocket.headers.get(INTERNAL_TOOL_HEADER) != INTERNAL_TOOL_TOKEN:
+            return None
+        if not _websocket_trusted_loopback(websocket):
             return None
         return (websocket.headers.get("X-Odysseus-Owner") or "").strip() or "internal-tool"
     except Exception:
@@ -97,7 +102,7 @@ def _websocket_owner(websocket: WebSocket) -> str | None:
             return None
         return auth_manager.get_username_for_token(token) or ""
 
-    if _websocket_client_host(websocket) not in ("127.0.0.1", "::1", "localhost"):
+    if not _websocket_trusted_loopback(websocket):
         return None
     return ""
 
@@ -549,6 +554,7 @@ def setup_coding_routes() -> APIRouter:
 
     @router.post("/spaces/{space_id}/worktrees")
     async def create_worktree(request: Request, space_id: str, body: WorktreeCreate):
+        require_admin(request)
         owner = _owner(request)
         try:
             return {"worktree": worktrees.create_worktree(
@@ -567,6 +573,7 @@ def setup_coding_routes() -> APIRouter:
 
     @router.delete("/worktrees/{worktree_space_id}")
     async def remove_worktree(request: Request, worktree_space_id: str, force: bool = Query(False)):
+        require_admin(request)
         owner = _owner(request)
         try:
             worktrees.remove_worktree(owner, worktree_space_id, force=force)
@@ -1006,8 +1013,6 @@ def setup_coding_routes() -> APIRouter:
         finally:
             db.close()
 
-        # Concurrency is a single owner-wide pool shared across projects; pump globally.
-        await runtime.pump_queue(owner=owner)
         db = SessionLocal()
         try:
             # Owner-global rows joined with thread + project so the UI can attribute
@@ -1072,9 +1077,19 @@ def setup_coding_routes() -> APIRouter:
     @router.get("/runtime/active-tasks")
     async def runtime_active_tasks(request: Request):
         # Machine-level count (all owners) backing the desktop quit prompt. Side
-        # effect free — unlike /queue it does NOT pump, so it's safe on a quit path.
+        # effect free, so it's safe on a quit path.
         require_admin(request)
         return {"active": runtime.active_run_count()}
+
+    @router.get("/runtime/desktop-status")
+    async def runtime_desktop_status(request: Request):
+        require_admin(request)
+        auth_mgr = getattr(request.app.state, "auth_manager", None)
+        auth_enabled = os.getenv("AUTH_ENABLED", "true").lower() != "false"
+        return {
+            "active": runtime.active_run_count(),
+            "auth_configured": (not auth_enabled) or bool(getattr(auth_mgr, "is_configured", False)),
+        }
 
     @router.post("/runtime/stop-all")
     async def runtime_stop_all(request: Request):
@@ -1083,6 +1098,14 @@ def setup_coding_routes() -> APIRouter:
         require_admin(request)
         stopped = await runtime.stop_all_runs(reason="app quit")
         return {"stopped": stopped}
+
+    @router.post("/runtime/leave-running")
+    async def runtime_leave_running(request: Request):
+        require_admin(request)
+        from src.process_lifecycle import disarm_parent_death_watchdog
+
+        disarm_parent_death_watchdog("desktop leave-running")
+        return {"ok": True}
 
     @router.get("/settings")
     async def get_coding_settings(request: Request):

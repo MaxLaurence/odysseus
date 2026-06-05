@@ -618,8 +618,8 @@ function _stripTaskSecrets(task) {
 function _stripStateSecrets(state) {
   const safe = { ...state };
   if (safe.env && typeof safe.env === 'object') {
-    const { hfToken, ...env } = safe.env;
-    if (hfToken) env.hfToken = hfToken;
+    const { hfToken, _hfTokenDirty, ...env } = safe.env;
+    if (_hfTokenDirty && hfToken) env.hfToken = hfToken;
     safe.env = env;
   }
   if (Array.isArray(safe.tasks)) safe.tasks = safe.tasks.map(_stripTaskSecrets);
@@ -975,11 +975,17 @@ function _syncToServer() {
         serveState: null,
       };
       try { state.serveState = JSON.parse(localStorage.getItem(SERVE_STATE_KEY)); } catch {}
-      await fetch('/api/cookbook/state', {
+      const body = _stripStateSecrets(state);
+      const response = await fetch('/api/cookbook/state', {
         method: 'POST', credentials: 'same-origin',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(_stripStateSecrets(state)),
+        body: JSON.stringify(body),
       });
+      if (response.ok && _envState._hfTokenDirty) {
+        _envState._hfTokenDirty = false;
+        const { hfToken, _hfTokenDirty, ...safeState } = _envState;
+        localStorage.setItem('cookbook-last-state', JSON.stringify(safeState));
+      }
     } catch {}
   }, 400);
 }

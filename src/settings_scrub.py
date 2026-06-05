@@ -15,7 +15,7 @@ on secret-shaped names.
 _SECRET_KEY_PATTERNS = (
     "_api_key", "_apikey", "_password", "_passwd", "_pass", "_pwd",
     "_secret", "_client_secret", "_token", "_access_token", "_refresh_token",
-    "_credential", "_credentials", "_key",
+    "_credential", "_credentials", "_key", "_account_json",
 )
 _SECRET_KEY_ALLOW = ("google_pse_cx",)  # public identifiers, not secrets
 

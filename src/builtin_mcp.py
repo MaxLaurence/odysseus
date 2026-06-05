@@ -12,6 +12,7 @@ import sys
 import asyncio
 
 from core.platform_compat import IS_WINDOWS, which_tool
+from src.child_process_env import safe_child_env
 
 logger = logging.getLogger(__name__)
 
@@ -222,6 +223,7 @@ async def _is_npx_package_cached(npx_path, package_spec, timeout_s=5):
             npx_path, "--no-install", package_spec, "--version",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            env=safe_child_env(),
         )
     except (OSError, ValueError):
         return False

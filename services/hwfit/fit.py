@@ -374,11 +374,33 @@ def analyze_model(model, system, target_quant=None, scoring_use_case=None, targe
         # and RAM modes where llama.cpp serving is the natural path.
         quant_to_try = "Q4_K_M"
 
-    # Multi-GPU filter: skip the row if the resolved quant is a GGUF tier
-    # (Q*/IQ-prefixed) — vLLM/SGLang can't serve those, so showing them on
-    # a 2+ GPU rig just clutters the list with unservable candidates.
+    # Multi-GPU filter: default lists skip GGUF tiers because vLLM/SGLang can't
+    # serve them on a 2+ GPU rig. If the user explicitly selected one, keep the
+    # strict quant in the result and surface it as no_fit instead of silently
+    # falling back to a lower/default tier.
     if gpu_count >= 2 and quant_to_try and quant_to_try.upper().startswith(("Q2", "Q3", "Q4", "Q5", "Q6", "Q8", "IQ")):
-        return None
+        if not target_quant:
+            return None
+        oversized_required = estimate_memory_gb(model, quant_to_try, ctx)
+        return {
+            "name": model.get("name"),
+            "provider": model.get("provider"),
+            "parameter_count": model.get("parameter_count"),
+            "params_b": round(pb, 1),
+            "is_moe": is_moe,
+            "use_case": model_use_case,
+            "fit_level": "too_tight",
+            "run_mode": "no_fit",
+            "quant": quant_to_try,
+            "context": ctx,
+            "required_gb": round(oversized_required, 1),
+            "speed_tps": 0,
+            "score": 0,
+            "scores": {"quality": 0, "speed": 0, "fit": 0, "context": 0},
+            "gguf_sources": model.get("gguf_sources", []),
+            "context_length": model_ctx,
+            "target_context": target_context or None,
+        }
 
     result = _try_quant_at(model, quant_to_try, ctx, effective_vram, 0 if native_gpu_only else eff_ram)
 

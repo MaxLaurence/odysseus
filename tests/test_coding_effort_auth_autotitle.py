@@ -210,24 +210,54 @@ def test_build_launch_env_subscription_codex_sets_codex_home_no_apikey(db_store)
         db.close()
 
 
-def test_build_launch_env_subscription_claude_injects_oauth_token(db_store, monkeypatch):
+def test_build_launch_env_subscription_claude_uses_config_dir_and_onboards(db_store):
+    # Subscription Claude points the CLI at the isolated config dir (the CLI finds the
+    # OAuth login there — file or macOS Keychain) and pre-seeds onboarding/trust flags so
+    # the interactive agent terminal doesn't run the first-run wizard (looking un-logged-in).
+    import json as _json
+    from pathlib import Path
     from src.coding_model_config import build_launch_env
-    from src import coding_auth_service
+    from src import coding_auth_service as a
 
-    SessionLocal, _ = db_store
-
-    class _Row:
-        token_encrypted = "sk-ant-oat01-TESTTOKEN"
-
-    monkeypatch.setattr(coding_auth_service, "_load_row", lambda db, owner, provider: _Row())
+    SessionLocal, data_dir = db_store
     db = SessionLocal()
     try:
-        env = build_launch_env(db, "tester", "", "opus",
-                               harness_id="claude", auth_mode="subscription")
-        assert env["CLAUDE_CODE_OAUTH_TOKEN"] == "sk-ant-oat01-TESTTOKEN"
+        env = build_launch_env(db, "tester", "", "claude-opus-4-8",
+                               harness_id="claude", auth_mode="subscription",
+                               workspace="/tmp/my-repo")
         assert "CLAUDE_CONFIG_DIR" in env
+        assert env["CLAUDE_CONFIG_DIR"].endswith("/claude")
+        assert str(data_dir) in env["CLAUDE_CONFIG_DIR"]
+        # Token is NOT injected as an env var anymore — the CLI reads its own login.
+        assert "CLAUDE_CODE_OAUTH_TOKEN" not in env
+        # Onboarding wizard + per-folder trust dialog are pre-accepted in .claude.json.
+        cfg = _json.loads((Path(env["CLAUDE_CONFIG_DIR"]) / ".claude.json").read_text())
+        assert cfg["hasCompletedOnboarding"] is True
+        assert cfg["projects"]["/tmp/my-repo"]["hasTrustDialogAccepted"] is True
     finally:
         db.close()
+
+
+def test_ensure_claude_noninteractive_is_idempotent_and_preserves(tmp_path):
+    from src import coding_auth_service as a
+    import json as _json
+    import os as _os
+    import stat as _stat
+    cfg = tmp_path / ".claude.json"
+    cfg.write_text(_json.dumps({"oauthAccount": {"emailAddress": "x@y.z"}, "theme": "ocean"}))
+    _os.chmod(cfg, 0o644)
+    a.ensure_claude_noninteractive(tmp_path, workspace="/repo")
+    d = _json.loads(cfg.read_text())
+    assert d["hasCompletedOnboarding"] is True
+    assert d["projects"]["/repo"]["hasTrustDialogAccepted"] is True
+    # Existing keys preserved (login + user theme untouched).
+    assert d["oauthAccount"]["emailAddress"] == "x@y.z"
+    assert d["theme"] == "ocean"
+    assert oct(_stat.S_IMODE(_os.stat(cfg).st_mode)) == "0o600"
+    # Second call is a no-op (no crash, flags stay).
+    a.ensure_claude_noninteractive(tmp_path, workspace="/repo")
+    assert _json.loads(cfg.read_text())["hasCompletedOnboarding"] is True
+    assert oct(_stat.S_IMODE(_os.stat(cfg).st_mode)) == "0o600"
 
 
 def test_list_providers_for_harness(db_store):
@@ -377,6 +407,106 @@ def test_codex_finalize_restricts_auth_json_perms(monkeypatch, tmp_path):
     assert done is True
     # The CLI's world-readable auth.json is tightened to owner-only.
     assert oct(stat.S_IMODE(os.stat(auth_file).st_mode)) == "0o600"
+
+
+def test_subscription_login_env_does_not_inherit_parent_secrets(monkeypatch, tmp_path):
+    from src import coding_auth_service as a
+
+    monkeypatch.setattr(a, "DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-proj-parent-secret-value")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-parent-secret-value")
+    monkeypatch.setenv("ODYSSEUS_INTERNAL_TOKEN", "ody_internal_parent_secret")
+
+    svc = a.CodingAuthService()
+    config_dir = a.auth_config_dir("tester", "claude")
+    env = svc._login_env("claude", config_dir)
+
+    assert env["CLAUDE_CONFIG_DIR"] == str(config_dir)
+    assert env["TERM"] == "xterm-256color"
+    assert "OPENAI_API_KEY" not in env
+    assert "ANTHROPIC_API_KEY" not in env
+    assert "ODYSSEUS_INTERNAL_TOKEN" not in env
+
+
+def test_subscription_auth_output_redactor_masks_token_shapes():
+    from src.coding_auth_service import _redact_auth_output_text
+
+    text = (
+        "access_token=sk-proj-parent-secret-value\n"
+        "Authorization: Bearer hf_abcdefghijklmnopqrstuvwxyz\n"
+        "id_token=eyJabcdefghijklmnopqrstuv.abcdefghijklmnop.abcdefghijklmnop\n"
+    )
+
+    redacted = _redact_auth_output_text(text)
+
+    assert "sk-proj-parent-secret-value" not in redacted
+    assert "hf_abcdefghijklmnopqrstuvwxyz" not in redacted
+    assert "eyJabcdefghijklmnopqrstuv.abcdefghijklmnop.abcdefghijklmnop" not in redacted
+    assert redacted.count("[redacted]") >= 3
+
+
+def test_claude_logout_clears_metadata_and_keychain(monkeypatch, tmp_path):
+    from src import coding_auth_service as a
+    from src import coding_provider_oauth as oauth
+
+    monkeypatch.setattr(a, "DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(a, "_is_macos", lambda: True)
+
+    keychain: dict[str, object] = {
+        "claudeAiOauth": {
+            "accessToken": "sk-ant-oat01-LOGOUT",
+            "refreshToken": "refresh-token",
+        }
+    }
+
+    class _Proc:
+        def __init__(self, returncode: int = 0, stdout: str = ""):
+            self.returncode = returncode
+            self.stdout = stdout
+            self.stderr = ""
+
+    def _security(args, *_, **__):
+        if "find-generic-password" in args:
+            if not keychain:
+                return _Proc(44, "")
+            return _Proc(0, json.dumps(keychain))
+        if "delete-generic-password" in args:
+            keychain.clear()
+            return _Proc(0, "")
+        raise AssertionError(f"unexpected security command: {args!r}")
+
+    monkeypatch.setattr(a.subprocess, "run", _security)
+    config_dir = a.auth_config_dir("tester", "claude")
+    claude_json = config_dir / ".claude.json"
+    claude_json.write_text(
+        json.dumps(
+            {
+                "oauthAccount": {"emailAddress": "x@y.z"},
+                "hasCompletedOnboarding": True,
+                "projects": {"/repo": {"hasTrustDialogAccepted": True}},
+            }
+        )
+    )
+
+    assert a.subscription_logged_in(None, "tester", "claude") is True
+    assert asyncio.run(oauth.resolve_subscription_credential("tester", "claude")) is not None
+
+    svc = a.CodingAuthService()
+
+    async def _noop_teardown(_name):
+        return None
+
+    monkeypatch.setattr(svc, "_teardown_session", _noop_teardown)
+    monkeypatch.setattr(svc, "_set_status", lambda *_, **__: None)
+
+    result = asyncio.run(svc.logout("tester", "claude"))
+
+    assert result["logged_in"] is False
+    assert keychain == {}
+    assert a.subscription_logged_in(None, "tester", "claude") is False
+    assert asyncio.run(oauth.resolve_subscription_credential("tester", "claude")) is None
+    if claude_json.exists():
+        assert "oauthAccount" not in json.loads(claude_json.read_text())
 
 
 def test_subscription_login_env_omitted_for_non_subscription_harness():

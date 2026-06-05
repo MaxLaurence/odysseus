@@ -111,7 +111,10 @@ async def call_task_tool(context: ProviderContext, action: str, args: dict[str, 
         require_capability(context, "task.release")
         slot_id = str(args.get("slot_id") or "").strip()
         if slot_id:
-            return service.release(slot_id)
+            result = service.release(slot_id, owner=context.owner, run_id=_run_identity(context))
+            if result.get("forbidden"):
+                raise CodingProviderError(403, "task slot does not belong to this run")
+            return result
         # No slot id → release everything this run holds (safety / coarse release).
         service.release_run(_run_identity(context))
         return {"released": True, "scope": "run"}
@@ -121,7 +124,10 @@ async def call_task_tool(context: ProviderContext, action: str, args: dict[str, 
         slot_id = str(args.get("slot_id") or "").strip()
         if not slot_id:
             raise CodingProviderError(400, "task.heartbeat requires slot_id")
-        return service.heartbeat(slot_id)
+        result = service.heartbeat(slot_id, owner=context.owner, run_id=_run_identity(context))
+        if result.get("forbidden"):
+            raise CodingProviderError(403, "task slot does not belong to this run")
+        return result
 
     raise CodingProviderError(400, "Unknown task action")
 

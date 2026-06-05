@@ -140,12 +140,13 @@ def build_launch_env(
     harness_id: str | None = "",
     auth_mode: str | None = "none",
     effort: str | None = "",
+    workspace: str | None = None,
 ) -> dict[str, str]:
     """Build per-run env, including secrets only for process injection.
 
     ``auth_mode`` controls how the agent CLI authenticates:
-      - "subscription": inject the owner's managed CLI OAuth login (isolated config
-        dir / token); do NOT inject an endpoint api-key.
+      - "subscription": inject the owner's managed CLI OAuth login config dir; do
+        NOT inject an endpoint api-key or OAuth token.
       - "endpoint" / "none": inject the configured ModelEndpoint api-key (legacy
         behavior — "none" stays endpoint-driven so pre-existing threads are unchanged).
     ``harness_id`` selects harness-specific env (Claude gets ANTHROPIC_* + thinking
@@ -169,10 +170,11 @@ def build_launch_env(
 
     if auth_mode == "subscription":
         # Subscription login: point the CLI at the owner's isolated OAuth credential
-        # dir / token instead of an api-key. Imported lazily to avoid an import cycle.
+        # dir instead of injecting an api-key or OAuth token. Imported lazily to avoid
+        # an import cycle.
         try:
             from src.coding_auth_service import subscription_launch_env
-            env.update(subscription_launch_env(db, owner, harness))
+            env.update(subscription_launch_env(db, owner, harness, workspace))
         except Exception:
             pass
     elif api_key:

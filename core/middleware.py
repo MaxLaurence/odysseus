@@ -15,6 +15,41 @@ from starlette.responses import Response
 # same value from this module. Never persisted or exposed externally.
 INTERNAL_TOOL_TOKEN = os.environ.get("ODYSSEUS_INTERNAL_TOKEN") or secrets.token_hex(32)
 INTERNAL_TOOL_HEADER = "X-Odysseus-Internal-Token"
+PROXY_EVIDENCE_HEADERS = (
+    "cf-connecting-ip",
+    "cf-ray",
+    "cf-visitor",
+    "fastly-client-ip",
+    "fly-client-ip",
+    "true-client-ip",
+    "x-client-ip",
+    "x-cluster-client-ip",
+    "x-envoy-external-address",
+    "x-forwarded-for",
+    "x-forwarded-host",
+    "x-forwarded-port",
+    "x-forwarded-proto",
+    "x-forwarded-scheme",
+    "x-forwarded-server",
+    "x-forwarded-ssl",
+    "x-original-forwarded-for",
+    "x-real-ip",
+    "forwarded",
+)
+
+
+def is_direct_loopback_host(host: str | None, headers) -> bool:
+    if host not in ("127.0.0.1", "::1", "localhost"):
+        return False
+    try:
+        return not any(headers.get(header) for header in PROXY_EVIDENCE_HEADERS)
+    except Exception:
+        return False
+
+
+def request_is_direct_loopback(request: Request) -> bool:
+    host = request.client.host if getattr(request, "client", None) else None
+    return is_direct_loopback_host(host, request.headers)
 
 
 def require_admin(request: Request):
@@ -28,7 +63,7 @@ def require_admin(request: Request):
     #     request.state.current_user = "internal-tool".
     try:
         hdr = request.headers.get(INTERNAL_TOOL_HEADER)
-        if hdr and secrets.compare_digest(hdr, INTERNAL_TOOL_TOKEN):
+        if hdr and secrets.compare_digest(hdr, INTERNAL_TOOL_TOKEN) and request_is_direct_loopback(request):
             return
         if getattr(request.state, "current_user", None) == "internal-tool":
             return

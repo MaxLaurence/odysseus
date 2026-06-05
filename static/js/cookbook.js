@@ -330,7 +330,6 @@ export function _buildEnvPrefix() {
     parts.push('eval "$(conda shell.bash hook)" && conda activate ' + _shellQuote(_envState.envPath));
   }
   let envVars = [];
-  if (_envState.hfToken) envVars.push('export HF_TOKEN=' + _shellQuote(_envState.hfToken));
   if (_envState.gpus) envVars.push('export CUDA_VISIBLE_DEVICES=' + _shellQuote(_envState.gpus));
   if (envVars.length) parts.push(envVars.join(' && '));
   if (parts.length === 0) return '';
@@ -346,7 +345,6 @@ function _buildEnvPrefixWindows() {
   } else if (_envState.env === 'conda' && _envState.envPath) {
     parts.push('conda activate ' + _psQuote(_envState.envPath));
   }
-  if (_envState.hfToken) parts.push('$env:HF_TOKEN=' + _psQuote(_envState.hfToken));
   if (_envState.gpus) parts.push('$env:CUDA_VISIBLE_DEVICES=' + _psQuote(_envState.gpus));
   if (parts.length === 0) return '';
   return parts.join('; ') + ';';
@@ -557,13 +555,14 @@ export function _savePresets(presets) {
 }
 
 function _envStateForStorage() {
-  const { hfToken, ...safeState } = _envState;
+  const { hfToken, _hfTokenDirty, ...safeState } = _envState;
   return safeState;
 }
 
 function _readStoredEnvState() {
   const stored = JSON.parse(localStorage.getItem(LAST_STATE_KEY) || '{}');
   delete stored.hfToken;
+  delete stored._hfTokenDirty;
   return stored;
 }
 
@@ -1421,6 +1420,7 @@ function _wireTabEvents(body) {
     hfInput.addEventListener('change', async () => {
       const val = hfInput.value.trim();
       _envState.hfToken = val;
+      _envState._hfTokenDirty = !!val;
       try { await _persistEnvState(); } catch {}
       if (val) {
         _envState.hfTokenConfigured = true;

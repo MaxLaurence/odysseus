@@ -1,5 +1,6 @@
 import sys
 import json
+import importlib
 from datetime import datetime
 
 # conftest.py stubs src.database with a fake module; webhook_manager imports
@@ -33,7 +34,9 @@ def test_webhook_url_ssrf_mitigation():
 
 @pytest.mark.asyncio
 async def test_webhook_delivery_uses_naive_utc_timestamps(monkeypatch):
-    import src.webhook_manager as wm
+    sys.modules.pop("src.webhook_manager", None)
+    sys.modules.pop("src.database", None)
+    wm = importlib.import_module("src.webhook_manager")
 
     class _Query:
         def __init__(self, updates):

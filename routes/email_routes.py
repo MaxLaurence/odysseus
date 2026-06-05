@@ -1072,8 +1072,8 @@ def setup_email_routes():
                     _c = _sql3.connect(SCHEDULED_DB)
                     placeholders = ",".join("?" * len(ids))
                     rows = _c.execute(
-                        f"SELECT message_id, summary FROM email_summaries WHERE message_id IN ({placeholders})",
-                        ids,
+                        f"SELECT message_id, summary FROM email_summaries WHERE owner = ? AND message_id IN ({placeholders})",
+                        [owner or "", *ids],
                     ).fetchall()
                     _c.close()
                     by_id = {r[0]: r[1] for r in rows}
@@ -1357,14 +1357,14 @@ def setup_email_routes():
                 import sqlite3 as _sql3
                 _c = _sql3.connect(SCHEDULED_DB)
                 _row = _c.execute(
-                    "SELECT summary FROM email_summaries WHERE message_id = ?",
-                    (message_id.strip(),),
+                    "SELECT summary FROM email_summaries WHERE message_id = ? AND owner = ?",
+                    (message_id.strip(), owner or ""),
                 ).fetchone()
                 if _row:
                     cached_summary = _row[0]
                 _row2 = _c.execute(
-                    "SELECT reply FROM email_ai_replies WHERE message_id = ?",
-                    (message_id.strip(),),
+                    "SELECT reply FROM email_ai_replies WHERE message_id = ? AND owner = ?",
+                    (message_id.strip(), owner or ""),
                 ).fetchone()
                 if _row2:
                     cached_ai_reply = _apply_email_style_mechanics(_extract_reply(_row2[0] or ""))
@@ -2690,10 +2690,10 @@ def setup_email_routes():
                     _c = _sql3.connect(SCHEDULED_DB)
                     _c.execute("""
                         INSERT OR REPLACE INTO email_summaries
-                        (message_id, uid, folder, subject, sender, summary, model_used, created_at)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        (message_id, owner, uid, folder, subject, sender, summary, model_used, created_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """, (
-                        mid, data.get("uid", ""), data.get("folder", ""),
+                        mid, owner or "", data.get("uid", ""), data.get("folder", ""),
                         subject, sender, content, model, datetime.utcnow().isoformat(),
                     ))
                     _c.commit()
@@ -2729,8 +2729,8 @@ def setup_email_routes():
                 try:
                     _c = _sql3.connect(SCHEDULED_DB)
                     _row = _c.execute(
-                        "SELECT reply, model_used FROM email_ai_replies WHERE message_id = ?",
-                        (message_id,),
+                        "SELECT reply, model_used FROM email_ai_replies WHERE message_id = ? AND owner = ?",
+                        (message_id, owner or ""),
                     ).fetchone()
                     _c.close()
                     if _row and _row[0]:
@@ -2932,9 +2932,9 @@ def setup_email_routes():
                     _c = _sql3.connect(SCHEDULED_DB)
                     _c.execute("""
                         INSERT OR REPLACE INTO email_ai_replies
-                        (message_id, uid, folder, reply, model_used, created_at)
-                        VALUES (?, ?, ?, ?, ?, ?)
-                    """, (message_id, source_uid, source_folder, reply, model, datetime.utcnow().isoformat()))
+                        (message_id, owner, uid, folder, reply, model_used, created_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """, (message_id, owner or "", source_uid, source_folder, reply, model, datetime.utcnow().isoformat()))
                     _c.commit()
                     _c.close()
                 except Exception as e:

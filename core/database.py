@@ -85,7 +85,7 @@ class Session(TimestampMixin, Base):
     
     # Session metadata
     name = Column(String, nullable=False)
-    endpoint_url = Column(String, nullable=False)
+    endpoint_url = Column(String, nullable=False, default="", server_default="")
     model = Column(String, nullable=False)
     owner = Column(String, nullable=True, index=True)  # username; null = legacy/shared
     
@@ -784,8 +784,8 @@ class CodingProviderAuth(TimestampMixin, Base):
     config dir under DATA_DIR/coding_auth/<owner_slug>/<provider> (exported as
     CLAUDE_CONFIG_DIR / CODEX_HOME at agent launch). This row tracks STATUS only, so
     the UI can show a login pill without ever reading the on-disk secret. The optional
-    token_encrypted column holds a `claude setup-token` OAuth token for the
-    CLAUDE_CODE_OAUTH_TOKEN injection path when that is preferred over a config dir.
+    token_encrypted column is legacy storage from the older Claude setup-token flow and
+    is intentionally not injected into coding-agent environments.
     """
     __tablename__ = "coding_provider_auth"
 
@@ -795,7 +795,7 @@ class CodingProviderAuth(TimestampMixin, Base):
     status          = Column(String, nullable=False, default="logged_out")  # logged_in|logged_out|pending|error
     config_dir      = Column(Text, nullable=True)
     account_label   = Column(String, nullable=True)             # masked email / plan label if exposed
-    token_encrypted = Column(EncryptedText, nullable=True)      # optional claude OAuth token
+    token_encrypted = Column(EncryptedText, nullable=True)      # legacy Claude setup-token storage
     last_login_at   = Column(DateTime, nullable=True)
     last_checked_at = Column(DateTime, nullable=True)
     error           = Column(Text, nullable=True)

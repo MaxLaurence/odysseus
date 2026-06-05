@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import shlex
 import uuid
 from datetime import datetime
@@ -23,6 +24,7 @@ from core.database import (
     SessionLocal,
 )
 from src.coding_autotitle import maybe_autotitle_thread
+from src.child_process_env import safe_child_env
 from src.coding_effort import normalize_effort
 from src.coding_harnesses import build_harness_command, get_harness
 from src.coding_model_config import build_launch_env, thread_model_config
@@ -76,6 +78,63 @@ def _json_dumps(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
 
 
+_REDACTION = "[redacted]"
+_SECRET_VALUE_PATTERNS = (
+    re.compile(r"(?i)(\bauthorization\s*[:=]\s*bearer\s+)([^\s\"'`,;]+)"),
+    re.compile(
+        r"(?i)(\b(?:[A-Z][A-Z0-9]*_)?(?:API[_-]?KEY|TOKEN|AUTH[_-]?TOKEN|ACCESS[_-]?TOKEN|"
+        r"REFRESH[_-]?TOKEN|ID[_-]?TOKEN|CLIENT[_-]?SECRET|SECRET|PASSWORD|PASSWD|PWD|"
+        r"CREDENTIAL|CREDENTIALS)\s*[:=]\s*[\"']?)([^\s\"'`,;}]+)"
+    ),
+    re.compile(
+        r"(?i)(\b(?:api[_-]?key|access[_-]?token|refresh[_-]?token|id[_-]?token|bearer[_-]?token|"
+        r"client[_-]?secret|password|secret|credential|credentials)\b\s*[:=]\s*[\"']?)([^\s\"'`,;}]+)"
+    ),
+)
+_BARE_SECRET_PATTERNS = (
+    re.compile(r"\bsk-(?:proj-|ant-)?[A-Za-z0-9_-]{12,}"),
+    re.compile(r"\bghp_[A-Za-z0-9_]{20,}"),
+    re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}"),
+    re.compile(r"\bhf_[A-Za-z0-9]{20,}"),
+    re.compile(r"\bxox[abprs]-[A-Za-z0-9-]{10,}"),
+    re.compile(r"\body_(?:cp|tool|oauth|internal)[A-Za-z0-9_:-]*"),
+)
+
+
+def redact_coding_output_text(text: str) -> str:
+    """Mask secret-shaped terminal output before it is persisted or replayed."""
+    if not text:
+        return text
+    redacted = text
+    for pattern in _SECRET_VALUE_PATTERNS:
+        redacted = pattern.sub(lambda match: f"{match.group(1)}{_REDACTION}", redacted)
+    for pattern in _BARE_SECRET_PATTERNS:
+        redacted = pattern.sub(_REDACTION, redacted)
+    return redacted
+
+
+def redact_coding_output_bytes(data: bytes) -> bytes:
+    if not data:
+        return data
+    return redact_coding_output_text(data.decode("utf-8", errors="replace")).encode("utf-8")
+
+
+def _redact_coding_event_value(value: Any) -> Any:
+    if isinstance(value, str):
+        return redact_coding_output_text(value)
+    if isinstance(value, dict):
+        return {key: _redact_coding_event_value(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_redact_coding_event_value(item) for item in value]
+    return value
+
+
+def _redact_coding_event_payload(payload: dict[str, Any] | None) -> dict[str, Any]:
+    if not payload:
+        return {}
+    return _redact_coding_event_value(payload)
+
+
 def _now() -> datetime:
     return datetime.utcnow()
 
@@ -87,6 +146,25 @@ def _iso(dt: datetime | None) -> str | None:
 def _safe_cwd(cwd: str | None, fallback: str | None) -> str:
     raw = (cwd or fallback or str(Path.home())).strip()
     return str(Path(raw).expanduser())
+
+
+def _existing_resolved_dir(path: str | None) -> Path | None:
+    raw = (path or "").strip()
+    if not raw:
+        return None
+    try:
+        resolved = Path(raw).expanduser().resolve(strict=True)
+    except Exception:
+        return None
+    return resolved if resolved.is_dir() else None
+
+
+def _path_inside_root(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+        return True
+    except ValueError:
+        return False
 
 
 def _user_login_shell() -> str:
@@ -104,7 +182,7 @@ def _user_login_shell() -> str:
 
 
 def _sanitize_base_launch_env(env: dict[str, str]) -> dict[str, str]:
-    return {key: value for key, value in env.items() if not key.startswith("ODYSSEUS_")}
+    return safe_child_env(source=env)
 
 
 def _drop_private_odysseus_env(env: dict[str, str]) -> dict[str, str]:
@@ -177,6 +255,7 @@ class CodingRuntimeService:
                     harness_id=run.harness_id or thread.harness_id,
                     auth_mode=getattr(thread, "auth_mode", None) or "none",
                     effort=getattr(thread, "effort", None) or "",
+                    workspace=self._subscription_trust_workspace(db, run, thread),
                 )
             )
         provider_env = self._issue_provider_bridge_env(run, thread)
@@ -185,6 +264,48 @@ class CodingRuntimeService:
         env = with_scripts_on_path(env)
         env = with_beads_on_path(env)
         return env, self._provider_bridge.metadata_for_env(provider_env)
+
+    def _subscription_trust_workspace(
+        self,
+        db,
+        run: CodingRun,
+        thread: CodingThread | None,
+    ) -> str | None:
+        """Only pre-accept Claude's folder trust prompt for the thread's project tree."""
+        if thread is None:
+            return None
+        workspace = _existing_resolved_dir(getattr(run, "cwd", None) or getattr(thread, "cwd", None))
+        if workspace is None:
+            return None
+        try:
+            project = (
+                db.query(CodingProject)
+                .filter(CodingProject.id == thread.project_id, CodingProject.owner == thread.owner)
+                .first()
+            )
+        except Exception:
+            project = None
+        root = _existing_resolved_dir(getattr(project, "root_path", None) if project else None)
+        if root is None or not _path_inside_root(workspace, root):
+            return None
+        return str(workspace)
+
+    def _validated_run_cwd(
+        self,
+        *,
+        requested_cwd: str | None,
+        thread: CodingThread,
+        project: CodingProject,
+    ) -> str:
+        project_root = _existing_resolved_dir(getattr(project, "root_path", None))
+        if project_root is None:
+            raise CodingRuntimeError(400, "Project root does not exist or is not a directory")
+        run_cwd = _existing_resolved_dir(requested_cwd or thread.cwd or project.root_path)
+        if run_cwd is None:
+            raise CodingRuntimeError(400, "Run cwd does not exist or is not a directory")
+        if not _path_inside_root(run_cwd, project_root):
+            raise CodingRuntimeError(400, "Run cwd must be inside the project root")
+        return str(run_cwd)
 
     def _revoke_run_provider_credentials(self, run_id: str, db=None) -> None:
         try:
@@ -244,6 +365,7 @@ class CodingRuntimeService:
         kind: str,
         payload: dict[str, Any] | None = None,
     ) -> CodingThreadEvent:
+        safe_payload = _redact_coding_event_payload(payload)
         # Sessions are autoflush=False, so flush any pending (not-yet-committed)
         # event rows before computing the next seq. Without this, two appends to
         # the same session before a commit would both read the same max(seq) and
@@ -263,7 +385,7 @@ class CodingRuntimeService:
             run_id=run_id,
             seq=next_seq,
             kind=kind,
-            payload_json=_json_dumps(payload or {}),
+            payload_json=_json_dumps(safe_payload),
         )
         db.add(event)
         if run_id:
@@ -280,7 +402,7 @@ class CodingRuntimeService:
                                     "run_id": run_id,
                                     "seq": next_seq,
                                     "kind": kind,
-                                    "payload": payload or {},
+                                    "payload": safe_payload,
                                     "created_at": _iso(event.created_at),
                                 }
                             )
@@ -384,8 +506,9 @@ class CodingRuntimeService:
                 get_harness(selected_harness)
                 if harness_id:
                     thread.harness_id = selected_harness
+                run_cwd = self._validated_run_cwd(requested_cwd=cwd, thread=thread, project=project)
                 if cwd:
-                    thread.cwd = _safe_cwd(cwd, project.root_path)
+                    thread.cwd = run_cwd
                 if model_endpoint_id is not None:
                     thread.model_endpoint_id = model_endpoint_id.strip()
                 if model is not None:
@@ -407,7 +530,6 @@ class CodingRuntimeService:
                 metadata_command = str(metadata.get("command") or "").strip()
                 default_harness_command = not requested_command and not metadata_command
                 base_command = build_harness_command(selected_harness, command, metadata)
-                run_cwd = _safe_cwd(cwd, thread.cwd or project.root_path)
                 model_config = thread_model_config(db, thread)
                 launch_plan = build_coding_agent_launch_plan(
                     harness_id=selected_harness,
@@ -999,7 +1121,11 @@ class CodingRuntimeService:
             # lifetime — so output is captured even with no browser attached. Replaces
             # the old `tmux pipe-pane`.
             self._capture_tasks[run.id] = self._pty_bridge.start_capture(
-                session, log_path, init_cols=init_cols, init_rows=init_rows
+                session,
+                log_path,
+                init_cols=init_cols,
+                init_rows=init_rows,
+                output_redactor=redact_coding_output_bytes,
             )
 
             async with self._lock:
@@ -1074,7 +1200,11 @@ class CodingRuntimeService:
         init_cols = int(metadata.get("cols") or 120)
         init_rows = int(metadata.get("rows") or 40)
         self._capture_tasks[run_id] = self._pty_bridge.start_capture(
-            run.tmux_session, Path(run.log_path), init_cols=init_cols, init_rows=init_rows
+            run.tmux_session,
+            Path(run.log_path),
+            init_cols=init_cols,
+            init_rows=init_rows,
+            output_redactor=redact_coding_output_bytes,
         )
         await self._tail_run(run.id, run.tmux_session, Path(run.log_path), exit_path)
 
@@ -1122,7 +1252,7 @@ class CodingRuntimeService:
                     run.thread_id,
                     run.id,
                     "output",
-                    {"stream": "stdout", "data": chunk.decode(errors="replace")},
+                    {"stream": "stdout", "data": redact_coding_output_text(chunk.decode(errors="replace"))},
                 )
         return new_offset
 
@@ -1226,16 +1356,17 @@ class CodingRuntimeService:
                 chunk = await stream.read(4096)
                 if not chunk:
                     return
+                data = redact_coding_output_text(chunk.decode(errors="replace"))
                 await self.append_event(
                     run.thread_id,
                     run.id,
                     "output",
-                    {"stream": name, "data": chunk.decode(errors="replace")},
+                    {"stream": name, "data": data},
                 )
                 try:
                     if run.log_path:
                         with Path(run.log_path).open("ab") as f:
-                            f.write(chunk)
+                            f.write(data.encode("utf-8"))
                 except Exception:
                     logger.debug("Failed to append subprocess output log", exc_info=True)
 
@@ -1377,7 +1508,15 @@ class CodingRuntimeService:
                 if len(line) >= 4:
                     asyncio.create_task(self._maybe_autotitle_from_run(run_id, owner, line))
 
-        await self._pty_bridge.attach_pty(websocket, run_id, owner, cols, rows, on_input=_on_first_input)
+        await self._pty_bridge.attach_pty(
+            websocket,
+            run_id,
+            owner,
+            cols,
+            rows,
+            on_input=_on_first_input,
+            history_redactor=redact_coding_output_bytes,
+        )
 
     async def _maybe_autotitle_from_run(self, run_id: str, owner: str, text: str) -> None:
         db = SessionLocal()

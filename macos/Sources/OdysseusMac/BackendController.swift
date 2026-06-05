@@ -34,6 +34,7 @@ final class BackendController: ObservableObject {
     private var currentPort: Int?
     private var isStarting = false
     private var startupTask: Task<Void, Never>?
+    private var networkSharingAllowed = false
 
     // Loopback-only secret shared with the backend via ODYSSEUS_INTERNAL_TOKEN so
     // this app can hit admin-gated control routes (the quit handler's task count /
@@ -121,6 +122,7 @@ final class BackendController: ObservableObject {
             url = localURL
             statusText = "Odysseus is running."
             writeWrapperLog("backend ready url=\(localURL.absoluteString)")
+            networkSharingAllowed = await refreshNetworkSharingAllowed()
             syncSharingProcess()
         } catch {
             writeWrapperLog("startup failed: \(error.localizedDescription)")
@@ -144,6 +146,7 @@ final class BackendController: ObservableObject {
         backendProcess?.terminate()
         backendProcess = nil
         currentPort = nil
+        networkSharingAllowed = false
         url = nil
         try? logHandle?.close()
         logHandle = nil
@@ -155,53 +158,51 @@ final class BackendController: ObservableObject {
     func stopSharing() {
         tailscaleProcess?.terminate()
         tailscaleProcess = nil
+        resetTailscaleServe()
         sharingStatus = "Sharing is off."
     }
 
     /// Number of coding agents the backend currently considers active (running /
-    /// starting / stopping). Drives the quit prompt — 0 means quitting orphans
-    /// nothing. Returns 0 if the backend can't be reached (treat as "safe to quit").
-    func activeTaskCount() async -> Int {
-        guard let base = url else { return 0 }
-        var request = URLRequest(url: base.appendingPathComponent("api/coding/runtime/active-tasks"))
-        request.setValue(internalToken, forHTTPHeaderField: "X-Odysseus-Internal-Token")
-        request.timeoutInterval = 5
-        do {
-            let (data, response) = try await URLSession.shared.data(for: request)
-            guard let http = response as? HTTPURLResponse, http.statusCode == 200,
-                  let object = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let active = object["active"] as? Int else {
-                return 0
-            }
-            return active
-        } catch {
-            writeWrapperLog("active-tasks query failed: \(error.localizedDescription)")
-            return 0
+    /// starting / stopping). Drives the quit prompt. Fail closed: callers must
+    /// decide what to do if the backend cannot be queried.
+    func activeTaskCount() async throws -> Int {
+        let object = try await controlJSON(path: "api/coding/runtime/desktop-status")
+        guard let active = object["active"] as? Int else {
+            throw BackendError.controlRequestFailed("desktop status did not include an active count")
         }
+        return active
     }
 
     /// Stop every active/queued agent across the backend (the "Quit Everything"
-    /// path). Returns the number stopped; 0 on failure.
+    /// path). Fails closed if the backend cannot confirm all agents stopped.
     @discardableResult
-    func stopAllTasks() async -> Int {
-        guard let base = url else { return 0 }
-        var request = URLRequest(url: base.appendingPathComponent("api/coding/runtime/stop-all"))
-        request.httpMethod = "POST"
-        request.setValue(internalToken, forHTTPHeaderField: "X-Odysseus-Internal-Token")
-        request.timeoutInterval = 30
+    func stopAllTasks() async throws -> Int {
+        let object = try await controlJSON(path: "api/coding/runtime/stop-all", method: "POST", timeout: 30)
+        guard let stopped = object["stopped"] as? Int else {
+            throw BackendError.controlRequestFailed("stop-all response did not include stopped count")
+        }
+        let remaining = try await activeTaskCount()
+        guard remaining == 0 else {
+            throw BackendError.controlRequestFailed("stop-all left \(remaining) active agent(s)")
+        }
+        writeWrapperLog("stop-all stopped \(stopped) task(s)")
+        return stopped
+    }
+
+    /// Explicitly keep the backend alive after the Swift wrapper exits. Without
+    /// this, the backend's parent-death watchdog treats "Leave Running" like a
+    /// wrapper crash and self-terminates.
+    @discardableResult
+    func prepareLeaveRunning() async -> Bool {
         do {
-            let (data, response) = try await URLSession.shared.data(for: request)
-            guard let http = response as? HTTPURLResponse, http.statusCode == 200,
-                  let object = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let stopped = object["stopped"] as? Int else {
-                writeWrapperLog("stop-all returned an unexpected response")
-                return 0
-            }
-            writeWrapperLog("stop-all stopped \(stopped) task(s)")
-            return stopped
+            _ = try await controlJSON(path: "api/coding/runtime/leave-running", method: "POST")
+            stopSharing()
+            writeWrapperLog("backend watchdog disarmed for Leave Running")
+            return true
         } catch {
-            writeWrapperLog("stop-all failed: \(error.localizedDescription)")
-            return 0
+            writeWrapperLog("leave-running preparation failed: \(error.localizedDescription)")
+            statusText = "Could not leave agents running: \(error.localizedDescription)"
+            return false
         }
     }
 
@@ -216,16 +217,33 @@ final class BackendController: ObservableObject {
     }
 
     private func waitForHealth(port: Int) async throws {
+        let healthURL = URL(string: "http://127.0.0.1:\(port)/api/health")!
         for _ in 0..<1200 {
             if backendProcess?.isRunning == false {
                 throw BackendError.backendExited
             }
-            if await Self.canOpenLoopbackConnection(port: port) {
+            if await Self.healthEndpointIsReady(healthURL) {
                 return
             }
             try await Task.sleep(nanoseconds: 250_000_000)
         }
         throw BackendError.healthTimedOut
+    }
+
+    nonisolated private static func healthEndpointIsReady(_ url: URL) async -> Bool {
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 1
+        do {
+            let (data, response) = try await URLSession.shared.data(for: request)
+            guard let http = response as? HTTPURLResponse, http.statusCode == 200,
+                  let object = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  object["status"] as? String == "healthy" else {
+                return false
+            }
+            return true
+        } catch {
+            return false
+        }
     }
 
     nonisolated private static func canOpenLoopbackConnection(port: Int) async -> Bool {
@@ -260,6 +278,38 @@ final class BackendController: ObservableObject {
         }.value
     }
 
+    private func controlJSON(path: String, method: String = "GET", timeout: TimeInterval = 5) async throws -> [String: Any] {
+        guard let base = url else {
+            throw BackendError.backendUnavailable
+        }
+        let endpoint = base.appendingPathComponent(path)
+        var request = URLRequest(url: endpoint)
+        request.httpMethod = method
+        request.setValue(internalToken, forHTTPHeaderField: "X-Odysseus-Internal-Token")
+        request.timeoutInterval = timeout
+        let (data, response) = try await URLSession.shared.data(for: request)
+        guard let http = response as? HTTPURLResponse else {
+            throw BackendError.controlRequestFailed("backend returned a non-HTTP response")
+        }
+        guard http.statusCode == 200 else {
+            throw BackendError.controlRequestFailed("backend returned HTTP \(http.statusCode)")
+        }
+        guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw BackendError.controlRequestFailed("backend returned invalid JSON")
+        }
+        return object
+    }
+
+    private func refreshNetworkSharingAllowed() async -> Bool {
+        do {
+            let object = try await controlJSON(path: "api/coding/runtime/desktop-status")
+            return object["auth_configured"] as? Bool == true
+        } catch {
+            writeWrapperLog("sharing status check failed: \(error.localizedDescription)")
+            return false
+        }
+    }
+
     private func writeWrapperLog(_ message: String) {
         guard let data = "[wrapper] \(message)\n".data(using: .utf8) else {
             return
@@ -271,6 +321,17 @@ final class BackendController: ObservableObject {
         stopSharing()
         guard sharingMode == .tailscaleServe else {
             sharingStatus = "Sharing is off. Odysseus is available only on this Mac."
+            return
+        }
+        guard networkSharingAllowed else {
+            sharingStatus = "Tailscale sharing is blocked until first-run admin setup is complete."
+            Task { @MainActor in
+                let allowed = await refreshNetworkSharingAllowed()
+                networkSharingAllowed = allowed
+                if allowed && sharingMode == .tailscaleServe {
+                    syncSharingProcess()
+                }
+            }
             return
         }
         guard let port = currentPort else {
@@ -293,6 +354,24 @@ final class BackendController: ObservableObject {
             sharingStatus = "Tailnet sharing is on via tailscale serve \(port)."
         } catch {
             sharingStatus = "Failed to start Tailscale sharing: \(error.localizedDescription)"
+        }
+    }
+
+    private func resetTailscaleServe() {
+        guard let tailscale = Self.findExecutable("tailscale") else {
+            return
+        }
+        let process = Process()
+        process.executableURL = tailscale
+        process.arguments = ["serve", "reset"]
+        process.standardOutput = logHandle
+        process.standardError = logHandle
+        do {
+            try process.run()
+            process.waitUntilExit()
+            writeWrapperLog("tailscale serve reset exited \(process.terminationStatus)")
+        } catch {
+            writeWrapperLog("tailscale serve reset failed: \(error.localizedDescription)")
         }
     }
 
@@ -553,6 +632,8 @@ enum BackendError: LocalizedError {
     case noFreePort
     case healthTimedOut
     case backendExited
+    case backendUnavailable
+    case controlRequestFailed(String)
 
     var errorDescription: String? {
         switch self {
@@ -566,6 +647,10 @@ enum BackendError: LocalizedError {
             return "The backend did not become healthy in time. Check the backend log."
         case .backendExited:
             return "The backend exited before it became healthy. Check the backend log."
+        case .backendUnavailable:
+            return "The backend is not running."
+        case .controlRequestFailed(let detail):
+            return detail
         }
     }
 }

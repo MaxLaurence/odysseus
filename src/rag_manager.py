@@ -30,17 +30,17 @@ class RAGManager:
         logger.info("RAGManager initialized as wrapper for VectorRAG")
     
     # Delegate all methods to VectorRAG
-    def search(self, query: str, k: int = 5) -> List[Dict[str, Any]]:
+    def search(self, query: str, k: int = 5, owner: str | None = None) -> List[Dict[str, Any]]:
         """Search for documents - delegates to VectorRAG."""
-        return self.vector_rag.search(query, k)
+        return self.vector_rag.search(query, k, owner=owner)
     
-    def index_personal_documents(self, directory: str) -> Dict[str, Any]:
+    def index_personal_documents(self, directory: str, file_extensions: set | None = None, owner: str | None = None) -> Dict[str, Any]:
         """Index documents - delegates to VectorRAG."""
-        return self.vector_rag.index_personal_documents(directory)
+        return self.vector_rag.index_personal_documents(directory, file_extensions=file_extensions, owner=owner)
     
-    def retrieve(self, query: str, k: int = 5) -> List[str]:
+    def retrieve(self, query: str, k: int = 5, owner: str | None = None) -> List[str]:
         """Retrieve relevant chunks - delegates to VectorRAG."""
-        return self.vector_rag.retrieve(query, k)
+        return self.vector_rag.retrieve(query, k, owner=owner)
     
     def rebuild_index(self) -> bool:
         """Rebuild index - delegates to VectorRAG."""
@@ -57,3 +57,11 @@ class RAGManager:
     def add_documents_batch(self, docs: List[tuple]) -> Dict[str, Any]:
         """Add documents in batch - delegates to VectorRAG."""
         return self.vector_rag.add_documents_batch(docs)
+
+    def remove_directory(self, directory: str, owner: str | None = None) -> Dict[str, Any]:
+        """Remove directory chunks - delegates to VectorRAG."""
+        return self.vector_rag.remove_directory(directory, owner=owner)
+
+    def delete_by_source(self, source: str, owner: str | None = None) -> int:
+        """Delete chunks for a source - delegates to VectorRAG."""
+        return self.vector_rag.delete_by_source(source, owner=owner)

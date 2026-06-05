@@ -65,19 +65,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // decision and report it back via reply(toApplicationShouldTerminate:).
         Task { @MainActor in
             let backend = BackendController.shared
-            let activeCount = await backend.activeTaskCount()
-            guard activeCount > 0 else {
-                NSApp.reply(toApplicationShouldTerminate: true)
-                return
+            let activeCount: Int?
+            do {
+                activeCount = try await backend.activeTaskCount()
+            } catch {
+                activeCount = nil
             }
             switch self.presentQuitPrompt(activeCount: activeCount) {
             case .leaveRunning:
                 // Leave the backend + agents running headless; just close the UI.
-                NSApp.reply(toApplicationShouldTerminate: true)
+                let prepared = await backend.prepareLeaveRunning()
+                NSApp.reply(toApplicationShouldTerminate: prepared)
             case .quitEverything:
-                await backend.stopAllTasks()
-                backend.stopBackend()
-                NSApp.reply(toApplicationShouldTerminate: true)
+                do {
+                    _ = try await backend.stopAllTasks()
+                    backend.stopBackend()
+                    NSApp.reply(toApplicationShouldTerminate: true)
+                } catch {
+                    self.presentQuitFailure(error)
+                    NSApp.reply(toApplicationShouldTerminate: false)
+                }
             case .cancel:
                 NSApp.reply(toApplicationShouldTerminate: false)
             }
@@ -86,17 +93,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @MainActor
-    private func presentQuitPrompt(activeCount: Int) -> QuitChoice {
+    private func presentQuitPrompt(activeCount: Int?) -> QuitChoice {
         let alert = NSAlert()
         alert.alertStyle = .warning
-        alert.messageText = activeCount == 1
-            ? "1 agent is still running"
-            : "\(activeCount) agents are still running"
-        alert.informativeText = """
-            Leave them running and Odysseus keeps working in the background — \
-            reopening the app reconnects to them. Quit everything to stop all \
-            running agents and shut the backend down.
-            """
+        if let activeCount {
+            guard activeCount > 0 else {
+                return .quitEverything
+            }
+            alert.messageText = activeCount == 1
+                ? "1 agent is still running"
+                : "\(activeCount) agents are still running"
+            alert.informativeText = """
+                Leave them running and Odysseus keeps working in the background. \
+                Quit everything to stop all running agents and shut the backend down.
+                """
+        } else {
+            alert.messageText = "Odysseus backend status is unavailable"
+            alert.informativeText = """
+                Odysseus could not confirm whether agents are still running. \
+                Leave running keeps the backend alive if it can be reached. \
+                Quit everything terminates the backend process.
+                """
+        }
         // Order sets the key bindings: first = default (Return), a button titled
         // "Cancel" auto-maps to Escape.
         alert.addButton(withTitle: "Leave Running")    // .alertFirstButtonReturn
@@ -111,5 +129,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         default:
             return .cancel
         }
+    }
+
+    @MainActor
+    private func presentQuitFailure(_ error: Error) {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Could not stop running agents"
+        alert.informativeText = """
+            Odysseus did not shut down because it could not confirm all agents stopped.
+
+            \(error.localizedDescription)
+            """
+        alert.addButton(withTitle: "OK")
+        NSApp.activate(ignoringOtherApps: true)
+        alert.runModal()
     }
 }

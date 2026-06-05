@@ -64,6 +64,14 @@ async def _cached(key: Tuple, ttl: float, fetch: Callable[[], Awaitable[Any]]) -
         raise
 
 
+def _mcp_args_with_owner(tool_name: str, args: Dict[str, Any], owner: str | None) -> Dict[str, Any]:
+    """Attach hidden owner context for shared Odysseus MCP servers."""
+    safe_args = dict(args or {})
+    if tool_name.startswith(("mcp__email__", "mcp__rag__")):
+        safe_args["_odysseus_owner"] = owner or ""
+    return safe_args
+
+
 def compute_next_run(schedule: str, scheduled_time: str,
                      scheduled_day: int = None,
                      scheduled_date: datetime = None,
@@ -1229,6 +1237,7 @@ class TaskScheduler:
                     qualified = f"mcp__{server_id}__{pattern['tool']}"
                     args = dict(pattern.get("args", {}))
                     args["account"] = "default"
+                    args = _mcp_args_with_owner(qualified, args, task.owner)
                     try:
                         # Cache 3 min: different scheduled tasks firing at the
                         # same minute share the same MCP snapshot.
@@ -1836,7 +1845,7 @@ class TaskScheduler:
         recipient = None
         try:
             from routes.email_helpers import _get_email_config
-            cfg = _get_email_config() or {}
+            cfg = _get_email_config(owner=task.owner or "") or {}
             recipient = cfg.get("from_address") or None
         except Exception as _e:
             logger.debug(f"_deliver_via_mcp: email config lookup failed: {_e}")
@@ -1865,7 +1874,10 @@ class TaskScheduler:
                 "set an email From address in Settings or give the task an owner email."
             )
         try:
-            mcp_result = await mcp.call_tool(tool_name, args)
+            mcp_result = await mcp.call_tool(
+                tool_name,
+                _mcp_args_with_owner(tool_name, args, task.owner),
+            )
             stderr = mcp_result.get("stderr", "")
             stdout = mcp_result.get("stdout", "")
             body_len = len(result or "")

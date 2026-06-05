@@ -14,6 +14,9 @@ import uuid
 import time
 from typing import Dict, Optional, Tuple
 
+from core.constants import PERSONAL_DIR
+from src.personal_paths import path_visible_to_personal_owner, resolve_personal_dir
+
 logger = logging.getLogger(__name__)
 
 AI_CHAT_TIMEOUT = 120  # seconds for a single LLM call
@@ -1167,7 +1170,14 @@ async def do_list_models(content: str, session_id: Optional[str] = None) -> Dict
 # RAG management tool
 # ---------------------------------------------------------------------------
 
-async def do_manage_rag(content: str, session_id: Optional[str] = None) -> Dict:
+def _call_owner_aware(method, *args, owner: str = "", **kwargs):
+    try:
+        return method(*args, owner=owner, **kwargs)
+    except TypeError:
+        return method(*args, **kwargs)
+
+
+async def do_manage_rag(content: str, session_id: Optional[str] = None, owner: Optional[str] = None) -> Dict:
     """Manage RAG indexed documents: list, add_directory, remove_directory.
 
     Content format:
@@ -1185,10 +1195,18 @@ async def do_manage_rag(content: str, session_id: Optional[str] = None) -> Dict:
         try:
             files = []
             if hasattr(_personal_docs_manager, 'index'):
-                files = _personal_docs_manager.index or []
+                files = [
+                    f for f in (_personal_docs_manager.index or [])
+                    if isinstance(f, dict)
+                    and (not owner or f.get("owner") == owner)
+                    and path_visible_to_personal_owner(f.get("path", ""), owner)
+                ]
             dirs = []
             if hasattr(_personal_docs_manager, 'get_indexed_directories'):
-                dirs = _personal_docs_manager.get_indexed_directories()
+                dirs = [
+                    d for d in _personal_docs_manager.get_indexed_directories()
+                    if isinstance(d, str) and path_visible_to_personal_owner(d, owner)
+                ]
 
             result_lines = []
             if dirs:
@@ -1215,7 +1233,10 @@ async def do_manage_rag(content: str, session_id: Optional[str] = None) -> Dict:
         directory = lines[1].strip()
 
         import os
-        directory = os.path.expanduser(directory)
+        try:
+            directory = resolve_personal_dir(os.path.expanduser(directory), personal_dir=PERSONAL_DIR)
+        except ValueError as e:
+            return {"error": str(e)}
         if not os.path.isdir(directory):
             return {"error": f"Directory not found: {directory}"}
 
@@ -1223,7 +1244,7 @@ async def do_manage_rag(content: str, session_id: Optional[str] = None) -> Dict:
             return {"error": "RAG manager not available"}
 
         try:
-            result = _rag_manager.index_personal_documents(directory)
+            result = _call_owner_aware(_rag_manager.index_personal_documents, directory, owner=owner or "")
             indexed = result.get("indexed", 0) if isinstance(result, dict) else 0
             return {"action": "add_directory", "directory": directory,
                     "results": f"Directory '{directory}' added to RAG index ({indexed} files indexed)"}
@@ -1234,6 +1255,10 @@ async def do_manage_rag(content: str, session_id: Optional[str] = None) -> Dict:
         if len(lines) < 2:
             return {"error": "remove_directory needs line 2: directory path"}
         directory = lines[1].strip()
+        try:
+            directory = resolve_personal_dir(directory, personal_dir=PERSONAL_DIR)
+        except ValueError as e:
+            return {"error": str(e)}
 
         if not _personal_docs_manager:
             return {"error": "Personal docs manager not available"}
@@ -1244,7 +1269,7 @@ async def do_manage_rag(content: str, session_id: Optional[str] = None) -> Dict:
                 # unconditional _rag_manager.rebuild_index() here wiped the whole
                 # collection on every remove (even for untracked dirs) and has
                 # been removed.
-                _personal_docs_manager.remove_directory(directory)
+                _call_owner_aware(_personal_docs_manager.remove_directory, directory, owner=owner or "")
             return {"action": "remove_directory", "directory": directory,
                     "results": f"Directory '{directory}' removed from RAG index"}
         except Exception as e:

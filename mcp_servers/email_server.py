@@ -29,6 +29,8 @@ from mcp.types import Tool, TextContent
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from routes.email_helpers import attachment_extract_dir, _q as _quote_mailbox
+
 server = Server("email")
 EMAIL_SOCKET_TIMEOUT = float(os.environ.get("EMAIL_SOCKET_TIMEOUT", "20"))
 
@@ -52,13 +54,46 @@ def _b(value) -> bytes:
 def _uid_fetch_rows(data) -> list:
     return [d for d in (data or []) if isinstance(d, bytes) and b"UID " in d]
 
+
+_UID_RE = re.compile(r"^[1-9][0-9]*$")
+
+
+def _reject_crlf(value, label: str) -> str:
+    text = str(value or "")
+    if "\r" in text or "\n" in text:
+        raise ValueError(f"{label} must not contain CR/LF")
+    return text
+
+
+def _imap_quoted(value, label: str = "value") -> str:
+    text = _reject_crlf(value, label)
+    return text.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _safe_mailbox(folder) -> str:
+    return _quote_mailbox(_reject_crlf(folder or "INBOX", "folder"))
+
+
+def _validate_uid(uid) -> str:
+    text = uid.decode() if isinstance(uid, bytes) else str(uid or "")
+    text = text.strip()
+    if not _UID_RE.fullmatch(text):
+        raise ValueError("UID must be a decimal IMAP UID")
+    return text
+
+
+def _validate_uid_list(uids) -> list[str]:
+    if isinstance(uids, (str, bytes)) or not isinstance(uids, (list, tuple)):
+        raise ValueError("uids must be a list of decimal IMAP UIDs")
+    return [_validate_uid(uid) for uid in uids]
+
 # ── Config ──
 # Multi-account aware. Accounts live in data/app.db :: email_accounts.
 # Callers can pass `account=` (match by name, user, or id) to pick a specific
 # inbox; None resolves to the default row. Falls back to env vars / settings.json
 # flat keys when no DB row matches (legacy single-account behaviour).
 
-_ACCOUNT_CACHE: dict = {}  # key = normalized account selector -> config dict
+_ACCOUNT_CACHE: dict = {}  # key = (owner, normalized account selector) -> config dict
 
 
 def _clean_header_value(value) -> str:
@@ -72,7 +107,35 @@ def _db_path() -> Path:
     return DATA_DIR / "app.db"
 
 
-def _list_accounts_raw() -> list:
+def _request_owner(owner: str | None = None) -> str:
+    if owner is not None:
+        return str(owner).strip()
+    return os.environ.get("ODYSSEUS_MCP_OWNER", "").strip()
+
+
+def _account_visible_to_owner(row: dict, owner: str) -> bool:
+    """Return whether an email account row can be used by owner.
+
+    Authenticated callers see their own rows plus legacy ownerless rows only
+    when the mailbox itself matches their owner key. Ownerless callers are
+    treated as legacy single-user mode and see only ownerless rows.
+    """
+    row_owner = str(row.get("owner") or "").strip()
+    if owner:
+        if row_owner == owner:
+            return True
+        if row_owner:
+            return False
+        owner_l = owner.lower()
+        mailbox_values = {
+            str(row.get("imap_user") or "").strip().lower(),
+            str(row.get("from_address") or "").strip().lower(),
+        }
+        return owner_l in mailbox_values
+    return not row_owner
+
+
+def _read_accounts_unfiltered() -> list:
     """Return list of dicts from the email_accounts table. Empty list if table
     missing or empty. Never raises."""
     path = _db_path()
@@ -83,8 +146,9 @@ def _list_accounts_raw() -> list:
         conn.row_factory = sqlite3.Row
         columns = {r[1] for r in conn.execute("PRAGMA table_info(email_accounts)").fetchall()}
         smtp_security_select = "smtp_security" if "smtp_security" in columns else "'' AS smtp_security"
+        owner_select = "owner" if "owner" in columns else "'' AS owner"
         rows = conn.execute(f"""
-            SELECT id, name, is_default, enabled,
+            SELECT id, {owner_select}, name, is_default, enabled,
                    imap_host, imap_port, imap_user, imap_password, imap_starttls,
                    smtp_host, smtp_port, {smtp_security_select}, smtp_user, smtp_password, from_address
             FROM email_accounts WHERE enabled = 1
@@ -98,11 +162,22 @@ def _list_accounts_raw() -> list:
         return []
 
 
-def _resolve_account(selector: str | None) -> dict | None:
+def _list_accounts_raw(owner: str | None = None) -> list:
+    """Return enabled accounts visible to owner.
+
+    This server is a long-lived shared MCP process; every call must pass the
+    authenticated owner explicitly. Without an owner we fail closed to
+    ownerless legacy rows instead of returning every user's mailbox.
+    """
+    owner_key = _request_owner(owner)
+    return [r for r in _read_accounts_unfiltered() if _account_visible_to_owner(r, owner_key)]
+
+
+def _resolve_account(selector: str | None, owner: str | None = None) -> dict | None:
     """Given a selector (None = default, or a name/user/id string), return the
     matching row or None. Matching is case-insensitive substring on name +
     imap_user + from_address, plus exact id match."""
-    rows = _list_accounts_raw()
+    rows = _list_accounts_raw(owner)
     if not rows:
         return None
     if not selector:
@@ -137,7 +212,7 @@ def _resolve_account(selector: str | None) -> dict | None:
     return None
 
 
-def _load_config(account: str | None = None) -> dict:
+def _load_config(account: str | None = None, owner: str | None = None) -> dict:
     """Return the full config dict for the requested account (or default).
 
     Resolution order per-field:
@@ -145,7 +220,8 @@ def _load_config(account: str | None = None) -> dict:
       2. env vars + settings.json flat keys (legacy)
       3. hardcoded fallbacks (localhost:31143 etc.)
     """
-    cache_key = (account or "").strip().lower() or "__default__"
+    owner_key = _request_owner(owner)
+    cache_key = (owner_key, (account or "").strip().lower() or "__default__")
     if cache_key in _ACCOUNT_CACHE:
         return _ACCOUNT_CACHE[cache_key]
 
@@ -174,14 +250,17 @@ def _load_config(account: str | None = None) -> dict:
         "account_name": None,
     }
 
-    rows = _list_accounts_raw()
-    row = _resolve_account(account)
-    if account and rows and not row:
+    visible_rows = _list_accounts_raw(owner_key)
+    all_rows_exist = bool(_read_accounts_unfiltered())
+    row = _resolve_account(account, owner_key)
+    if account and (visible_rows or all_rows_exist) and not row:
         available = ", ".join(
             f"{r.get('name') or r.get('imap_user')} <{r.get('imap_user') or r.get('from_address') or '?'}>"
-            for r in rows
-        )
-        raise ValueError(f"Email account not found for selector {account!r}. Available accounts: {available}")
+            for r in visible_rows
+        ) or "none"
+        raise ValueError(f"Email account not found for selector {account!r}. Available accounts for this user: {available}")
+    if owner_key and all_rows_exist and not row:
+        raise ValueError("No email account configured for this user")
     if row:
         cfg["account_id"] = row["id"]
         cfg["account_name"] = row["name"]
@@ -233,10 +312,10 @@ def _load_config(account: str | None = None) -> dict:
 # ── IMAP helpers ──
 
 
-def _imap_connect(account: str | None = None):
+def _imap_connect(account: str | None = None, owner: str | None = None):
     """Connect to IMAP server, returns logged-in connection. account selects
     the mailbox (None = default)."""
-    cfg = _load_config(account)
+    cfg = _load_config(account, owner=owner)
     if cfg["imap_ssl"]:
         conn = imaplib.IMAP4_SSL(
             cfg["imap_host"],
@@ -399,16 +478,31 @@ def _extract_text(msg):
     return ""
 
 
-def _get_cached_summaries():
+def _get_cached_summaries(account: str | None = None, owner: str | None = None):
     """Read pre-computed summaries from SQLite cache."""
-    cfg = _load_config()
+    owner_key = _request_owner(owner)
+    cfg = _load_config(account, owner=owner_key)
     db_path = cfg["cache_db"]
     if not os.path.exists(db_path):
         return {}
     try:
         conn = sqlite3.connect(db_path)
+        columns = {r[1] for r in conn.execute("PRAGMA table_info(email_ai)").fetchall()}
+        if owner_key and not ({"owner", "account_id"} & columns):
+            conn.close()
+            return {}
+        where = []
+        params = []
+        if owner_key and "owner" in columns:
+            where.append("owner = ?")
+            params.append(owner_key)
+        if cfg.get("account_id") and "account_id" in columns:
+            where.append("account_id = ?")
+            params.append(cfg["account_id"])
+        where_sql = f" WHERE {' AND '.join(where)}" if where else ""
         rows = conn.execute(
-            "SELECT subject, sender, summary, suggested_reply FROM email_ai"
+            f"SELECT subject, sender, summary, suggested_reply FROM email_ai{where_sql}",
+            params,
         ).fetchall()
         conn.close()
         result = {}
@@ -448,14 +542,15 @@ def _recent_uids_by_sequence(conn, total, max_results):
 
 
 def _list_emails(folder="INBOX", max_results=20, unresponded_only=False,
-                 unread_only=False, account=None):
+                 unread_only=False, account=None, owner: str | None = None):
     """List emails newest-first. By default returns the latest messages,
     including read mail, so it matches normal inbox UI expectations.
     Pass unread_only=True and/or unresponded_only=True for attention scans.
     account selects mailbox (None = default).
     """
-    conn = _imap_connect(account)
-    select_status, select_data = conn.select(folder, readonly=True)
+    mailbox = _safe_mailbox(folder)
+    conn = _imap_connect(account, owner=owner)
+    select_status, select_data = conn.select(mailbox, readonly=True)
     if select_status != "OK":
         conn.logout()
         raise ValueError(f"IMAP folder not found: {folder}")
@@ -489,7 +584,7 @@ def _list_emails(folder="INBOX", max_results=20, unresponded_only=False,
         conn.logout()
         return []
 
-    cache = _get_cached_summaries()
+    cache = _get_cached_summaries(account, owner=owner)
     results = []
 
     for uid in uid_list:
@@ -542,8 +637,9 @@ def _result_sort_time(result: dict) -> datetime:
 
 
 def _list_emails_across_accounts(folder="INBOX", max_results=20,
-                                 unresponded_only=False, unread_only=False):
-    rows = _list_accounts_raw()
+                                 unresponded_only=False, unread_only=False,
+                                 owner: str | None = None):
+    rows = _list_accounts_raw(owner)
     combined = []
     errors = []
     for row in rows:
@@ -557,6 +653,7 @@ def _list_emails_across_accounts(folder="INBOX", max_results=20,
                 unresponded_only=unresponded_only,
                 unread_only=unread_only,
                 account=account_selector,
+                owner=owner,
             )
             for item in account_results:
                 item["_account"] = account_name
@@ -569,27 +666,28 @@ def _list_emails_across_accounts(folder="INBOX", max_results=20,
     return combined[:max_results], errors
 
 
-def _search_emails(query, folders=None, max_results=20, account=None):
+def _search_emails(query, folders=None, max_results=20, account=None, owner: str | None = None):
     """IMAP-search emails by free-text query. Matches FROM, SUBJECT, and
     body TEXT. Walks multiple folders so older threads outside INBOX
     (Sent/Archive) are still findable. Returns the same shape as
     _list_emails plus an `_folder` tag."""
     if not query or not str(query).strip():
         return []
-    q = str(query).replace("\\", "\\\\").replace('"', '\\"')
+    q = _imap_quoted(query, "query")
     # Mail clients commonly use OR FROM/SUBJECT/TEXT to match either field.
     # IMAP SEARCH OR is binary, so we nest it.
     search_cmd = f'(OR OR FROM "{q}" SUBJECT "{q}" TEXT "{q}")'
     if folders is None:
         folders = ["INBOX", "Sent", "Archive"]
-    cache = _get_cached_summaries()
+    mailboxes = [(folder, _safe_mailbox(folder)) for folder in folders]
+    cache = _get_cached_summaries(account, owner=owner)
     out = []
-    conn = _imap_connect(account)
+    conn = _imap_connect(account, owner=owner)
     touched = []
     try:
-        for folder in folders:
+        for folder, mailbox in mailboxes:
             try:
-                status, _ = conn.select(folder, readonly=True)
+                status, _ = conn.select(mailbox, readonly=True)
                 if status != "OK":
                     continue
                 status, data = conn.uid("SEARCH", None, search_cmd)
@@ -696,14 +794,25 @@ def _extract_attachment_to_disk(msg, index, target_dir):
     return None
 
 
-def _read_email(uid=None, message_id=None, folder="INBOX", account=None):
+def _read_email(uid=None, message_id=None, folder="INBOX", account=None, owner: str | None = None):
     """Read full email content by UID or message-ID. account = mailbox selector."""
-    cfg = _load_config(account)
-    conn = _imap_connect(account)
-    conn.select(folder, readonly=True)
+    try:
+        mailbox = _safe_mailbox(folder)
+        safe_message_id = _imap_quoted(message_id, "message_id") if message_id and not uid else None
+    except ValueError as exc:
+        return {"error": str(exc)}
+    safe_uid = None
+    if uid:
+        try:
+            safe_uid = _validate_uid(uid)
+        except ValueError as exc:
+            return {"error": str(exc)}
+    cfg = _load_config(account, owner=owner)
+    conn = _imap_connect(account, owner=owner)
+    conn.select(mailbox, readonly=True)
 
     if message_id and not uid:
-        status, data = conn.uid("SEARCH", None, f'(HEADER Message-ID "{message_id}")')
+        status, data = conn.uid("SEARCH", None, f'(HEADER Message-ID "{safe_message_id}")')
         if status != "OK" or not data[0]:
             conn.logout()
             return {"error": f"Email not found with Message-ID: {message_id}"}
@@ -713,7 +822,10 @@ def _read_email(uid=None, message_id=None, folder="INBOX", account=None):
         conn.logout()
         return {"error": "No UID or Message-ID provided"}
 
-    status, msg_data = conn.uid("FETCH", _b(uid), "(RFC822)")
+    if safe_uid is None:
+        safe_uid = _validate_uid(uid)
+
+    status, msg_data = conn.uid("FETCH", _b(safe_uid), "(RFC822)")
     if status != "OK":
         conn.logout()
         return {"error": f"Failed to fetch email UID {uid}"}
@@ -749,8 +861,8 @@ def _read_email(uid=None, message_id=None, folder="INBOX", account=None):
     }
 
 
-def _read_email_across_accounts(uid=None, message_id=None, folder="INBOX"):
-    rows = _list_accounts_raw()
+def _read_email_across_accounts(uid=None, message_id=None, folder="INBOX", owner: str | None = None):
+    rows = _list_accounts_raw(owner)
     matches = []
     errors = []
     for row in rows:
@@ -762,6 +874,7 @@ def _read_email_across_accounts(uid=None, message_id=None, folder="INBOX"):
             message_id=message_id,
             folder=folder,
             account=account_selector,
+            owner=owner,
         )
         if "error" in result:
             errors.append(f"{account_name} <{account_email}>: {result['error']}")
@@ -786,23 +899,23 @@ def _smtp_ready(cfg: dict) -> bool:
     return bool(cfg.get("smtp_host") and cfg.get("smtp_user") and cfg.get("smtp_password"))
 
 
-def _resolve_send_config(account=None):
-    cfg = _load_config(account)
+def _resolve_send_config(account=None, owner: str | None = None):
+    cfg = _load_config(account, owner=owner)
     if _smtp_ready(cfg):
         return account, cfg
     if account:
         raise ValueError(f"Email account {cfg.get('account_name') or account} has no SMTP configured")
-    for row in _list_accounts_raw():
+    for row in _list_accounts_raw(owner):
         selector = row.get("id") or row.get("name") or row.get("imap_user")
-        trial = _load_config(selector)
+        trial = _load_config(selector, owner=owner)
         if _smtp_ready(trial):
             return selector, trial
     raise ValueError("No SMTP-capable email account configured")
 
 
-def _smtp_connect(account=None, cfg=None):
+def _smtp_connect(account=None, cfg=None, owner: str | None = None):
     """Connect to SMTP server, returns logged-in connection."""
-    cfg = cfg or _load_config(account)
+    cfg = cfg or _load_config(account, owner=owner)
     if not _smtp_ready(cfg):
         raise ValueError(f"Email account {cfg.get('account_name') or account or 'default'} has no SMTP configured")
     port = int(cfg.get("smtp_port") or 465)
@@ -833,9 +946,9 @@ def _smtp_connect(account=None, cfg=None):
     return conn
 
 
-def _send_email(to, subject, body, in_reply_to=None, references=None, cc=None, bcc=None, account=None):
+def _send_email(to, subject, body, in_reply_to=None, references=None, cc=None, bcc=None, account=None, owner: str | None = None):
     """Send an email via SMTP. Returns dict with status."""
-    send_account, cfg = _resolve_send_config(account)
+    send_account, cfg = _resolve_send_config(account, owner=owner)
     msg = EmailMessage()
     msg["From"] = _clean_header_value(cfg["from_address"])
     msg["To"] = _clean_header_value(to if isinstance(to, str) else ", ".join(to))
@@ -862,7 +975,7 @@ def _send_email(to, subject, body, in_reply_to=None, references=None, cc=None, b
     if bcc:
         recipients.extend([a.strip() for a in bcc.split(",")] if isinstance(bcc, str) else bcc)
 
-    conn = _smtp_connect(send_account, cfg=cfg)
+    conn = _smtp_connect(send_account, cfg=cfg, owner=owner)
     try:
         conn.send_message(msg, from_addr=cfg["from_address"], to_addrs=recipients)
     finally:
@@ -871,7 +984,7 @@ def _send_email(to, subject, body, in_reply_to=None, references=None, cc=None, b
     sent_folder = None
     sent_uid = None
     try:
-        imap = _imap_connect(send_account)
+        imap = _imap_connect(send_account, owner=owner)
         try:
             sent_folder = _detect_sent_folder(imap)
             append_st, append_data = imap.append(sent_folder, "\\Seen", None, msg.as_bytes())
@@ -898,10 +1011,14 @@ def _send_email(to, subject, body, in_reply_to=None, references=None, cc=None, b
     }
 
 
-def _reply_to_email(uid, body, folder="INBOX", reply_all=False, account=None):
+def _reply_to_email(uid, body, folder="INBOX", reply_all=False, account=None, owner: str | None = None):
     """Reply to an existing email by UID. Threads via In-Reply-To/References."""
-    conn = _imap_connect(account)
-    conn.select(folder, readonly=True)
+    try:
+        uid = _validate_uid(uid)
+    except ValueError as exc:
+        return {"error": str(exc)}
+    conn = _imap_connect(account, owner=owner)
+    conn.select(_safe_mailbox(folder), readonly=True)
     status, msg_data = conn.uid("FETCH", _b(uid), "(RFC822)")
     conn.logout()
     if status != "OK" or not msg_data or not msg_data[0]:
@@ -937,13 +1054,18 @@ def _reply_to_email(uid, body, folder="INBOX", reply_all=False, account=None):
         references=new_references,
         cc=cc,
         account=account,
+        owner=owner,
     )
 
 
-def _set_flag(uid, folder, flag, add=True, account=None):
+def _set_flag(uid, folder, flag, add=True, account=None, owner: str | None = None):
     """Add or remove an IMAP flag (e.g. \\Seen, \\Answered, \\Deleted)."""
-    conn = _imap_connect(account)
-    conn.select(folder)
+    try:
+        uid = _validate_uid(uid)
+    except ValueError:
+        return False
+    conn = _imap_connect(account, owner=owner)
+    conn.select(_safe_mailbox(folder))
     op = "+FLAGS" if add else "-FLAGS"
     try:
         status, data = conn.uid("STORE", _b(uid), op, flag)
@@ -956,16 +1078,20 @@ def _set_flag(uid, folder, flag, add=True, account=None):
         conn.logout()
 
 
-def _bulk_set_flag(uids, folder, flag, add=True, account=None):
+def _bulk_set_flag(uids, folder, flag, add=True, account=None, owner: str | None = None):
     """Add/remove an IMAP flag on MANY messages in one connection.
     `uids` is a list; we issue a single STORE over the comma-joined set
     (IMAP supports message-set syntax). Returns count attempted."""
     if not uids:
         return 0
-    conn = _imap_connect(account)
+    try:
+        uids = _validate_uid_list(uids)
+    except ValueError:
+        return 0
+    conn = _imap_connect(account, owner=owner)
     touched = []
     try:
-        conn.select(folder)
+        conn.select(_safe_mailbox(folder))
         op = "+FLAGS" if add else "-FLAGS"
         msg_set = ",".join(str(u) for u in uids)
         try:
@@ -985,15 +1111,20 @@ def _bulk_set_flag(uids, folder, flag, add=True, account=None):
     return len(touched)
 
 
-def _bulk_move(uids, source_folder, dest_folder, account=None, role: str = ""):
+def _bulk_move(uids, source_folder, dest_folder, account=None, role: str = "", owner: str | None = None):
     """Move MANY messages between folders in one connection."""
     if not uids:
         return 0
-    conn = _imap_connect(account)
+    try:
+        uids = _validate_uid_list(uids)
+    except ValueError:
+        return 0
+    conn = _imap_connect(account, owner=owner)
     moved = 0
     try:
-        conn.select(source_folder)
+        conn.select(_safe_mailbox(source_folder))
         dest_folder = _resolve_folder(conn, dest_folder, role or _folder_role_from_name(dest_folder))
+        dest_mailbox = _safe_mailbox(dest_folder)
         msg_set = ",".join(str(u) for u in uids)
         try:
             status, data = conn.uid("FETCH", _b(msg_set), "(UID)")
@@ -1003,10 +1134,10 @@ def _bulk_move(uids, source_folder, dest_folder, account=None, role: str = ""):
         if not existing:
             return 0
         moved = len(existing)
-        status, _ = conn.uid("MOVE", _b(msg_set), dest_folder)
+        status, _ = conn.uid("MOVE", _b(msg_set), dest_mailbox)
         if status != "OK":
             # Fallback: UID copy + flag-delete + expunge
-            status, _ = conn.uid("COPY", _b(msg_set), dest_folder)
+            status, _ = conn.uid("COPY", _b(msg_set), dest_mailbox)
             if status != "OK":
                 return 0
             status, _ = conn.uid("STORE", _b(msg_set), "+FLAGS", "\\Deleted")
@@ -1018,12 +1149,12 @@ def _bulk_move(uids, source_folder, dest_folder, account=None, role: str = ""):
     return moved
 
 
-def _search_uids(folder="INBOX", criteria="UNSEEN", account=None):
+def _search_uids(folder="INBOX", criteria="UNSEEN", account=None, owner: str | None = None):
     """Return a list of UIDs matching an IMAP search (e.g. UNSEEN,
     ALL, ANSWERED). Used to resolve selectors like all_unread → uids."""
-    conn = _imap_connect(account)
+    conn = _imap_connect(account, owner=owner)
     try:
-        conn.select(folder, readonly=True)
+        conn.select(_safe_mailbox(folder), readonly=True)
         status, data = conn.uid("SEARCH", None, criteria)
         if status != "OK" or not data or not data[0]:
             return []
@@ -1032,12 +1163,17 @@ def _search_uids(folder="INBOX", criteria="UNSEEN", account=None):
         conn.logout()
 
 
-def _move_message(uid, source_folder, dest_folder, account=None, role: str = ""):
+def _move_message(uid, source_folder, dest_folder, account=None, role: str = "", owner: str | None = None):
     """Move a message between folders. Tries IMAP MOVE, falls back to copy+delete."""
-    conn = _imap_connect(account)
-    conn.select(source_folder)
+    try:
+        uid = _validate_uid(uid)
+    except ValueError:
+        return False
+    conn = _imap_connect(account, owner=owner)
+    conn.select(_safe_mailbox(source_folder))
     try:
         dest_folder = _resolve_folder(conn, dest_folder, role or _folder_role_from_name(dest_folder))
+        dest_mailbox = _safe_mailbox(dest_folder)
         try:
             status, data = conn.uid("FETCH", _b(uid), "(UID)")
         except Exception:
@@ -1045,11 +1181,11 @@ def _move_message(uid, source_folder, dest_folder, account=None, role: str = "")
         existing = _uid_fetch_rows(data)
         if status != "OK" or not existing:
             return False
-        status, _ = conn.uid("MOVE", _b(uid), dest_folder)
+        status, _ = conn.uid("MOVE", _b(uid), dest_mailbox)
         if status == "OK":
             return True
         # Fallback: UID copy + delete
-        status, _ = conn.uid("COPY", _b(uid), dest_folder)
+        status, _ = conn.uid("COPY", _b(uid), dest_mailbox)
         if status != "OK":
             return False
         status, _ = conn.uid("STORE", _b(uid), "+FLAGS", "\\Deleted")
@@ -1062,24 +1198,28 @@ def _move_message(uid, source_folder, dest_folder, account=None, role: str = "")
     return ok
 
 
-def _delete_email(uid, folder="INBOX", permanent=False, account=None):
+def _delete_email(uid, folder="INBOX", permanent=False, account=None, owner: str | None = None):
     """Delete an email. By default moves to Trash; permanent=True expunges."""
-    cfg = _load_config(account)
+    cfg = _load_config(account, owner=owner)
     if permanent:
-        return _set_flag(uid, folder, "\\Deleted", add=True, account=account)
-    return _move_message(uid, folder, cfg["trash_folder"], account=account, role="trash")
+        return _set_flag(uid, folder, "\\Deleted", add=True, account=account, owner=owner)
+    return _move_message(uid, folder, cfg["trash_folder"], account=account, role="trash", owner=owner)
 
 
-def _archive_email(uid, folder="INBOX", account=None):
+def _archive_email(uid, folder="INBOX", account=None, owner: str | None = None):
     """Move an email to the archive folder."""
-    cfg = _load_config(account)
-    return _move_message(uid, folder, cfg["archive_folder"], account=account, role="archive")
+    cfg = _load_config(account, owner=owner)
+    return _move_message(uid, folder, cfg["archive_folder"], account=account, role="archive", owner=owner)
 
 
-def _download_attachment(uid, index, folder="INBOX", account=None):
+def _download_attachment(uid, index, folder="INBOX", account=None, owner: str | None = None):
     """Extract a specific attachment to disk and return its local path."""
-    conn = _imap_connect(account)
-    conn.select(folder, readonly=True)
+    try:
+        uid = _validate_uid(uid)
+    except ValueError as exc:
+        return {"error": str(exc)}
+    conn = _imap_connect(account, owner=owner)
+    conn.select(_safe_mailbox(folder), readonly=True)
     status, msg_data = conn.uid("FETCH", _b(uid), "(RFC822)")
     conn.logout()
     if status != "OK":
@@ -1087,7 +1227,7 @@ def _download_attachment(uid, index, folder="INBOX", account=None):
     raw = msg_data[0][1]
     msg = email.message_from_bytes(raw)
 
-    target_dir = DATA_DIR / "mail-attachments" / f"{folder}_{uid}"
+    target_dir = attachment_extract_dir(folder, uid)
     filepath = _extract_attachment_to_disk(msg, index, target_dir)
     if not filepath:
         return {"error": f"Attachment index {index} not found"}
@@ -1357,8 +1497,10 @@ async def list_tools() -> list[Tool]:
 @server.call_tool()
 async def call_tool(name: str, arguments: dict) -> list[TextContent]:
     try:
+        arguments = arguments or {}
+        owner = _request_owner(arguments.get("_odysseus_owner"))
         if name == "list_email_accounts":
-            rows = _list_accounts_raw()
+            rows = _list_accounts_raw(owner)
             if not rows:
                 return [TextContent(type="text", text="No email accounts configured. Legacy single-account mode active.")]
             lines = [f"Found {len(rows)} email account(s):\n"]
@@ -1380,7 +1522,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             # Build a header note so the LLM always knows which account was hit
             # AND what other accounts exist. Prevents "I can see emails" →
             # user: "I have 2 inboxes" → "which one?" loop.
-            all_accounts = _list_accounts_raw()
+            all_accounts = _list_accounts_raw(owner)
             header_lines = []
             errors = []
             if len(all_accounts) >= 2 and not acct:
@@ -1389,6 +1531,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                     max_results=max_results,
                     unresponded_only=unresponded_only,
                     unread_only=unread_only,
+                    owner=owner,
                 )
                 account_names = [
                     f"{a.get('name') or a.get('imap_user')} <{a.get('imap_user') or a.get('from_address') or '?'}>"
@@ -1405,15 +1548,16 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                     unresponded_only=unresponded_only,
                     unread_only=unread_only,
                     account=acct,
+                    owner=owner,
                 )
-                active_cfg = _load_config(acct)
+                active_cfg = _load_config(acct, owner=owner)
                 if active_cfg.get("account_name") or active_cfg.get("imap_user"):
                     for item in results:
                         item["_account"] = active_cfg.get("account_name") or active_cfg.get("imap_user") or "default"
                         item["_account_email"] = active_cfg.get("imap_user") or ""
 
             if len(all_accounts) >= 2 and acct:
-                active_cfg = _load_config(acct)
+                active_cfg = _load_config(acct, owner=owner)
                 active_name = active_cfg.get("account_name") or "default"
                 active_email = active_cfg.get("imap_user") or ""
                 other = [
@@ -1454,7 +1598,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             folder = arguments.get("folder", "INBOX")
             if uid is None or index is None:
                 return [TextContent(type="text", text="Error: uid and index are required")]
-            result = _download_attachment(uid, index, folder, account=acct)
+            result = _download_attachment(uid, index, folder, account=acct, owner=owner)
             if "error" in result:
                 return [TextContent(type="text", text=f"Error: {result['error']}")]
             text = (
@@ -1470,7 +1614,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             folders = arguments.get("folders") or None
             max_results = arguments.get("max_results", 20)
             try:
-                hits = _search_emails(q, folders=folders, max_results=max_results, account=acct)
+                hits = _search_emails(q, folders=folders, max_results=max_results, account=acct, owner=owner)
             except Exception as e:
                 return [TextContent(type="text", text=f"Search failed: {e}")]
             if not hits:
@@ -1491,12 +1635,13 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             return [TextContent(type="text", text="\n".join(lines))]
 
         elif name == "read_email":
-            all_accounts = _list_accounts_raw()
+            all_accounts = _list_accounts_raw(owner)
             if len(all_accounts) >= 2 and not acct:
                 result = _read_email_across_accounts(
                     uid=arguments.get("uid"),
                     message_id=arguments.get("message_id"),
                     folder=arguments.get("folder", "INBOX"),
+                    owner=owner,
                 )
             else:
                 result = _read_email(
@@ -1504,6 +1649,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                     message_id=arguments.get("message_id"),
                     folder=arguments.get("folder", "INBOX"),
                     account=acct,
+                    owner=owner,
                 )
             if "error" in result:
                 return [TextContent(type="text", text=f"Error: {result['error']}")]
@@ -1538,6 +1684,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 cc=arguments.get("cc"),
                 bcc=arguments.get("bcc"),
                 account=acct,
+                owner=owner,
             )
             acct_note = f" (from {result['account']})" if result.get("account") else ""
             return [TextContent(type="text", text=f"Sent email to {result['to']} with subject '{result['subject']}'{acct_note}.")]
@@ -1553,12 +1700,13 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 folder=arguments.get("folder", "INBOX"),
                 reply_all=bool(arguments.get("reply_all", False)),
                 account=acct,
+                owner=owner,
             )
             if "error" in result:
                 return [TextContent(type="text", text=f"Error: {result['error']}")]
             # Mark original as answered
             try:
-                _set_flag(uid, arguments.get("folder", "INBOX"), "\\Answered", add=True, account=acct)
+                _set_flag(uid, arguments.get("folder", "INBOX"), "\\Answered", add=True, account=acct, owner=owner)
             except Exception:
                 pass
             return [TextContent(type="text", text=f"Replied to UID {uid}: '{result['subject']}' → {result['to']}")]
@@ -1567,7 +1715,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             uid = arguments.get("uid")
             if not uid:
                 return [TextContent(type="text", text="Error: uid is required")]
-            ok = _archive_email(uid, arguments.get("folder", "INBOX"), account=acct)
+            ok = _archive_email(uid, arguments.get("folder", "INBOX"), account=acct, owner=owner)
             return [TextContent(type="text", text=f"{'Archived' if ok else 'Failed to archive'} UID {uid}")]
 
         elif name == "delete_email":
@@ -1579,6 +1727,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 arguments.get("folder", "INBOX"),
                 permanent=bool(arguments.get("permanent", False)),
                 account=acct,
+                owner=owner,
             )
             return [TextContent(type="text", text=f"{'Deleted' if ok else 'Failed to delete'} UID {uid}")]
 
@@ -1587,7 +1736,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             if not uid:
                 return [TextContent(type="text", text="Error: uid is required")]
             read = bool(arguments.get("read", True))
-            ok = _set_flag(uid, arguments.get("folder", "INBOX"), "\\Seen", add=read, account=acct)
+            ok = _set_flag(uid, arguments.get("folder", "INBOX"), "\\Seen", add=read, account=acct, owner=owner)
             state = "read" if read else "unread"
             return [TextContent(type="text", text=f"{'Marked' if ok else 'Failed to mark'} UID {uid} as {state}")]
 
@@ -1597,35 +1746,35 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             all_unread = bool(arguments.get("all_unread", False))
             uids = arguments.get("uids") or []
             if all_unread:
-                uids = _search_uids(folder, "UNSEEN", account=acct)
+                uids = _search_uids(folder, "UNSEEN", account=acct, owner=owner)
             if not uids:
                 return [TextContent(type="text", text="No messages selected (pass uids or all_unread=true).")]
             requested_n = len(uids)
             changed_n = 0
             try:
                 if action == "mark_read":
-                    changed_n = _bulk_set_flag(uids, folder, "\\Seen", add=True, account=acct)
+                    changed_n = _bulk_set_flag(uids, folder, "\\Seen", add=True, account=acct, owner=owner)
                     verb = "marked read"
                 elif action == "mark_unread":
-                    changed_n = _bulk_set_flag(uids, folder, "\\Seen", add=False, account=acct)
+                    changed_n = _bulk_set_flag(uids, folder, "\\Seen", add=False, account=acct, owner=owner)
                     verb = "marked unread"
                 elif action == "archive":
-                    cfg = _load_config(acct)
-                    changed_n = _bulk_move(uids, folder, cfg["archive_folder"], account=acct, role="archive")
+                    cfg = _load_config(acct, owner=owner)
+                    changed_n = _bulk_move(uids, folder, cfg["archive_folder"], account=acct, role="archive", owner=owner)
                     verb = "archived"
                 elif action == "junk":
-                    cfg = _load_config(acct)
+                    cfg = _load_config(acct, owner=owner)
                     junk_folder = cfg.get("junk_folder") or "Junk"
-                    changed_n = _bulk_move(uids, folder, junk_folder, account=acct, role="junk")
+                    changed_n = _bulk_move(uids, folder, junk_folder, account=acct, role="junk", owner=owner)
                     verb = "moved to Junk"
                 elif action == "delete":
                     permanent = bool(arguments.get("permanent", False))
                     if permanent:
-                        changed_n = _bulk_set_flag(uids, folder, "\\Deleted", add=True, account=acct)
+                        changed_n = _bulk_set_flag(uids, folder, "\\Deleted", add=True, account=acct, owner=owner)
                         verb = "permanently deleted"
                     else:
-                        cfg = _load_config(acct)
-                        changed_n = _bulk_move(uids, folder, cfg["trash_folder"], account=acct, role="trash")
+                        cfg = _load_config(acct, owner=owner)
+                        changed_n = _bulk_move(uids, folder, cfg["trash_folder"], account=acct, role="trash", owner=owner)
                         verb = "moved to Trash"
                 else:
                     return [TextContent(type="text", text=f"Unknown bulk action: {action!r}. Use mark_read/mark_unread/archive/delete/junk.")]

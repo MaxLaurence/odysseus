@@ -4,12 +4,11 @@ Design: Odysseus does NOT reimplement Anthropic/OpenAI OAuth. It *wraps* each CL
 own login flow, run inside an isolated, per-owner config directory so multiple
 Odysseus users never share one OS keychain / ``~/.claude`` / ``~/.codex``:
 
-  - Claude: ``claude setup-token`` (requires a Claude subscription) runs the browser
-            OAuth flow and prints a long-lived token. We run it on a PTY (so the user
-            can complete the browser step and see the prompt), capture the printed
-            ``sk-ant-oat…`` token, store it Fernet-encrypted, and inject it at agent
-            launch as ``CLAUDE_CODE_OAUTH_TOKEN`` (which takes precedence over the
-            keychain). ``CLAUDE_CONFIG_DIR`` is also set to the isolated dir.
+  - Claude: ``claude auth login --claudeai`` runs the browser OAuth flow and writes
+            credentials into the isolated ``CLAUDE_CONFIG_DIR`` (a credentials file on
+            Linux, or macOS Keychain plus account metadata in ``.claude.json``). Agent
+            launches point Claude at that config dir and never inject the OAuth token
+            through process environment.
   - Codex:  ``codex login`` runs the ChatGPT browser OAuth flow (its own localhost
             callback) and writes ``auth.json`` under ``CODEX_HOME``. We point
             ``CODEX_HOME`` at the isolated dir and detect ``auth.json`` to mark
@@ -33,6 +32,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -43,6 +43,7 @@ from typing import Any
 
 from core.constants import DATA_DIR
 from core.database import CodingProviderAuth, SessionLocal
+from src.child_process_env import safe_child_env
 from src.coding_pty_bridge import CodingPtyBridge, dtach_bin
 
 logger = logging.getLogger(__name__)
@@ -63,6 +64,37 @@ _PROVIDER_BIN = {"claude": "claude", "codex": "codex"}
 # How long the completion watcher waits for the login to finish (seconds).
 _WATCH_TIMEOUT = 600
 _WATCH_INTERVAL = 2.0
+_AUTH_REDACTION = "[redacted]"
+_AUTH_SECRET_VALUE_PATTERNS = (
+    re.compile(r"(?i)(\bauthorization\s*[:=]\s*bearer\s+)([^\s\"'`,;]+)"),
+    re.compile(
+        r"(?i)(\b(?:access[_-]?token|refresh[_-]?token|id[_-]?token|api[_-]?key|"
+        r"client[_-]?secret|password|secret|credential|credentials)\s*[:=]\s*[\"']?)([^\s\"'`,;}]+)"
+    ),
+)
+_AUTH_BARE_SECRET_PATTERNS = (
+    re.compile(r"\bsk-(?:proj-|ant-)?[A-Za-z0-9_-]{12,}"),
+    re.compile(r"\bhf_[A-Za-z0-9]{20,}"),
+    re.compile(r"\body_(?:cp|tool|oauth|internal)[A-Za-z0-9_:-]*"),
+    re.compile(r"\beyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}"),
+)
+
+
+def _redact_auth_output_text(text: str) -> str:
+    if not text:
+        return text
+    redacted = text
+    for pattern in _AUTH_SECRET_VALUE_PATTERNS:
+        redacted = pattern.sub(lambda match: f"{match.group(1)}{_AUTH_REDACTION}", redacted)
+    for pattern in _AUTH_BARE_SECRET_PATTERNS:
+        redacted = pattern.sub(_AUTH_REDACTION, redacted)
+    return redacted
+
+
+def _redact_auth_output_bytes(data: bytes) -> bytes:
+    if not data:
+        return data
+    return _redact_auth_output_text(data.decode("utf-8", errors="replace")).encode("utf-8")
 
 
 def normalize_provider(provider: str | None) -> str:
@@ -120,6 +152,36 @@ def _restrict_file(path: Path) -> None:
         os.chmod(path, 0o600)
     except Exception:
         pass
+
+
+def _write_json_owner_only(path: Path, data: dict[str, Any]) -> None:
+    """Atomically write JSON using 0600 for the temp and final file.
+
+    These files can carry account metadata and, for Linux Claude credentials, OAuth
+    tokens. `Path.write_text()` followed by chmod leaves an avoidable window with the
+    process umask's default permissions, so keep the file owner-only for its whole
+    lifetime.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f"{path.name}.tmp.{os.getpid()}")
+    fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(data, handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
+        _restrict_file(path)
+    except Exception:
+        try:
+            os.close(fd)
+        except Exception:
+            pass
+        try:
+            tmp.unlink()
+        except Exception:
+            pass
+        raise
 
 
 # --- Claude credential STORE (file vs macOS Keychain) -----------------------
@@ -185,6 +247,37 @@ def _write_claude_keychain(config_dir: Path, data: dict[str, Any]) -> bool:
         return False
 
 
+def _delete_claude_keychain(config_dir: Path) -> bool:
+    if not _is_macos():
+        return False
+    try:
+        proc = subprocess.run(
+            ["security", "delete-generic-password", "-s", _claude_keychain_service(config_dir)],
+            capture_output=True, text=True, timeout=10,
+        )
+        return proc.returncode == 0
+    except Exception:
+        return False
+
+
+def _clear_claude_account_metadata(config_dir: Path) -> None:
+    cfg = config_dir / ".claude.json"
+    try:
+        if not cfg.is_file():
+            return
+        data = json.loads(cfg.read_text())
+        if not isinstance(data, dict):
+            _restrict_file(cfg)
+            return
+        if "oauthAccount" in data:
+            data.pop("oauthAccount", None)
+            _write_json_owner_only(cfg, data)
+        else:
+            _restrict_file(cfg)
+    except Exception:
+        logger.debug("Failed to clear Claude account metadata", exc_info=True)
+
+
 def read_claude_credentials_raw(config_dir: Path) -> tuple[str, dict[str, Any]]:
     """Return (store, full_data): store is 'file' | 'keychain' | '' and full_data is the
     parsed credential JSON exactly as stored (so a refresh write-back preserves shape)."""
@@ -208,8 +301,7 @@ def write_claude_credentials_raw(config_dir: Path, store: str, data: dict[str, A
         return
     creds = _claude_credentials_file(config_dir)
     try:
-        creds.write_text(json.dumps(data))
-        _restrict_file(creds)
+        _write_json_owner_only(creds, data)
     except Exception:
         logger.debug("Failed to persist Claude credentials file", exc_info=True)
 
@@ -239,10 +331,54 @@ def claude_login_present(config_dir: Path) -> bool:
     return False
 
 
-def _decrypt(value: str | None) -> str:
-    # token_encrypted is an EncryptedText column, so the ORM already decrypts it on
-    # read. This guard only matters if a raw value sneaks through.
-    return (value or "").strip()
+def ensure_claude_noninteractive(config_dir: Path, workspace: str | None = None) -> None:
+    """Pre-seed the isolated `.claude.json` so an interactive `claude` launch skips the
+    first-run wizard.
+
+    `claude auth login` writes the OAuth login but NOT the onboarding-complete markers, so
+    the agent's terminal otherwise runs the full first-run flow (theme/intro/tips + the
+    per-folder "do you trust this directory?" prompt) — which looks exactly like a fresh,
+    un-logged-in instance even though the credentials are present. We set the same flags a
+    normally-onboarded `~/.claude.json` carries:
+      - top-level ``hasCompletedOnboarding`` → skips the onboarding wizard
+      - ``projects[<workspace>].hasTrustDialogAccepted`` (+ a seen count) → skips the trust
+        dialog for the run's working directory.
+    Idempotent: only writes when something actually changes. (Theme is intentionally left
+    unset — a fully onboarded global config carries no `theme` key and shows no picker.)"""
+    cfg = config_dir / ".claude.json"
+    try:
+        data = json.loads(cfg.read_text()) if cfg.is_file() else {}
+        if not isinstance(data, dict):
+            data = {}
+    except Exception:
+        data = {}
+    changed = False
+    if not data.get("hasCompletedOnboarding"):
+        data["hasCompletedOnboarding"] = True
+        changed = True
+    ws = (workspace or "").strip()
+    if ws:
+        projects = data.get("projects")
+        if not isinstance(projects, dict):
+            projects = {}
+            data["projects"] = projects
+        entry = projects.get(ws)
+        if not isinstance(entry, dict):
+            entry = {}
+            projects[ws] = entry
+        if not entry.get("hasTrustDialogAccepted"):
+            entry["hasTrustDialogAccepted"] = True
+            changed = True
+        if not entry.get("projectOnboardingSeenCount"):
+            entry["projectOnboardingSeenCount"] = 1
+            changed = True
+    if changed:
+        try:
+            _write_json_owner_only(cfg, data)
+        except Exception:
+            logger.debug("Failed to seed claude non-interactive flags", exc_info=True)
+    elif cfg.exists():
+        _restrict_file(cfg)
 
 
 # --- launch-env injection (called from coding_model_config.build_launch_env) ----
@@ -264,23 +400,22 @@ def subscription_logged_in(db, owner: str | None, provider: str) -> bool:
     return False
 
 
-def subscription_launch_env(db, owner: str | None, harness_id: str | None) -> dict[str, str]:
+def subscription_launch_env(db, owner: str | None, harness_id: str | None,
+                            workspace: str | None = None) -> dict[str, str]:
     """Env to inject when a thread uses ``auth_mode="subscription"``.
 
-    Points the CLI at the owner's isolated credential dir (and, for Claude, prefers
-    the stored OAuth token). Returns {} for harnesses without a subscription concept.
+    Points the CLI at the owner's isolated credential dir. For Claude we also pre-seed the
+    isolated config's onboarding/trust flags (see ``ensure_claude_noninteractive``) so the
+    interactive agent terminal doesn't run the first-run wizard and look un-logged-in.
+    Returns {} for harnesses without a subscription concept.
     """
     provider = normalize_provider(harness_id)
     if not provider:
         return {}
     if provider == "claude":
-        row = _load_row(db, owner, "claude")
-        token = _decrypt(row.token_encrypted) if row is not None else ""
         config_dir = auth_config_dir(owner, "claude")
-        env = {"CLAUDE_CONFIG_DIR": str(config_dir)}
-        if token:
-            env["CLAUDE_CODE_OAUTH_TOKEN"] = token
-        return env
+        ensure_claude_noninteractive(config_dir, workspace)
+        return {"CLAUDE_CONFIG_DIR": str(config_dir)}
     if provider == "codex":
         return {"CODEX_HOME": str(auth_config_dir(owner, "codex"))}
     return {}
@@ -442,8 +577,8 @@ class CodingAuthService:
             pass
         except Exception:
             pass
-        # Pre-create the capture log owner-only (0o600). The login PTY can briefly print
-        # a plaintext OAuth token (claude setup-token) into it before the watcher scrubs
+        # Pre-create the capture log owner-only (0o600). Login flows can expose
+        # sensitive OAuth/status details in terminal output before the watcher scrubs
         # it, so it must never be world-readable under the default umask.
         try:
             os.close(os.open(str(log_path), os.O_CREAT | os.O_WRONLY, 0o600))
@@ -460,7 +595,13 @@ class CodingAuthService:
             self._set_status(owner, prov, "error", error=err or "failed to start login session")
             raise CodingAuthError(500, f"Failed to start login: {err or result.returncode}")
 
-        self._capture_tasks[name] = self._pty.start_capture(name, log_path, init_cols=cols, init_rows=rows)
+        self._capture_tasks[name] = self._pty.start_capture(
+            name,
+            log_path,
+            init_cols=cols,
+            init_rows=rows,
+            output_redactor=_redact_auth_output_bytes,
+        )
         self._set_status(owner, prov, "pending", config_dir=str(config_dir), error=None)
         self._watch_tasks[name] = asyncio.create_task(
             self._watch_completion(owner, prov, name, log_path, config_dir)
@@ -477,8 +618,7 @@ class CodingAuthService:
         return dtach_bin() is not None
 
     def _login_env(self, provider: str, config_dir: Path) -> dict[str, str]:
-        env = {k: v for k, v in os.environ.items() if not k.startswith("ODYSSEUS_")}
-        env["TERM"] = env.get("TERM") or "xterm-256color"
+        env = safe_child_env({"TERM": "xterm-256color"})
         if provider == "claude":
             env["CLAUDE_CONFIG_DIR"] = str(config_dir)
         elif provider == "codex":
@@ -541,6 +681,9 @@ class CodingAuthService:
                 creds = _claude_credentials_file(config_dir)
                 if _file_has_content(creds):
                     _restrict_file(creds)
+                # Seed onboarding flags now so the FIRST coding-agent launch in this
+                # freshly-logged-in config dir doesn't run the first-run wizard.
+                ensure_claude_noninteractive(config_dir)
                 await self._teardown_session(name)
                 self._scrub_log(log_path)
                 self._set_status(
@@ -596,6 +739,9 @@ class CodingAuthService:
         name = self._session_name(owner, prov)
         await self._teardown_session(name)
         config_dir = auth_config_dir(owner, prov, create=False)
+        if prov == "claude":
+            _delete_claude_keychain(config_dir)
+            _clear_claude_account_metadata(config_dir)
         for fname in (".credentials.json", "auth.json", "login.log"):
             try:
                 (config_dir / fname).unlink()
@@ -615,7 +761,14 @@ class CodingAuthService:
             return
         name = self._session_name(owner, prov)
         log_path = auth_config_dir(owner, prov, create=False) / "login.log"
-        await self._pty.attach_session(websocket, name, cols=cols, rows=rows, log_path=log_path)
+        await self._pty.attach_session(
+            websocket,
+            name,
+            cols=cols,
+            rows=rows,
+            log_path=log_path,
+            output_redactor=_redact_auth_output_bytes,
+        )
 
     # ---- internals -------------------------------------------------------
 

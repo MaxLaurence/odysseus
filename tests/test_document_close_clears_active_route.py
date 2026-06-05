@@ -14,8 +14,11 @@ while completing reliably everywhere.
 
 import tempfile
 import uuid
+from datetime import datetime
 from types import SimpleNamespace
 
+import pytest
+from fastapi import HTTPException
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import NullPool
@@ -23,7 +26,7 @@ from unittest.mock import MagicMock
 
 import core.database as cdb
 import routes.document_routes as droutes
-from core.database import Document
+from core.database import Document, DocumentVersion
 from core.database import Session as DbSession
 from routes.document_helpers import DocumentPatch
 from src.tool_implementations import set_active_document, get_active_document
@@ -91,3 +94,39 @@ async def test_unlinking_a_different_doc_leaves_pointer():
     set_active_document(active_id)
     await patch_document(_req(), other_id, DocumentPatch(session_id=""))
     assert get_active_document() == active_id
+
+
+async def test_orphaned_document_versions_do_not_leak_without_parent_doc():
+    list_versions = _endpoint("GET", "/api/document/{doc_id}/versions")
+    get_version = _endpoint("GET", "/api/document/{doc_id}/version/{num}")
+    doc_id = "missing-doc-" + uuid.uuid4().hex[:8]
+    with _ENGINE.connect() as conn:
+        conn.exec_driver_sql("PRAGMA foreign_keys=OFF")
+        conn.exec_driver_sql(
+            """
+            INSERT INTO document_versions
+                (id, document_id, version_number, content, summary, source, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                str(uuid.uuid4()),
+                doc_id,
+                1,
+                "orphaned secret content",
+                "orphan",
+                "user",
+                datetime.utcnow(),
+            ),
+        )
+        conn.commit()
+        conn.exec_driver_sql("PRAGMA foreign_keys=ON")
+
+    with pytest.raises(HTTPException) as list_exc:
+        await list_versions(_req(), doc_id)
+    assert list_exc.value.status_code == 404
+    assert list_exc.value.detail == "Document not found"
+
+    with pytest.raises(HTTPException) as get_exc:
+        await get_version(_req(), doc_id, 1)
+    assert get_exc.value.status_code == 404
+    assert get_exc.value.detail == "Document not found"

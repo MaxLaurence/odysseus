@@ -3,6 +3,7 @@ import os
 import re
 import json
 import logging
+import inspect
 from typing import List, Dict, Set, Any, Tuple
 from dataclasses import dataclass
 
@@ -76,7 +77,13 @@ def split_chunks(text: str, size: int = config.CHUNK_SIZE, overlap: int = config
     n = len(text)
     while i < n:
         j = min(i + size, n)
-        chunks.append(text[i:j])
+        chunk = text[i:j]
+        if j >= n and len(chunk) > overlap and len(set(chunk)) > 1:
+            start = max(0, n - size)
+            expanded = text[start:n]
+            if any(chunk in previous for previous in chunks) and expanded not in chunks:
+                chunk = expanded
+        chunks.append(chunk)
         if j >= n:
             # Reached the end. Without this, the next start (j - overlap) is
             # still > i, so the loop appended one extra chunk duplicating the
@@ -148,7 +155,7 @@ def retrieve_personal_keyword(personal_index: List[Dict], query: str, k: int = 5
     return out
 
 def retrieve_personal(personal_index: List[Dict], query: str, k: int = 5,
-                     rag_manager=None) -> List[str]:
+                     rag_manager=None, owner: str = None) -> List[str]:
     """
     Retrieve relevant personal documents using vector search first, falling back to keyword search.
 
@@ -167,7 +174,7 @@ def retrieve_personal(personal_index: List[Dict], query: str, k: int = 5,
     # First try vector search if RAGManager is available
     if rag_manager:
         try:
-            vector_results = rag_manager.search(query, k)
+            vector_results = _call_owner_aware(rag_manager.search, query, k, owner=owner)
             if vector_results:
                 # Format vector results
                 out = []
@@ -184,11 +191,31 @@ def retrieve_personal(personal_index: List[Dict], query: str, k: int = 5,
             logger.warning(f"Vector search failed, falling back to keyword search: {e}")
 
     # Fall back to keyword search
+    if owner:
+        personal_index = [
+            f for f in personal_index
+            if isinstance(f, dict) and f.get("owner") == owner
+        ]
     return retrieve_personal_keyword(personal_index, query, k)
 
 
 def _string_list(values) -> list[str]:
     return [value for value in values or [] if isinstance(value, str)]
+
+
+def _call_owner_aware(method, *args, owner: str = None, **kwargs):
+    if owner:
+        try:
+            params = inspect.signature(method).parameters.values()
+            if not any(p.kind == inspect.Parameter.VAR_KEYWORD or p.name == "owner" for p in params):
+                raise TypeError("owner-scoped RAG method does not accept owner")
+        except (TypeError, ValueError):
+            raise TypeError("owner-scoped RAG method does not accept owner")
+        return method(*args, owner=owner, **kwargs)
+    try:
+        return method(*args, owner=owner, **kwargs)
+    except TypeError:
+        return method(*args, **kwargs)
 
 
 class PersonalDocsManager:
@@ -285,7 +312,7 @@ class PersonalDocsManager:
             # index=False so we do not create a second ownerless copy.
             if index and self.rag_manager:
                 try:
-                    result = self.rag_manager.index_personal_documents(directory, owner=owner)
+                    result = _call_owner_aware(self.rag_manager.index_personal_documents, directory, owner=owner)
                     logger.info(f"Indexed {result.get('indexed_count', 0)} chunks from {directory}")
                 except Exception as e:
                     logger.error(f"Failed to index directory {directory}: {e}")
@@ -295,7 +322,7 @@ class PersonalDocsManager:
         else:
             logger.info(f"Directory already indexed: {directory}")
 
-    def remove_directory(self, directory: str):
+    def remove_directory(self, directory: str, owner: str = None):
         """Remove a directory from the tracking list."""
         # Normalize the path
         directory = os.path.abspath(directory)
@@ -316,7 +343,7 @@ class PersonalDocsManager:
             # removes exactly this directory's chunks and leaves the rest intact.
             if self.rag_manager:
                 try:
-                    self.rag_manager.remove_directory(directory)
+                    _call_owner_aware(self.rag_manager.remove_directory, directory, owner=owner)
                 except Exception as e:
                     logger.error(f"Failed to remove directory from RAG index: {e}")
         else:
@@ -360,9 +387,9 @@ class PersonalDocsManager:
 
         logger.info(f"Refreshed index: {len(self.index)} documents from {len(self.indexed_directories) + 1} directories")
 
-    def retrieve(self, query: str, k: int = 5) -> List[str]:
+    def retrieve(self, query: str, k: int = 5, owner: str = None) -> List[str]:
         """Retrieve relevant documents for a query."""
-        return retrieve_personal(self.index, query, k, self.rag_manager)
+        return retrieve_personal(self.index, query, k, self.rag_manager, owner=owner)
 
     def get_file_list(self) -> List[Dict[str, Any]]:
         """Get list of indexed files with metadata."""
@@ -390,7 +417,7 @@ class PersonalDocsManager:
             'additional_directories': self.indexed_directories
         }
         
-    def index_all_directories(self):
+    def index_all_directories(self, owner: str = None):
         """Re-index all tracked directories in the RAG system."""
         if not self.rag_manager:
             logger.warning("No RAG manager available for indexing")
@@ -401,7 +428,7 @@ class PersonalDocsManager:
         
         # Index the base personal directory
         try:
-            result = self.rag_manager.index_personal_documents(self.personal_dir)
+            result = _call_owner_aware(self.rag_manager.index_personal_documents, self.personal_dir, owner=owner)
             if result.get('success'):
                 success_count += 1
                 logger.info(f"Indexed base directory: {self.personal_dir}")
@@ -417,7 +444,7 @@ class PersonalDocsManager:
                 continue
             
             try:
-                result = self.rag_manager.index_personal_documents(directory)
+                result = _call_owner_aware(self.rag_manager.index_personal_documents, directory, owner=owner)
                 if result.get('success'):
                     success_count += 1
                     logger.info(f"Indexed directory: {directory}")

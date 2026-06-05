@@ -508,9 +508,12 @@ def test_provider_token_mint_verify_revoke_scopes_coding_reads(
 
 
 def test_provider_bearer_token_denies_admin_coding_capabilities(
+    monkeypatch,
     provider_coding_client,
     isolated_provider_coding_store,
 ):
+    from src.coding_worktrees import get_coding_worktree_service
+
     client, _runtime = provider_coding_client
     _project_id, thread_id = _seed_project_and_thread(isolated_provider_coding_store)
     raw_token = client.post("/api/tokens", data={"name": "Read-only provider"}).json()["token"]
@@ -530,6 +533,29 @@ def test_provider_bearer_token_denies_admin_coding_capabilities(
     denied_delete = client.delete(f"/api/coding/threads/{thread_id}", headers=_auth(raw_token))
     assert denied_delete.status_code == 403
     assert denied_delete.json()["detail"] == "Admin only"
+
+    worktrees = get_coding_worktree_service()
+    monkeypatch.setattr(
+        worktrees,
+        "create_worktree",
+        lambda *_args, **_kwargs: {"id": "should-not-create"},
+    )
+    monkeypatch.setattr(worktrees, "remove_worktree", lambda *_args, **_kwargs: None)
+
+    denied_worktree = client.post(
+        f"/api/coding/spaces/{_project_id}/worktrees",
+        headers=_auth(raw_token),
+        json={"branch": "feature/read-only-escape"},
+    )
+    assert denied_worktree.status_code == 403
+    assert denied_worktree.json()["detail"] == "Admin only"
+
+    denied_remove_worktree = client.delete(
+        "/api/coding/worktrees/worktree-space-id",
+        headers=_auth(raw_token),
+    )
+    assert denied_remove_worktree.status_code == 403
+    assert denied_remove_worktree.json()["detail"] == "Admin only"
 
 
 @pytest.mark.asyncio
@@ -1491,6 +1517,76 @@ def test_run_provider_task_acquire_and_release(
     released = client.post(
         "/api/coding/provider/tool",
         headers=headers,
+        json={"tool": "task", "action": "release", "args": {"slot_id": slot_id}},
+    )
+    assert released.status_code == 200
+    assert released.json()["result"]["released"] is True
+
+    svc._holders.clear()
+    svc._waiters.clear()
+
+
+def test_run_provider_task_release_and_heartbeat_are_run_scoped(
+    provider_coding_client,
+    isolated_provider_coding_store,
+):
+    from src.coding_provider_tokens import mint_run_provider_token
+    from src.coding_task_slots import get_task_slot_service
+
+    svc = get_task_slot_service()
+    svc._holders.clear()
+    svc._waiters.clear()
+    svc._limits.clear()
+
+    client, _runtime = provider_coding_client
+    project_a, thread_a = _seed_project_and_thread(isolated_provider_coding_store)
+    run_a = _seed_run(isolated_provider_coding_store, thread_id=thread_a)
+    project_b, thread_b = _seed_project_and_thread(isolated_provider_coding_store)
+    run_b = _seed_run(isolated_provider_coding_store, thread_id=thread_b)
+
+    token_a = mint_run_provider_token(
+        owner="tester",
+        project_id=project_a,
+        thread_id=thread_a,
+        run_id=run_a,
+        capabilities=["task.acquire", "task.release", "task.heartbeat"],
+    )["token"]
+    token_b = mint_run_provider_token(
+        owner="tester",
+        project_id=project_b,
+        thread_id=thread_b,
+        run_id=run_b,
+        capabilities=["task.acquire", "task.release", "task.heartbeat"],
+    )["token"]
+    headers_a = _run_auth(token_a, project_id=project_a, thread_id=thread_a, run_id=run_a)
+    headers_b = _run_auth(token_b, project_id=project_b, thread_id=thread_b, run_id=run_b)
+
+    acquired = client.post(
+        "/api/coding/provider/tool",
+        headers=headers_a,
+        json={"tool": "task", "action": "acquire", "args": {"wait_seconds": 2}},
+    )
+    assert acquired.status_code == 200
+    slot_id = acquired.json()["result"]["slot_id"]
+
+    cross_heartbeat = client.post(
+        "/api/coding/provider/tool",
+        headers=headers_b,
+        json={"tool": "task", "action": "heartbeat", "args": {"slot_id": slot_id}},
+    )
+    assert cross_heartbeat.status_code == 403
+
+    cross_release = client.post(
+        "/api/coding/provider/tool",
+        headers=headers_b,
+        json={"tool": "task", "action": "release", "args": {"slot_id": slot_id}},
+    )
+    assert cross_release.status_code == 403
+    assert svc.snapshot("tester")["run_states"].get(run_a) == "running"
+
+    released = client.post(
+        "/api/coding/provider/tool",
+        headers=headers_a,
         json={"tool": "task", "action": "release", "args": {"slot_id": slot_id}},
     )
     assert released.status_code == 200

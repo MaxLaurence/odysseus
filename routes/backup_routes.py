@@ -12,6 +12,60 @@ from src.settings import load_settings, save_settings, load_features, save_featu
 logger = logging.getLogger(__name__)
 
 
+_SECRET_EXPORT_KEY_EXACT = {
+    "token",
+    "api_token",
+    "access_token",
+    "refresh_token",
+    "bearer_token",
+    "password",
+    "passwd",
+    "secret",
+    "client_secret",
+}
+
+_SECRET_EXPORT_KEY_FRAGMENTS = (
+    "api_key",
+    "auth_token",
+    "oauth",
+    "credential",
+    "password",
+    "secret",
+    "private_key",
+    "webhook_token",
+    "hf_token",
+)
+
+
+def _is_secret_export_key(key: str) -> bool:
+    normalized = (key or "").strip().lower()
+    compact = normalized.replace("-", "_")
+    dense = compact.replace("_", "")
+    if compact in _SECRET_EXPORT_KEY_EXACT:
+        return True
+    if compact.endswith("_token") and not compact.endswith("_tokens"):
+        return True
+    return any(fragment in compact or fragment.replace("_", "") in dense for fragment in _SECRET_EXPORT_KEY_FRAGMENTS)
+
+
+def _omit_export_secrets(value):
+    """Return a copy with credential-like dict keys omitted.
+
+    Omit rather than placeholder-redact so importing a sanitized backup does
+    not overwrite existing live credentials with sentinel values.
+    """
+    if isinstance(value, dict):
+        out = {}
+        for key, item in value.items():
+            if _is_secret_export_key(str(key)):
+                continue
+            out[key] = _omit_export_secrets(item)
+        return out
+    if isinstance(value, list):
+        return [_omit_export_secrets(item) for item in value]
+    return value
+
+
 def setup_backup_routes(memory_manager, preset_manager, skills_manager) -> APIRouter:
     router = APIRouter(tags=["backup"])
 
@@ -31,14 +85,14 @@ def setup_backup_routes(memory_manager, preset_manager, skills_manager) -> APIRo
         skills = skills_manager.load(owner=user)
 
         # Settings
-        settings = load_settings()
+        settings = _omit_export_secrets(load_settings())
 
         # Feature flags
         features = load_features()
 
         # User preferences
         from routes.prefs_routes import _load_for_user
-        preferences = _load_for_user(user)
+        preferences = _omit_export_secrets(_load_for_user(user))
 
         export_data = {
             "version": 1,
@@ -89,10 +143,12 @@ def setup_backup_routes(memory_manager, preset_manager, skills_manager) -> APIRo
                     continue
                 if mem["text"].strip().lower() in existing_texts:
                     continue  # skip duplicates
-                # Assign owner when auth is enabled
-                if user and not mem.get("owner"):
-                    mem["owner"] = user
-                existing.append(mem)
+                imported_mem = dict(mem)
+                # Normal imports restore data into the importing user's namespace.
+                # Never preserve attacker-supplied owners from backup JSON.
+                if user:
+                    imported_mem["owner"] = user
+                existing.append(imported_mem)
                 existing_texts.add(mem["text"].strip().lower())
                 added += 1
             memory_manager.save(existing)
@@ -112,9 +168,10 @@ def setup_backup_routes(memory_manager, preset_manager, skills_manager) -> APIRo
                     continue
                 if skill["title"].strip().lower() in existing_titles:
                     continue
-                if user and not skill.get("owner"):
-                    skill["owner"] = user
-                existing.append(skill)
+                imported_skill = dict(skill)
+                if user:
+                    imported_skill["owner"] = user
+                existing.append(imported_skill)
                 existing_ids.add(skill.get("id"))
                 existing_titles.add(skill["title"].strip().lower())
                 added += 1

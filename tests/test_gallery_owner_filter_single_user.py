@@ -36,7 +36,8 @@ def _seed(*owners):
         db.close()
 
 
-def test_none_user_returns_all_rows():
+def test_none_user_returns_all_rows(monkeypatch):
+    monkeypatch.setenv("AUTH_ENABLED", "false")
     _seed(None, None, "alice")
     db = _TS()
     try:
@@ -46,7 +47,8 @@ def test_none_user_returns_all_rows():
         db.close()
 
 
-def test_named_user_is_still_scoped():
+def test_named_user_is_still_scoped(monkeypatch):
+    monkeypatch.setenv("AUTH_ENABLED", "false")
     _seed("alice", "alice", "bob", None)
     db = _TS()
     try:

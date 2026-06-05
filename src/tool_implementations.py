@@ -861,6 +861,7 @@ async def do_manage_tasks(content: str, owner: Optional[str] = None) -> Dict:
     import uuid as _uuid
     from core.database import SessionLocal, ScheduledTask
     from src.task_scheduler import compute_next_run
+    from src.tool_security import owner_is_admin_or_single_user
 
     try:
         args = _parse_tool_args(content)
@@ -868,6 +869,14 @@ async def do_manage_tasks(content: str, owner: Optional[str] = None) -> Dict:
         return {"error": "Invalid JSON arguments", "exit_code": 1}
 
     action = args.get("action", "list")
+    admin_only_actions = {"run_local", "run_script", "ssh_command"}
+
+    def _is_admin_owner() -> bool:
+        return owner_is_admin_or_single_user(owner)
+
+    def _requires_admin_task(task_type: str | None, action_name: str | None) -> bool:
+        return (task_type or "").strip().lower() == "action" and (action_name or "").strip() in admin_only_actions
+
     db = SessionLocal()
     try:
         if action == "list":
@@ -899,6 +908,8 @@ async def do_manage_tasks(content: str, owner: Optional[str] = None) -> Dict:
                 return {"error": "Prompt is required for llm/research tasks", "exit_code": 1}
             if task_type == "action" and not args.get("action_name"):
                 return {"error": "action_name is required for action tasks", "exit_code": 1}
+            if _requires_admin_task(task_type, args.get("action_name")) and not _is_admin_owner():
+                return {"error": f"Action '{args.get('action_name')}' requires admin privileges", "exit_code": 1}
 
             # Compute next_run for schedule triggers
             next_run = None
@@ -952,10 +963,18 @@ async def do_manage_tasks(content: str, owner: Optional[str] = None) -> Dict:
                     setattr(task, field, args[field])
                     changed.append(field)
             if args.get("task_type") is not None:
-                task.task_type = args["task_type"]
+                next_task_type = args["task_type"]
+                next_action = args.get("action_name") if args.get("action_name") is not None else task.action
+                if _requires_admin_task(next_task_type, next_action) and not _is_admin_owner():
+                    return {"error": f"Action '{next_action}' requires admin privileges", "exit_code": 1}
+                task.task_type = next_task_type
                 changed.append("task_type")
             if args.get("action_name") is not None:
-                task.action = args["action_name"]
+                next_action = args["action_name"]
+                next_task_type = args.get("task_type") if args.get("task_type") is not None else task.task_type
+                if _requires_admin_task(next_task_type, next_action) and not _is_admin_owner():
+                    return {"error": f"Action '{next_action}' requires admin privileges", "exit_code": 1}
+                task.action = next_action
                 changed.append("action")
             if args.get("trigger_type") is not None:
                 task.trigger_type = args["trigger_type"]
@@ -1026,6 +1045,8 @@ async def do_manage_tasks(content: str, owner: Optional[str] = None) -> Dict:
                 return {"error": f"Task {task_id} not found", "exit_code": 1}
             if owner and task.owner and task.owner != owner:
                 return {"error": "Access denied", "exit_code": 1}
+            if _requires_admin_task(task.task_type, task.action) and not _is_admin_owner():
+                return {"error": f"Action '{task.action}' requires admin privileges", "exit_code": 1}
 
             from src.event_bus import get_task_scheduler
             scheduler = get_task_scheduler()
@@ -1174,6 +1195,7 @@ def _coding_log_tail(run, chars: int) -> str:
         return ""
     try:
         from pathlib import Path
+        from src.coding_runtime import redact_coding_output_text
 
         path = Path(run.log_path)
         if not path.exists() or not path.is_file():
@@ -1182,7 +1204,7 @@ def _coding_log_tail(run, chars: int) -> str:
         read_size = min(max(chars, 0), 50_000, size)
         with path.open("rb") as f:
             f.seek(max(0, size - read_size))
-            return f.read(read_size).decode("utf-8", errors="replace")
+            return redact_coding_output_text(f.read(read_size).decode("utf-8", errors="replace"))
     except Exception:
         logger.debug("Failed to read coding run log tail", exc_info=True)
         return ""

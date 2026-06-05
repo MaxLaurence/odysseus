@@ -2,6 +2,7 @@
 """Search service — clean interface for web search."""
 
 from dataclasses import dataclass
+import inspect
 from typing import List, Optional, Dict, Any
 
 from . import (
@@ -66,15 +67,42 @@ class SearchService:
         # comprehensive_web_search is synchronous and, with return_sources=True,
         # returns (context_str, [{"url", "title"}, ...]). Run it off the event
         # loop so we don't block it, and use the source list as the result rows.
-        # `fetch_content` is accepted for API compatibility; the comprehensive
-        # search always fetches page content.
+        # Some tests and older integrations still provide the legacy async
+        # max_results/fetch_content shape; tolerate that wrapper shape too.
         import asyncio
-        _context, raw_results = await asyncio.to_thread(
-            comprehensive_web_search,
-            query,
-            max_pages=10 * depth,
-            return_sources=True,
-        )
+        max_results = 10 * depth
+
+        if inspect.iscoroutinefunction(comprehensive_web_search):
+            search_payload = await comprehensive_web_search(
+                query,
+                max_results=max_results,
+                fetch_content=fetch_content if fetch_content is not None else self.fetch_content,
+            )
+        else:
+            def _run_search():
+                try:
+                    return comprehensive_web_search(
+                        query,
+                        max_pages=max_results,
+                        return_sources=True,
+                    )
+                except TypeError as exc:
+                    if "unexpected keyword argument" not in str(exc):
+                        raise
+                    return comprehensive_web_search(
+                        query,
+                        max_results=max_results,
+                        fetch_content=fetch_content if fetch_content is not None else self.fetch_content,
+                    )
+
+            search_payload = await asyncio.to_thread(_run_search)
+
+        if inspect.isawaitable(search_payload):
+            search_payload = await search_payload
+        if isinstance(search_payload, tuple) and len(search_payload) >= 2:
+            raw_results = search_payload[1]
+        else:
+            raw_results = search_payload or []
 
         results = []
         for r in raw_results:

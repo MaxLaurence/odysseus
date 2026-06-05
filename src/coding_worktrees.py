@@ -42,6 +42,26 @@ def _worktrees_root() -> Path:
     return Path(raw).expanduser()
 
 
+def _resolve_for_containment(path: Path) -> Path:
+    """Resolve existing path components without requiring the leaf to exist."""
+    try:
+        return path.resolve(strict=False)
+    except Exception:
+        return path.absolute()
+
+
+def _is_relative_to(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+        return True
+    except ValueError:
+        return False
+
+
+def _checkout_base(root_path: str) -> Path:
+    return _worktrees_root() / _repo_name(root_path)
+
+
 def _sanitize_branch(branch: str) -> str:
     """Make a branch name safe to use as a single filesystem path segment."""
     cleaned = branch.strip().strip("/")
@@ -212,14 +232,14 @@ class CodingWorktreeService:
                 raise CodingRuntimeError(400, "Space is not a git repository")
 
             # Compute the checkout path.
+            checkout_base = _resolve_for_containment(_checkout_base(parent.root_path))
             if path:
                 checkout = Path(path).expanduser()
             else:
-                checkout = (
-                    _worktrees_root()
-                    / _repo_name(parent.root_path)
-                    / _sanitize_branch(branch)
-                )
+                checkout = checkout_base / _sanitize_branch(branch)
+            checkout = _resolve_for_containment(checkout)
+            if checkout == checkout_base or not _is_relative_to(checkout, checkout_base):
+                raise CodingRuntimeError(400, f"worktree path must be under {checkout_base}")
             checkout_str = str(checkout)
             if checkout.exists():
                 raise CodingRuntimeError(409, f"Worktree path already exists: {checkout_str}")

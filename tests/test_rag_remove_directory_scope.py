@@ -35,8 +35,11 @@ class _FakeCollection:
         self._ids = [r[0] for r in rows]
         self._metas = [r[1] for r in rows]
 
-    def get(self, include=None):
-        return {"ids": list(self._ids), "metadatas": list(self._metas)}
+    def get(self, where=None, include=None):
+        rows = list(zip(self._ids, self._metas))
+        if isinstance(where, dict) and "source" in where:
+            rows = [(i, m) for i, m in rows if isinstance(m, dict) and m.get("source") == where["source"]]
+        return {"ids": [i for i, _ in rows], "metadatas": [m for _, m in rows]}
 
     def delete(self, ids=None):
         drop = set(ids or [])
@@ -74,6 +77,36 @@ def test_vectorrag_remove_no_match_is_noop():
     assert res["success"] is True
     assert res["removed_count"] == 0
     assert set(rag._collection.get()["ids"]) == {"a"}
+
+
+def test_vectorrag_remove_directory_is_owner_scoped():
+    rows = [
+        ("alice", {"source": "/a/docs/f1.md", "owner": "alice"}),
+        ("bob", {"source": "/a/docs/f2.md", "owner": "bob"}),
+        ("ownerless", {"source": "/a/docs/f3.md"}),
+    ]
+    rag = _make_vectorrag(rows)
+
+    res = rag.remove_directory("/a/docs", owner="alice")
+
+    assert res["success"] is True
+    assert res["removed_count"] == 1
+    assert set(rag._collection.get()["ids"]) == {"bob", "ownerless"}
+
+
+def test_vectorrag_delete_by_source_is_owner_scoped():
+    source = "/a/docs/shared.md"
+    rows = [
+        ("alice", {"source": source, "owner": "alice"}),
+        ("bob", {"source": source, "owner": "bob"}),
+        ("other", {"source": "/a/docs/other.md", "owner": "alice"}),
+    ]
+    rag = _make_vectorrag(rows)
+
+    removed = rag.delete_by_source(source, owner="alice")
+
+    assert removed == 1
+    assert set(rag._collection.get()["ids"]) == {"bob", "other"}
 
 
 # --------------------------------------------------------------------------- #
@@ -135,8 +168,11 @@ def test_personal_docs_remove_is_targeted(tmp_path):
 # --------------------------------------------------------------------------- #
 
 
-async def test_do_manage_rag_remove_does_not_rebuild(monkeypatch):
+async def test_do_manage_rag_remove_does_not_rebuild(monkeypatch, tmp_path):
     calls = {"rebuild": 0}
+    personal = tmp_path / "personal"
+    target = personal / "target"
+    target.mkdir(parents=True)
 
     class _Rag:
         def rebuild_index(self):
@@ -151,9 +187,10 @@ async def test_do_manage_rag_remove_does_not_rebuild(monkeypatch):
 
     monkeypatch.setattr(ai, "_rag_manager", _Rag())
     monkeypatch.setattr(ai, "_personal_docs_manager", _PDocs())
+    monkeypatch.setattr(ai, "PERSONAL_DIR", str(personal))
 
     # Untracked path: the old code still fired an unconditional rebuild_index().
-    result = await ai.do_manage_rag("remove_directory\n/abs/untracked/dir")
+    result = await ai.do_manage_rag(f"remove_directory\n{target}")
 
     assert calls["rebuild"] == 0, "remove must not rebuild (whole-collection wipe)"
     assert "error" not in result, result

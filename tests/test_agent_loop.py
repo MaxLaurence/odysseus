@@ -9,7 +9,6 @@ for mod in [
     'sqlalchemy', 'sqlalchemy.orm', 'sqlalchemy.ext', 'sqlalchemy.ext.declarative',
     'sqlalchemy.ext.hybrid', 'sqlalchemy.sql', 'sqlalchemy.sql.expression',
     'src.database',
-    'src.agent_tools',
     'core.models', 'core.database',
 ]:
     if mod not in sys.modules:

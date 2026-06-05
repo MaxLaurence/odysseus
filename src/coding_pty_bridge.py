@@ -224,16 +224,31 @@ class CodingPtyBridge:
         *,
         init_cols: int,
         init_rows: int,
+        output_redactor: Callable[[bytes], bytes] | None = None,
     ) -> asyncio.Task:
         """Start the persistent capture logger (replaces ``tmux pipe-pane``).
 
         Returns an ``asyncio.Task``; the caller tracks it and cancels it on teardown
         (it also self-terminates when the session ends)."""
         return asyncio.create_task(
-            self._capture_loop(name, Path(log_path), int(init_cols), int(init_rows))
+            self._capture_loop(
+                name,
+                Path(log_path),
+                int(init_cols),
+                int(init_rows),
+                output_redactor=output_redactor,
+            )
         )
 
-    async def _capture_loop(self, name: str, log_path: Path, init_cols: int, init_rows: int) -> None:
+    async def _capture_loop(
+        self,
+        name: str,
+        log_path: Path,
+        init_cols: int,
+        init_rows: int,
+        *,
+        output_redactor: Callable[[bytes], bytes] | None = None,
+    ) -> None:
         """A long-lived dtach client that tees ALL session output to ``log_path`` for
         the run's lifetime — so output is captured even when no browser is attached
         (autonomous agents), exactly like the old pipe-pane. It attaches FIRST at the
@@ -282,6 +297,11 @@ class CodingPtyBridge:
                     data = await queue.get()
                     if not data:
                         return
+                    if output_redactor is not None:
+                        try:
+                            data = output_redactor(data)
+                        except Exception:
+                            self._logger.debug("capture output redactor failed", exc_info=True)
                     try:
                         f.write(data)
                     except Exception:
@@ -344,6 +364,7 @@ class CodingPtyBridge:
         cols: int = 120,
         rows: int = 40,
         on_input: Callable[[bytes], None] | None = None,
+        history_redactor: Callable[[bytes], bytes] | None = None,
     ) -> None:
         """Bridge a WebSocket to the run's dtach session through a real PTY.
 
@@ -377,7 +398,10 @@ class CodingPtyBridge:
                 if log_path and log_path.exists():
                     data = log_path.read_bytes()
                     for i in range(0, len(data), 65536):
-                        await websocket.send_bytes(data[i:i + 65536])
+                        chunk = data[i:i + 65536]
+                        if history_redactor is not None:
+                            chunk = history_redactor(chunk)
+                        await websocket.send_bytes(chunk)
             except Exception:
                 self._logger.debug("history replay failed", exc_info=True)
             try:
@@ -396,6 +420,7 @@ class CodingPtyBridge:
         cols: int = 100,
         rows: int = 30,
         log_path: Path | None = None,
+        output_redactor: Callable[[bytes], bytes] | None = None,
     ) -> None:
         """Bridge a WebSocket to an arbitrary (non-run) dtach session by name.
 
@@ -409,7 +434,10 @@ class CodingPtyBridge:
                 if log_path and Path(log_path).exists():
                     data = Path(log_path).read_bytes()
                     for i in range(0, len(data), 65536):
-                        await websocket.send_bytes(data[i:i + 65536])
+                        chunk = data[i:i + 65536]
+                        if output_redactor is not None:
+                            chunk = output_redactor(chunk)
+                        await websocket.send_bytes(chunk)
             except Exception:
                 self._logger.debug("session history replay failed", exc_info=True)
             try:
@@ -417,7 +445,7 @@ class CodingPtyBridge:
             except Exception:
                 pass
             return
-        await self._bridge_ws(websocket, name, cols, rows)
+        await self._bridge_ws(websocket, name, cols, rows, output_redactor=output_redactor)
 
     async def _bridge_ws(
         self,
@@ -426,6 +454,7 @@ class CodingPtyBridge:
         cols: int,
         rows: int,
         on_input: Callable[[bytes], None] | None = None,
+        output_redactor: Callable[[bytes], bytes] | None = None,
     ) -> None:
         """Shared PTY<->WebSocket bridge for a live dtach session (used by both
         ``attach_pty`` and ``attach_session``). Detaching leaves the session alive.
@@ -472,6 +501,11 @@ class CodingPtyBridge:
                 data = await out_queue.get()
                 if not data:
                     return
+                if output_redactor is not None:
+                    try:
+                        data = output_redactor(data)
+                    except Exception:
+                        self._logger.debug("bridge output redactor failed", exc_info=True)
                 await websocket.send_bytes(data)
 
         async def _pump_in() -> None:

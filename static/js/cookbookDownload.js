@@ -205,7 +205,10 @@ function _syncEnvFromPanel(panel) {
   const f = _getPanelFields(panel);
   if (f.env_type !== undefined) _envState.env = f.env_type;
   if (f.env_path !== undefined) _envState.envPath = f.env_path;
-  if (f.hf_token !== undefined) _envState.hfToken = f.hf_token;
+  if (f.hf_token !== undefined) {
+    _envState.hfToken = f.hf_token;
+    _envState._hfTokenDirty = !!f.hf_token;
+  }
   if (f.gpus !== undefined) _envState.gpus = f.gpus;
 }
 
@@ -231,7 +234,7 @@ export function _wirePanelEvents(panel, model, backend) {
         const f = input.dataset.field;
         if (f === 'env_type') { _envState.env = input.value; _persistEnvState(); }
         else if (f === 'env_path') { _envState.envPath = input.value; _persistEnvState(); }
-        else if (f === 'hf_token') { _envState.hfToken = input.value; _persistEnvState(); }
+        else if (f === 'hf_token') { _envState.hfToken = input.value; _envState._hfTokenDirty = !!input.value; _persistEnvState(); }
         else if (f === 'gpus') { _envState.gpus = input.value; _persistEnvState(); }
       });
     }

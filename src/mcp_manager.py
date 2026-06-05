@@ -10,7 +10,75 @@ import logging
 import os
 from typing import Any, Dict, List, Optional
 
+from src.child_process_env import safe_child_env
+
 logger = logging.getLogger(__name__)
+
+_IDENTITY_ENV_KEYS = {
+    "EMAIL",
+    "EMAIL_ADDRESS",
+    "MCP_EMAIL_ADDRESS",
+    "ACCOUNT_NAME",
+    "USERNAME",
+    "USER_NAME",
+}
+_SECRET_IDENTITY_KEY_FRAGMENTS = (
+    "token",
+    "secret",
+    "key",
+    "password",
+    "passwd",
+    "credential",
+    "private",
+    "cookie",
+    "session",
+)
+
+
+def _mcp_stdio_env(env: Optional[Dict[str, str]] = None) -> Dict[str, str]:
+    """Build stdio MCP child env without ambient backend secrets."""
+    return safe_child_env(env)
+
+
+def _mcp_identity_hint(env: Optional[Dict[str, str]] = None) -> str:
+    """Return safe, model-visible identity hints for MCP server labels."""
+    hints = []
+    for key, value in (env or {}).items():
+        if not isinstance(key, str) or not isinstance(value, str):
+            continue
+        key_upper = key.upper()
+        key_lower = key.lower()
+        if any(fragment in key_lower for fragment in _SECRET_IDENTITY_KEY_FRAGMENTS):
+            continue
+        if key_upper not in _IDENTITY_ENV_KEYS:
+            continue
+        stripped = value.strip()
+        if not stripped or "\n" in stripped or "\r" in stripped or len(stripped) > 120:
+            continue
+        hints.append(stripped)
+    return ", ".join(hints)
+
+
+def _mcp_disabled_tool_set(server_id: str) -> set[str]:
+    """Load the disabled tool names for a server from persistent config."""
+    try:
+        from core.database import McpServer, SessionLocal
+
+        db = SessionLocal()
+        try:
+            row = db.query(McpServer).filter(McpServer.id == server_id).first()
+            if not row or not row.disabled_tools:
+                return set()
+            names = json.loads(row.disabled_tools)
+            if not isinstance(names, list):
+                return set()
+            return {name for name in names if isinstance(name, str)}
+        finally:
+            db.close()
+    except Exception as exc:
+        logger.warning("Unable to load MCP disabled tools for %s: %s", server_id, exc)
+        return set()
+
 
 def _format_mcp_connection_error(name: str, command: str = "", args: Optional[List[str]] = None, error: Exception = None) -> str:
     """Return a user-actionable MCP connection error message."""
@@ -85,7 +153,7 @@ class McpManager:
             server_params = StdioServerParameters(
                 command=command,
                 args=args,
-                env={**os.environ, **env} if env else None,
+                env=_mcp_stdio_env(env),
             )
 
             stack = AsyncExitStack()
@@ -112,22 +180,12 @@ class McpManager:
             self._sessions[server_id] = session
             self._stacks[server_id] = stack
             self._tools[server_id] = tools
-            # Extract identity hints from env vars (e.g. email address, API name)
-            # so tool descriptions can distinguish between multiple instances of
-            # the same MCP server (e.g. two email accounts).
-            identity_hints = []
-            for k, v in (env or {}).items():
-                k_lower = k.lower()
-                if any(x in k_lower for x in ['email_address', 'account', 'user', 'username']):
-                    identity_hints.append(v)
-            identity = ", ".join(identity_hints) if identity_hints else ""
-
             self._connections[server_id] = {
                 "status": "connected",
                 "name": name,
                 "transport": "stdio",
                 "tool_count": len(tools),
-                "identity": identity,
+                "identity": _mcp_identity_hint(env),
             }
 
             logger.info(f"MCP server connected: {name} ({server_id}) - {len(tools)} tools via stdio")
@@ -238,6 +296,12 @@ class McpManager:
 
         server_id = parts[1]
         tool_name = parts[2]
+
+        if tool_name in _mcp_disabled_tool_set(server_id):
+            return {
+                "error": f"MCP tool disabled by server configuration: {server_id}/{tool_name}",
+                "exit_code": 1,
+            }
 
         session = self._sessions.get(server_id)
         if not session:

@@ -58,10 +58,17 @@ def token_routes_mod(monkeypatch):
     monkeypatch.setitem(sys.modules, "core.database", db_stub)
 
     # Force a fresh import so the route module binds to the stubbed core.database
+    previous_route_mod = sys.modules.get("routes.api_token_routes")
     monkeypatch.delitem(sys.modules, "routes.api_token_routes", raising=False)
 
     import routes.api_token_routes as mod  # noqa: PLC0415
-    return mod
+    try:
+        yield mod
+    finally:
+        if previous_route_mod is not None:
+            sys.modules["routes.api_token_routes"] = previous_route_mod
+        else:
+            sys.modules.pop("routes.api_token_routes", None)
 
 
 # ---------------------------------------------------------------------------

@@ -30,6 +30,14 @@ _WATCHDOG_POLL_SECONDS = 3.0
 _REAP_GRACE_SECONDS = 2.0
 
 _exit_reaper_installed = False
+_parent_death_watchdog_disarmed = False
+
+
+def disarm_parent_death_watchdog(reason: str = "") -> None:
+    """Let an explicit desktop "Leave Running" quit keep the backend alive."""
+    global _parent_death_watchdog_disarmed
+    _parent_death_watchdog_disarmed = True
+    logger.info("Parent-death watchdog disarmed%s", f": {reason}" if reason else "")
 
 
 def _pid_alive(pid: int) -> bool:
@@ -79,6 +87,9 @@ async def parent_death_watchdog() -> None:
     try:
         while True:
             await asyncio.sleep(_WATCHDOG_POLL_SECONDS)
+            if _parent_death_watchdog_disarmed:
+                logger.info("Parent-death watchdog exiting because it was disarmed")
+                return
             if direct_child:
                 orphaned = os.getppid() != parent_pid
             else:

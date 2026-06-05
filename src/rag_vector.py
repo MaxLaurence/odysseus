@@ -382,7 +382,7 @@ class VectorRAG:
             logger.error(f"index_personal_documents {directory}: {e}")
             return {'success': False, 'indexed_count': indexed, 'failed_count': failed, 'message': str(e)}
 
-    def remove_directory(self, directory: str) -> Dict[str, Any]:
+    def remove_directory(self, directory: str, owner: Optional[str] = None) -> Dict[str, Any]:
         """Remove all chunks under ``directory`` (recursively), and nothing else.
 
         Selection is a Python-side path-boundary match on each chunk's stored
@@ -405,6 +405,7 @@ class VectorRAG:
                 results["ids"][i]
                 for i, m in enumerate(results["metadatas"])
                 if isinstance(m, dict)
+                and (owner is None or m.get("owner") == owner)
                 and isinstance(m.get("source"), str)
                 and (m["source"] == directory or m["source"].startswith(directory + os.sep))
             ]
@@ -420,12 +421,12 @@ class VectorRAG:
             return {"success": False, "message": str(e)}
 
     def reindex_directory(
-        self, directory: str, file_extensions: Optional[set] = None
+        self, directory: str, file_extensions: Optional[set] = None, owner: Optional[str] = None
     ) -> Dict[str, Any]:
-        remove_result = self.remove_directory(directory)
+        remove_result = self.remove_directory(directory, owner=owner)
         if not remove_result.get("success"):
             return remove_result
-        index_result = self.index_personal_documents(directory, file_extensions)
+        index_result = self.index_personal_documents(directory, file_extensions, owner=owner)
         return {
             "success": index_result.get("success", False),
             "message": (
@@ -498,7 +499,7 @@ class VectorRAG:
     # Delete by metadata
     # ------------------------------------------------------------------
 
-    def delete_by_source(self, source: str) -> int:
+    def delete_by_source(self, source: str, owner: Optional[str] = None) -> int:
         """Remove all chunks whose metadata['source'] matches *source*.
         Returns the number of removed chunks."""
         if not self.healthy:
@@ -506,9 +507,13 @@ class VectorRAG:
         try:
             results = self._collection.get(
                 where={"source": source},
-                include=[],
+                include=["metadatas"],
             )
-            ids = results.get("ids", [])
+            ids = [
+                doc_id
+                for doc_id, metadata in zip(results.get("ids", []), results.get("metadatas", []))
+                if owner is None or (isinstance(metadata, dict) and metadata.get("owner") == owner)
+            ]
             if not ids:
                 return 0
             self._collection.delete(ids=ids)
@@ -522,5 +527,5 @@ class VectorRAG:
     # Convenience
     # ------------------------------------------------------------------
 
-    def retrieve(self, query: str, k: int = 5) -> List[str]:
-        return [r['document'] for r in self.search(query, k)]
+    def retrieve(self, query: str, k: int = 5, owner: Optional[str] = None) -> List[str]:
+        return [r['document'] for r in self.search(query, k, owner=owner)]

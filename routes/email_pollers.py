@@ -216,6 +216,7 @@ async def _auto_summarize_pass_single(days_back: int = 1, account_id: str | None
                         break
                 except Exception:
                     continue
+        primary_scan_error = None
         for folder in folders_to_scan:
             try:
                 conn.select(_q(folder), readonly=True)
@@ -225,6 +226,10 @@ async def _auto_summarize_pass_single(days_back: int = 1, account_id: str | None
                         uid_list.append((folder, u))
             except Exception as _e:
                 logger.warning(f"Folder {folder} scan failed: {_e}")
+                if folder == "INBOX":
+                    primary_scan_error = _e
+        if primary_scan_error is not None and not uid_list:
+            raise primary_scan_error
         # Some IMAP servers/accounts give unreliable results for SINCE
         # because of INTERNALDATE/date-header quirks. If the user manually
         # runs a cacheable email task and SINCE finds nothing, fall back to
@@ -243,8 +248,14 @@ async def _auto_summarize_pass_single(days_back: int = 1, account_id: str | None
         await _emit_progress(progress_cb, f"Found {len(uid_list)} recent email(s); checking cache…")
 
         _c = _sql3.connect(SCHEDULED_DB)
-        _sum_existing = {r[0] for r in _c.execute("SELECT message_id FROM email_summaries").fetchall()}
-        _reply_existing = {r[0] for r in _c.execute("SELECT message_id FROM email_ai_replies").fetchall()}
+        _sum_existing = {r[0] for r in _c.execute(
+            "SELECT message_id FROM email_summaries WHERE owner=?",
+            (account_owner or "",),
+        ).fetchall()}
+        _reply_existing = {r[0] for r in _c.execute(
+            "SELECT message_id FROM email_ai_replies WHERE owner=?",
+            (account_owner or "",),
+        ).fetchall()}
         if auto_tag or auto_spam:
             if account_owner:
                 _tag_existing = {r[0] for r in _c.execute("SELECT message_id FROM email_tags WHERE owner=?", (account_owner,)).fetchall()}
@@ -415,9 +426,9 @@ async def _auto_summarize_pass_single(days_back: int = 1, account_id: str | None
                                 _c = _sql3.connect(SCHEDULED_DB)
                                 _c.execute("""
                                     INSERT OR REPLACE INTO email_summaries
-                                    (message_id, uid, folder, subject, sender, summary, model_used, created_at)
-                                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                                """, (message_id, uid.decode() if isinstance(uid, bytes) else str(uid), _folder, subject, sender, summary, model, datetime.utcnow().isoformat()))
+                                    (message_id, owner, uid, folder, subject, sender, summary, model_used, created_at)
+                                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                """, (message_id, account_owner or "", uid.decode() if isinstance(uid, bytes) else str(uid), _folder, subject, sender, summary, model, datetime.utcnow().isoformat()))
                                 _c.commit()
                                 _c.close()
                                 _sum_existing.add(message_id)
@@ -458,9 +469,9 @@ async def _auto_summarize_pass_single(days_back: int = 1, account_id: str | None
                             _c = _sql3.connect(SCHEDULED_DB)
                             _c.execute("""
                                 INSERT OR REPLACE INTO email_ai_replies
-                                (message_id, uid, folder, reply, model_used, created_at)
-                                VALUES (?, ?, ?, ?, ?, ?)
-                            """, (message_id, uid.decode() if isinstance(uid, bytes) else str(uid), _folder, reply, model, datetime.utcnow().isoformat()))
+                                (message_id, owner, uid, folder, reply, model_used, created_at)
+                                VALUES (?, ?, ?, ?, ?, ?, ?)
+                            """, (message_id, account_owner or "", uid.decode() if isinstance(uid, bytes) else str(uid), _folder, reply, model, datetime.utcnow().isoformat()))
                             _c.commit()
                             _c.close()
                             _reply_existing.add(message_id)

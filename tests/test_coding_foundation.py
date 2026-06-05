@@ -494,6 +494,9 @@ def test_launch_environment_strips_private_odysseus_env_and_preserves_provider_a
     monkeypatch.setenv("OPENAI_ORG_ID", "org-from-server")
     monkeypatch.setenv("ODYSSEUS_INTERNAL_TOKEN", "server-admin-token")
     monkeypatch.setenv("ODYSSEUS_PRIVATE_FLAG", "server-private")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "ambient-anthropic")
+    monkeypatch.setenv("HF_TOKEN", "ambient-hf")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "ambient-aws")
     monkeypatch.setattr(
         coding_runtime,
         "build_launch_env",
@@ -536,7 +539,6 @@ def test_launch_environment_strips_private_odysseus_env_and_preserves_provider_a
     finally:
         db.close()
 
-    assert env["OPENAI_ORG_ID"] == "org-from-server"
     assert env["OPENAI_API_KEY"] == "model-token"
     assert env["OPENAI_MODEL"] == "model-from-thread"
     assert env["ODYSSEUS_TOOL_URL"].endswith("/api/coding/provider/tool")
@@ -544,6 +546,10 @@ def test_launch_environment_strips_private_odysseus_env_and_preserves_provider_a
     assert env["ODYSSEUS_THREAD_ID"] == "thread-env-sanitize"
     assert env["ODYSSEUS_PROJECT_ID"] == "project-env-sanitize"
     assert env["ODYSSEUS_RUN_ID"] == "run-env-sanitize"
+    assert "OPENAI_ORG_ID" not in env
+    assert "ANTHROPIC_API_KEY" not in env
+    assert "HF_TOKEN" not in env
+    assert "AWS_SECRET_ACCESS_KEY" not in env
     assert "ODYSSEUS_INTERNAL_TOKEN" not in env
     assert "ODYSSEUS_PRIVATE_FLAG" not in env
     assert env["PATH"].startswith(f"{scripts_dir()}{os.pathsep}")
@@ -551,6 +557,85 @@ def test_launch_environment_strips_private_odysseus_env_and_preserves_provider_a
     # The full (already-sanitized) launch env is handed to dtach directly; private
     # ODYSSEUS_* vars are dropped by _build_launch_environment (asserted above), so the
     # agent never sees server-internal tokens.
+
+
+def test_launch_environment_only_autotrusts_claude_workspace_inside_project(
+    monkeypatch,
+    isolated_coding_store,
+):
+    import src.coding_auth_service as auth_service
+    from src.coding_runtime import CodingRuntimeService
+
+    monkeypatch.setattr(auth_service, "DATA_DIR", str(isolated_coding_store.data_dir))
+
+    service = CodingRuntimeService()
+    monkeypatch.setattr(service, "_issue_provider_bridge_env", lambda _run, _thread: {})
+
+    inside = isolated_coding_store.workspace / "inside"
+    outside = isolated_coding_store.data_dir.parent / "outside"
+    inside.mkdir()
+    outside.mkdir()
+
+    _project_id, thread_id = _seed_project_and_thread(
+        isolated_coding_store,
+        thread_id="thread-claude-trust",
+    )
+    db = isolated_coding_store.SessionLocal()
+    try:
+        thread = db.query(CodingThread).filter(CodingThread.id == thread_id).first()
+        assert thread is not None
+        thread.harness_id = "claude"
+        thread.auth_mode = "subscription"
+        thread.cwd = str(inside)
+        db.commit()
+
+        outside_run = CodingRun(
+            id="run-claude-outside",
+            thread_id=thread_id,
+            owner="tester",
+            harness_id="claude",
+            status="starting",
+            cwd=str(outside),
+        )
+        env, _metadata = service._build_launch_environment(db, outside_run, thread)
+        claude_json = Path(env["CLAUDE_CONFIG_DIR"]) / ".claude.json"
+        data = json.loads(claude_json.read_text())
+        assert str(outside) not in data.get("projects", {})
+
+        inside_run = CodingRun(
+            id="run-claude-inside",
+            thread_id=thread_id,
+            owner="tester",
+            harness_id="claude",
+            status="starting",
+            cwd=str(inside),
+        )
+        service._build_launch_environment(db, inside_run, thread)
+        data = json.loads(claude_json.read_text())
+        assert data["projects"][str(inside)]["hasTrustDialogAccepted"] is True
+    finally:
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_enqueue_run_rejects_cwd_outside_project_root(tmp_path, isolated_coding_store):
+    from src.coding_runtime import CodingRuntimeError, CodingRuntimeService
+
+    _project_id, thread_id = _seed_project_and_thread(isolated_coding_store)
+    outside = tmp_path / "outside-project"
+    outside.mkdir()
+
+    service = CodingRuntimeService()
+    with pytest.raises(CodingRuntimeError) as exc:
+        await service.enqueue_run(
+            thread_id=thread_id,
+            owner="tester",
+            command="echo should-not-run",
+            cwd=str(outside),
+        )
+
+    assert exc.value.status_code == 400
+    assert exc.value.detail == "Run cwd must be inside the project root"
 
 
 def test_provider_cli_list_uses_provider_authenticated_tool_action(monkeypatch, capsys):
@@ -689,7 +774,65 @@ def test_coding_settings_persist_max_concurrent_tasks(
     settings._invalidate_caches()
 
 
-def test_queue_poll_reconciles_dead_tmux_run_and_starts_next(
+def test_queue_get_is_side_effect_free_for_queued_runs(
+    monkeypatch,
+    coding_client,
+    isolated_coding_store,
+):
+    from src import coding_runtime
+
+    client, runtime = coding_client
+
+    launched: list[str] = []
+
+    async def no_launch(run_id):
+        launched.append(run_id)
+
+    monkeypatch.setattr(runtime, "_launch_run", no_launch)
+    monkeypatch.setattr(coding_runtime.CodingRuntimeService, "dtach_available", lambda _self: True)
+
+    _project_id, thread_id = _seed_project_and_thread(isolated_coding_store)
+    run_id = f"run-{uuid.uuid4()}"
+    db = isolated_coding_store.SessionLocal()
+    try:
+        thread = db.query(CodingThread).filter(CodingThread.id == thread_id).first()
+        assert thread is not None
+        db.add(
+            CodingRun(
+                id=run_id,
+                thread_id=thread_id,
+                owner="tester",
+                harness_id="generic",
+                status="queued",
+                command="echo queued",
+                cwd=str(isolated_coding_store.workspace),
+                metadata_json="{}",
+            )
+        )
+        thread.status = "queued"
+        thread.last_run_id = run_id
+        db.commit()
+    finally:
+        db.close()
+
+    response = client.get("/api/coding/queue")
+
+    assert response.status_code == 200
+    assert launched == []
+    assert response.json()["queue"]["queued_count"] == 1
+    db = isolated_coding_store.SessionLocal()
+    try:
+        run = db.query(CodingRun).filter(CodingRun.id == run_id).first()
+        thread = db.query(CodingThread).filter(CodingThread.id == thread_id).first()
+        assert run is not None
+        assert thread is not None
+        assert run.status == "queued"
+        assert thread.status == "queued"
+    finally:
+        db.close()
+
+
+def test_pump_queue_reconciles_dead_tmux_run_and_starts_next(
     monkeypatch,
     coding_client,
     isolated_coding_store,
@@ -760,6 +903,7 @@ def test_queue_poll_reconciles_dead_tmux_run_and_starts_next(
     finally:
         db.close()
 
+    asyncio.run(runtime.pump_queue(owner="tester"))
     response = client.get("/api/coding/queue")
 
     assert response.status_code == 200
@@ -1282,6 +1426,55 @@ async def test_event_persistence_replays_from_db_and_mirrors_run_dir(isolated_co
 
 
 @pytest.mark.asyncio
+async def test_output_events_are_redacted_before_persistence(isolated_coding_store):
+    from src.coding_runtime import CodingRuntimeService
+
+    _project_id, thread_id = _seed_project_and_thread(isolated_coding_store)
+    run_id = f"run-{uuid.uuid4()}"
+    run_dir = isolated_coding_store.data_dir / "redacted-run"
+    db = isolated_coding_store.SessionLocal()
+    try:
+        db.add(
+            CodingRun(
+                id=run_id,
+                thread_id=thread_id,
+                owner="tester",
+                harness_id="generic",
+                status="running",
+                command="echo secret",
+                cwd=str(isolated_coding_store.workspace),
+                run_dir=str(run_dir),
+                log_path=str(run_dir / "raw.log"),
+                metadata_json="{}",
+            )
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    secret = (
+        "OPENAI_API_KEY=sk-proj-abcdefghijklmnop "
+        "Authorization: Bearer bearer-secret-token "
+        "ODYSSEUS_TOOL_TOKEN=ody_cp_secret"
+    )
+    service = CodingRuntimeService()
+    await service.append_event(thread_id, run_id, "output", {"stream": "stdout", "data": secret})
+
+    replayed = CodingRuntimeService().get_events(thread_id, "tester", after_seq=0)
+    persisted = json.loads(replayed[0].payload_json)["data"]
+    assert "sk-proj-abcdefghijklmnop" not in persisted
+    assert "bearer-secret-token" not in persisted
+    assert "ody_cp_secret" not in persisted
+    assert persisted.count("[redacted]") >= 3
+
+    mirrored = json.loads((run_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()[0])
+    mirrored_data = mirrored["payload"]["data"]
+    assert "sk-proj-abcdefghijklmnop" not in mirrored_data
+    assert "bearer-secret-token" not in mirrored_data
+    assert "ody_cp_secret" not in mirrored_data
+
+
+@pytest.mark.asyncio
 async def test_terminals_launch_concurrently_without_a_cap(monkeypatch, isolated_coding_store):
     # With the terminal cap removed, a second run launches immediately rather than
     # queueing behind the first — even with the legacy cap pinned to 1.
@@ -1446,7 +1639,11 @@ async def test_manage_coding_runs_thread_and_reads_events(monkeypatch, isolated_
         owner="tester",
     )
 
-    script = "print('managed coding run', flush=True)"
+    script = (
+        "print('managed coding run', flush=True); "
+        "print('OPENAI_API_KEY=sk-proj-abcdefghijklmnop', flush=True); "
+        "print('Authorization: Bearer bearer-secret-token', flush=True)"
+    )
     command = f"{shlex.quote(sys.executable)} -c {shlex.quote(script)}"
     queued = await do_manage_coding(
         json.dumps(
@@ -1481,11 +1678,16 @@ async def test_manage_coding_runs_thread_and_reads_events(monkeypatch, isolated_
     assert read_run["run"]["status"] == "exited"
     assert read_run["run"]["exit_code"] == 0
     assert "managed coding run" in read_run["log_tail"]
+    assert "sk-proj-abcdefghijklmnop" not in read_run["log_tail"]
+    assert "bearer-secret-token" not in read_run["log_tail"]
 
     event_kinds = [event["kind"] for event in read_run["events"]]
     assert event_kinds[:3] == ["queued", "starting", "started"]
     assert "output" in event_kinds
     assert event_kinds[-1] == "exited"
+    serialized_events = json.dumps(read_run["events"])
+    assert "sk-proj-abcdefghijklmnop" not in serialized_events
+    assert "bearer-secret-token" not in serialized_events
 
     queue = await do_manage_coding(json.dumps({"action": "queue"}), owner="tester")
     assert queue["queue"]["queued_count"] == 0
@@ -1509,6 +1711,91 @@ def test_queue_response_includes_task_slot_snapshot(coding_client, isolated_codi
     assert task_slots["waiting_total"] == 0
     assert task_slots["endpoints"] == []
     assert "default_limit" in task_slots
+
+
+def test_worktree_create_rejects_caller_path_outside_worktree_root(
+    monkeypatch,
+    tmp_path,
+    isolated_coding_store,
+):
+    import src.coding_worktrees as coding_worktrees
+    from src.coding_runtime import CodingRuntimeError
+
+    monkeypatch.setattr(coding_worktrees, "SessionLocal", isolated_coding_store.SessionLocal)
+    monkeypatch.setenv("ODYSSEUS_WORKTREES_DIR", str(tmp_path / "allowed-worktrees"))
+    monkeypatch.setattr(coding_worktrees, "_is_git_repo", lambda _root: True)
+    monkeypatch.setattr(coding_worktrees, "_branch_exists", lambda _root, _branch: False)
+
+    calls = []
+
+    class _Proc:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    def _run(*args, **kwargs):
+        calls.append((args, kwargs))
+        return _Proc()
+
+    monkeypatch.setattr(coding_worktrees.subprocess, "run", _run)
+
+    project_id, _thread_id = _seed_project_and_thread(isolated_coding_store)
+    outside = tmp_path / "outside-worktrees" / "feature"
+    service = coding_worktrees.CodingWorktreeService()
+
+    with pytest.raises(CodingRuntimeError) as exc:
+        service.create_worktree(
+            "tester",
+            project_id,
+            "feature/outside",
+            path=str(outside),
+        )
+
+    assert exc.value.status_code == 400
+    assert "worktree path must be under" in exc.value.detail
+    assert calls == []
+
+
+def test_websocket_internal_token_requires_loopback_without_forwarded_headers():
+    from types import SimpleNamespace
+
+    from core.middleware import INTERNAL_TOOL_HEADER, INTERNAL_TOOL_TOKEN
+    from routes.coding_routes import _websocket_admin_allowed, _websocket_owner
+
+    class _Headers(dict):
+        def get(self, key, default=None):
+            return super().get(key.lower(), default)
+
+    def _ws(host: str, extra_headers: dict[str, str] | None = None):
+        headers = {
+            INTERNAL_TOOL_HEADER.lower(): INTERNAL_TOOL_TOKEN,
+            "x-odysseus-owner": "tester",
+        }
+        for key, value in (extra_headers or {}).items():
+            headers[key.lower()] = value
+        return SimpleNamespace(
+            headers=_Headers(headers),
+            cookies={},
+            client=SimpleNamespace(host=host),
+            app=SimpleNamespace(state=SimpleNamespace(auth_manager=None)),
+        )
+
+    loopback = _ws("127.0.0.1")
+    assert _websocket_owner(loopback) == "tester"
+    assert _websocket_admin_allowed(loopback, "tester") is True
+
+    remote = _ws("100.64.0.2")
+    assert _websocket_owner(remote) is None
+    assert _websocket_admin_allowed(remote, "tester") is False
+
+    for header, value in (
+        ("X-Forwarded-For", "100.64.0.2"),
+        ("X-Forwarded-Proto", "https"),
+        ("Fly-Client-IP", "100.64.0.2"),
+    ):
+        forwarded = _ws("127.0.0.1", {header: value})
+        assert _websocket_owner(forwarded) is None
+        assert _websocket_admin_allowed(forwarded, "tester") is False
 
 
 def test_active_run_count_excludes_queued_and_finished(isolated_coding_store):
@@ -1625,6 +1912,7 @@ async def test_stop_all_runs_stops_running_and_cancels_queued(monkeypatch, isola
 
 def test_runtime_active_tasks_and_stop_all_endpoints(monkeypatch, coding_client, isolated_coding_store):
     import src.coding_runtime as coding_runtime
+    import src.process_lifecycle as process_lifecycle
 
     monkeypatch.setattr(coding_runtime.CodingRuntimeService, "dtach_available", lambda _self: True)
 
@@ -1681,6 +1969,18 @@ def test_runtime_active_tasks_and_stop_all_endpoints(monkeypatch, coding_client,
     resp = client.get("/api/coding/runtime/active-tasks")
     assert resp.status_code == 200
     assert resp.json() == {"active": 1}
+
+    resp = client.get("/api/coding/runtime/desktop-status")
+    assert resp.status_code == 200
+    assert resp.json()["active"] == 1
+    assert isinstance(resp.json()["auth_configured"], bool)
+
+    disarmed: list[str] = []
+    monkeypatch.setattr(process_lifecycle, "disarm_parent_death_watchdog", lambda reason="": disarmed.append(reason))
+    resp = client.post("/api/coding/runtime/leave-running")
+    assert resp.status_code == 200
+    assert resp.json() == {"ok": True}
+    assert disarmed == ["desktop leave-running"]
 
     # stop-all winds down both the running and the queued run.
     resp = client.post("/api/coding/runtime/stop-all")

@@ -184,18 +184,39 @@ class TaskSlotService:
                 "limit": self.limit_for(key),
             }
 
-    def release(self, slot_id: str) -> dict[str, Any]:
-        holder = self._holders.pop((slot_id or "").strip(), None)
+    def _holder_authorized(
+        self,
+        holder: _Holder,
+        *,
+        owner: str | None = None,
+        run_id: str | None = None,
+    ) -> bool:
+        expected_owner = (owner or "").strip()
+        expected_run = (run_id or "").strip()
+        if expected_owner and holder.owner != expected_owner:
+            return False
+        if expected_run and holder.run_id != expected_run:
+            return False
+        return True
+
+    def release(self, slot_id: str, *, owner: str | None = None, run_id: str | None = None) -> dict[str, Any]:
+        slot_id = (slot_id or "").strip()
+        holder = self._holders.get(slot_id)
         if not holder:
             return {"released": False}
+        if not self._holder_authorized(holder, owner=owner, run_id=run_id):
+            return {"released": False, "forbidden": True}
+        self._holders.pop(slot_id, None)
         self.reclaim_expired()
         self._drain(holder.endpoint_key)
         return {"released": True, "endpoint": holder.endpoint_key}
 
-    def heartbeat(self, slot_id: str) -> dict[str, Any]:
+    def heartbeat(self, slot_id: str, *, owner: str | None = None, run_id: str | None = None) -> dict[str, Any]:
         holder = self._holders.get((slot_id or "").strip())
         if not holder:
             return {"ok": False}
+        if not self._holder_authorized(holder, owner=owner, run_id=run_id):
+            return {"ok": False, "forbidden": True}
         holder.expires_at = _now() + TASK_SLOT_TTL_SECONDS
         return {"ok": True, "expires_in": TASK_SLOT_TTL_SECONDS}
 

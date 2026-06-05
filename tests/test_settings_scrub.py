@@ -19,7 +19,8 @@ def test_top_level_secrets_blanked():
 
 def test_broadened_patterns_blanked():
     s = {"smtp_pass": "a", "db_pwd": "b", "oauth_client_secret": "c",
-         "gh_access_token": "d", "refresh_token": "e", "x_credential": "f", "z_apikey": "g"}
+         "gh_access_token": "d", "refresh_token": "e", "x_credential": "f", "z_apikey": "g",
+         "service_account_json": '{"private_key":"secret"}'}
     out = scrub_settings(s)
     assert all(out[k] == "" for k in s), out
 

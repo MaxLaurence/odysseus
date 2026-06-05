@@ -1358,7 +1358,11 @@ export function _hwfitInit() {
   // HF Token
   const hfToken = document.getElementById('hwfit-hftoken');
   if (hfToken) {
-    hfToken.addEventListener('change', () => { _envState.hfToken = hfToken.value.trim(); _persistEnvState(); });
+    hfToken.addEventListener('change', () => {
+      _envState.hfToken = hfToken.value.trim();
+      _envState._hfTokenDirty = !!_envState.hfToken;
+      _persistEnvState();
+    });
     hfToken.addEventListener('input', () => { _envState.hfToken = hfToken.value.trim(); });
   }
 

@@ -1375,8 +1375,8 @@ function pollAuthStatus(provider) {
 
 // Open the subscription-login PTY in a self-contained overlay terminal. Reuses the
 // engine-agnostic terminal factory but stays OUT of the pane split-tree (the login
-// session is not a CodingRun). Lets the user see the login URL / complete any
-// interactive step (e.g. `claude setup-token`) the browser flow can't finish on its own.
+// session is not a CodingRun). Lets the user see the login URL and complete any
+// interactive provider step the browser flow can't finish on its own.
 function openAuthTerminalOverlay(provider) {
   if (!provider) return;
   if (typeof WebSocket === 'undefined') { toast('Terminal not supported in this browser'); return; }

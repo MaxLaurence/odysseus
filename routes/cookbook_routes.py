@@ -240,6 +240,56 @@ def setup_cookbook_routes() -> APIRouter:
         except Exception:
             return ""
 
+    def _write_owner_secret_file(path: Path, content: str) -> Path:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(content)
+                handle.flush()
+                os.fsync(handle.fileno())
+        except Exception:
+            try:
+                os.close(fd)
+            except Exception:
+                pass
+            raise
+        safe_chmod(path, 0o600)
+        return path
+
+    def _write_bash_hf_env_file(session_id: str, hf_token: str | None) -> Path | None:
+        if not hf_token:
+            return None
+        return _write_owner_secret_file(
+            TMUX_LOG_DIR / f"{session_id}_hf.env",
+            f"export HF_TOKEN='{_bash_squote(hf_token)}'\n",
+        )
+
+    def _write_ps_hf_env_file(session_id: str, hf_token: str | None) -> Path | None:
+        if not hf_token:
+            return None
+        return _write_owner_secret_file(
+            TMUX_LOG_DIR / f"{session_id}_hf.ps1",
+            f"$env:HF_TOKEN = '{_ps_squote(hf_token)}'\r\n",
+        )
+
+    def _remove_owner_secret_file(path: Path | None) -> None:
+        if not path:
+            return
+        try:
+            path.unlink(missing_ok=True)
+        except Exception:
+            logger.warning("Failed to remove temporary Cookbook secret file %s", path, exc_info=True)
+
+    def _bash_source_hf_env_line(path_expr: str) -> str:
+        return f"if [ -f {path_expr} ]; then . {path_expr}; rm -f {path_expr}; fi"
+
+    def _ps_source_hf_env_lines(path_expr: str) -> list[str]:
+        return [
+            f"$__odyHfEnv = {path_expr}",
+            'if (Test-Path $__odyHfEnv) { . $__odyHfEnv; Remove-Item -Force $__odyHfEnv -ErrorAction SilentlyContinue }',
+        ]
+
     def _cookbook_ssh_dir() -> Path:
         # The Docker image keeps cookbook keys under /app/.ssh; that path only
         # exists inside the container. On Windows (and any non-container host)
@@ -437,8 +487,6 @@ def setup_cookbook_routes() -> APIRouter:
         # No script/tee needed — we'll use tmux capture-pane to read output
         lines = ["#!/bin/bash"]
         lines.extend(_user_shell_path_bootstrap())
-        if req.hf_token:
-            lines.append(f"export HF_TOKEN='{_bash_squote(req.hf_token)}'")
         # Ensure pip-user scripts (e.g. hf CLI installed via --user) are on PATH
         lines.append('export PATH="$HOME/.local/bin:$PATH"')
         # When Odysseus runs from a venv (e.g. native macOS install), put its bin
@@ -462,6 +510,7 @@ def setup_cookbook_routes() -> APIRouter:
 
         remote = req.remote_host  # None for local
         is_windows = req.platform == "windows"
+        local_secret_cleanup_path: Path | None = None
         # LOCAL execution on a native-Windows host never uses tmux (it uses the
         # detached-process path below), regardless of the UI-supplied platform.
         local_windows = IS_WINDOWS and not remote
@@ -477,11 +526,14 @@ def setup_cookbook_routes() -> APIRouter:
         if remote and is_windows:
             # ── Windows remote: generate .ps1 runner, use Start-Process for background ──
             remote_runner = f".{session_id}_run.ps1"
+            remote_hf_env = f".{session_id}_hf.ps1"
+            hf_env_path = _write_ps_hf_env_file(session_id, req.hf_token)
+            local_secret_cleanup_path = hf_env_path
             ps_lines = []
             ps_lines.append('$sessionDir = "$env:TEMP\\odysseus-sessions"')
             ps_lines.append('New-Item -ItemType Directory -Force -Path $sessionDir | Out-Null')
-            if req.hf_token:
-                ps_lines.append(f"$env:HF_TOKEN = '{_ps_squote(req.hf_token)}'")
+            if hf_env_path:
+                ps_lines.extend(_ps_source_hf_env_lines(f"(Join-Path $HOME '{remote_hf_env}')"))
             if req.env_prefix:
                 ps_lines.append(_safe_env_prefix(req.env_prefix))
             # Try hf CLI, fall back to Python huggingface_hub, then auto-install
@@ -525,20 +577,25 @@ def setup_cookbook_routes() -> APIRouter:
                 f"-RedirectStandardError \\\"$sd\\{session_id}.err.log\\\" "
                 f"-NoNewWindow -PassThru | ForEach-Object {{ $_.Id | Out-File \\\"$sd\\{session_id}.pid\\\" }}"
             )
+            hf_env_scp = f"scp -O {_Pf}-q '{hf_env_path}' {remote}:{remote_hf_env} && " if hf_env_path else ""
             setup_cmd = (
-                f"scp -O {_Pf}-q '{runner_path}' {remote}:{remote_runner} && "
-                f'ssh {_pf}{remote} "powershell -Command \\"{launch_ps}\\""'
+                hf_env_scp
+                + f"scp -O {_Pf}-q '{runner_path}' {remote}:{remote_runner} && "
+                + f'ssh {_pf}{remote} "powershell -Command \\"{launch_ps}\\""'
             )
 
         elif remote:
             # ── Linux/Termux remote: create tmux session ON the remote host ──
             remote_runner = f".{session_id}_run.sh"
+            remote_hf_env = f".{session_id}_hf.env"
+            hf_env_path = _write_bash_hf_env_file(session_id, req.hf_token)
+            local_secret_cleanup_path = hf_env_path
             runner_lines = ["#!/bin/bash"]
             runner_lines.extend(_user_shell_path_bootstrap())
             runner_lines.append("# Auto-detect environment")
             runner_lines.append("deactivate 2>/dev/null; hash -r")
-            if req.hf_token:
-                runner_lines.append(f"export HF_TOKEN='{_bash_squote(req.hf_token)}'")
+            if hf_env_path:
+                runner_lines.append(_bash_source_hf_env_line(f'"$HOME/{remote_hf_env}"'))
             if req.env_prefix:
                 runner_lines.append(_safe_env_prefix(req.env_prefix))
             else:
@@ -597,13 +654,18 @@ def setup_cookbook_routes() -> APIRouter:
             _port = req.ssh_port
             _pf = f"-P {_port} " if _port and _port != "22" else ""
             _spf = f"-p {_port} " if _port and _port != "22" else ""
+            hf_env_scp = f"scp -O {_pf}-q '{hf_env_path}' {remote}:{remote_hf_env} && " if hf_env_path else ""
             setup_cmd = (
-                f"scp -O {_pf}-q '{runner_path}' {remote}:{remote_runner} && "
-                f"ssh {_spf}{remote} 'chmod +x {remote_runner} && tmux new-session -d -s {session_id} \"./{remote_runner}\"'"
+                hf_env_scp
+                + f"scp -O {_pf}-q '{runner_path}' {remote}:{remote_runner} && "
+                + f"ssh {_spf}{remote} 'chmod +x {remote_runner} && tmux new-session -d -s {session_id} \"./{remote_runner}\"'"
             )
         else:
             # Local: run hf download in the background (tmux on POSIX, a detached
             # process + logfile on Windows where tmux doesn't exist).
+            hf_env_path = _write_bash_hf_env_file(session_id, req.hf_token)
+            if hf_env_path:
+                lines.append(_bash_source_hf_env_line(shlex.quote(str(hf_env_path))))
             if req.env_prefix:
                 lines.append(_safe_env_prefix(req.env_prefix))
             else:
@@ -637,12 +699,15 @@ def setup_cookbook_routes() -> APIRouter:
                 logger.error(f"Local detached download launch failed: {e}")
                 return {"ok": False, "error": str(e), "session_id": session_id}
         else:
-            proc = await asyncio.create_subprocess_shell(
-                setup_cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            await proc.wait()
+            try:
+                proc = await asyncio.create_subprocess_shell(
+                    setup_cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                await proc.wait()
+            finally:
+                _remove_owner_secret_file(local_secret_cleanup_path)
 
             if proc.returncode != 0:
                 stderr = (await proc.stderr.read()).decode(errors="replace")
@@ -935,6 +1000,7 @@ def setup_cookbook_routes() -> APIRouter:
         session_id = f"serve-{uuid.uuid4().hex[:8]}"
         remote = req.remote_host
         is_windows = req.platform == "windows"
+        local_secret_cleanup_path: Path | None = None
         # LOCAL execution on a native-Windows host never uses tmux (detached
         # process path below), regardless of the UI-supplied platform.
         local_windows = IS_WINDOWS and not remote
@@ -955,11 +1021,14 @@ def setup_cookbook_routes() -> APIRouter:
         if is_windows and remote:
             # ── Windows remote: generate .ps1 serve runner ──
             remote_runner = f".{session_id}_run.ps1"
+            remote_hf_env = f".{session_id}_hf.ps1"
+            hf_env_path = _write_ps_hf_env_file(session_id, req.hf_token)
+            local_secret_cleanup_path = hf_env_path
             ps_lines = []
             ps_lines.append('$sessionDir = "$env:TEMP\\odysseus-sessions"')
             ps_lines.append('New-Item -ItemType Directory -Force -Path $sessionDir | Out-Null')
-            if req.hf_token:
-                ps_lines.append(f"$env:HF_TOKEN = '{_ps_squote(req.hf_token)}'")
+            if hf_env_path:
+                ps_lines.extend(_ps_source_hf_env_lines(f"(Join-Path $HOME '{remote_hf_env}')"))
             if req.gpus:
                 ps_lines.append(f"$env:CUDA_VISIBLE_DEVICES = '{req.gpus}'")
             if req.env_prefix:
@@ -997,12 +1066,18 @@ def setup_cookbook_routes() -> APIRouter:
                 f"-RedirectStandardError \\\"$sd\\{session_id}.err.log\\\" "
                 f"-NoNewWindow -PassThru | ForEach-Object {{ $_.Id | Out-File \\\"$sd\\{session_id}.pid\\\" }}"
             )
+            hf_env_scp = f"scp -O {_Pf}-q '{hf_env_path}' {remote}:{remote_hf_env} && " if hf_env_path else ""
             setup_cmd = (
-                f"scp -O {_Pf}-q '{runner_path}' {remote}:{remote_runner} && "
-                f'ssh {_pf}{remote} "powershell -Command \\"{launch_ps}\\""'
+                hf_env_scp
+                + f"scp -O {_Pf}-q '{runner_path}' {remote}:{remote_runner} && "
+                + f'ssh {_pf}{remote} "powershell -Command \\"{launch_ps}\\""'
             )
         else:
             # ── Linux/Termux: bash + tmux (existing flow) ──
+            remote_hf_env = f".{session_id}_hf.env"
+            hf_env_path = _write_bash_hf_env_file(session_id, req.hf_token)
+            if remote:
+                local_secret_cleanup_path = hf_env_path
             runner_lines = ["#!/bin/bash"]
             runner_lines.extend(_user_shell_path_bootstrap())
             runner_lines.append('ODYSSEUS_PREFLIGHT_EXIT=""')
@@ -1011,8 +1086,11 @@ def setup_cookbook_routes() -> APIRouter:
             if not remote:
                 runner_lines.append(_local_tooling_path_export(sys.executable))
             runner_lines.append("export FLASHINFER_DISABLE_VERSION_CHECK=1")
-            if req.hf_token:
-                runner_lines.append(f"export HF_TOKEN='{_bash_squote(req.hf_token)}'")
+            if hf_env_path:
+                if remote:
+                    runner_lines.append(_bash_source_hf_env_line(f'"$HOME/{remote_hf_env}"'))
+                else:
+                    runner_lines.append(_bash_source_hf_env_line(shlex.quote(str(hf_env_path))))
             if req.gpus:
                 runner_lines.append(f"export CUDA_VISIBLE_DEVICES='{req.gpus}'")
             if req.env_prefix:
@@ -1201,8 +1279,9 @@ def setup_cookbook_routes() -> APIRouter:
                         )
                 setup_cmd = (
                     f"{scp_extras}"
-                    f"scp -O {_Pf}-q '{runner_path}' {remote}:{remote_runner} && "
-                    f"ssh {_pf}{remote} 'chmod +x {remote_runner} && tmux new-session -d -s {session_id} \"./{remote_runner}\"'"
+                    + (f"scp -O {_Pf}-q '{hf_env_path}' {remote}:{remote_hf_env} && " if hf_env_path else "")
+                    + f"scp -O {_Pf}-q '{runner_path}' {remote}:{remote_runner} && "
+                    + f"ssh {_pf}{remote} 'chmod +x {remote_runner} && tmux new-session -d -s {session_id} \"./{remote_runner}\"'"
                 )
             else:
                 setup_cmd = f"tmux new-session -d -s {session_id} {shlex.quote(str(runner_path))}"
@@ -1215,12 +1294,15 @@ def setup_cookbook_routes() -> APIRouter:
                 logger.error(f"Local detached serve launch failed: {e}")
                 return {"ok": False, "error": str(e), "session_id": session_id}
         else:
-            proc = await asyncio.create_subprocess_shell(
-                setup_cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            await proc.wait()
+            try:
+                proc = await asyncio.create_subprocess_shell(
+                    setup_cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                await proc.wait()
+            finally:
+                _remove_owner_secret_file(local_secret_cleanup_path)
 
             if proc.returncode != 0:
                 stderr = (await proc.stderr.read()).decode(errors="replace")

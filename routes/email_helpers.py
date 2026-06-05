@@ -193,6 +193,22 @@ def require_user(request: Request) -> str:
     return _require_auth(request)
 
 
+def _email_account_visible_to_owner(row, owner: str) -> bool:
+    if not owner:
+        return True
+    row_owner = (getattr(row, "owner", None) or "").strip()
+    if row_owner == owner:
+        return True
+    if row_owner:
+        return False
+    owner_l = owner.strip().lower()
+    mailbox_values = {
+        (getattr(row, "imap_user", None) or "").strip().lower(),
+        (getattr(row, "from_address", None) or "").strip().lower(),
+    }
+    return owner_l in mailbox_values
+
+
 def _assert_owns_account(account_id: str, owner: str) -> None:
     """Reject requests that name an `account_id` belonging to another user.
     Previously the account lookup in `_get_email_config` filtered only on
@@ -209,7 +225,7 @@ def _assert_owns_account(account_id: str, owner: str) -> None:
             row = db.query(_EA).filter(_EA.id == account_id).first()
             if row is None:
                 raise HTTPException(404, "Account not found")
-            if row.owner and row.owner != owner:
+            if not _email_account_visible_to_owner(row, owner):
                 # Treat as 404 (not 403) so we don't leak existence.
                 raise HTTPException(404, "Account not found")
         finally:
@@ -315,30 +331,95 @@ def _init_scheduled_db():
             owner TEXT DEFAULT ''
         )
     """)
-    # Email summary cache (keyed by Message-ID)
+    # Email summary cache. SECURITY: Message-IDs are global, so caches must be
+    # keyed by (message_id, owner) to avoid serving another user's summary for
+    # the same newsletter/thread id.
     conn.execute("""
         CREATE TABLE IF NOT EXISTS email_summaries (
-            message_id TEXT PRIMARY KEY,
+            message_id TEXT,
+            owner TEXT DEFAULT '',
             uid TEXT,
             folder TEXT,
             subject TEXT,
             sender TEXT,
             summary TEXT NOT NULL,
             model_used TEXT,
-            created_at TEXT NOT NULL
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (message_id, owner)
         )
     """)
-    # Email AI reply cache (pre-generated draft replies)
+    # Email AI reply cache (pre-generated draft replies), owner-scoped for the
+    # same reason as email_summaries.
     conn.execute("""
         CREATE TABLE IF NOT EXISTS email_ai_replies (
-            message_id TEXT PRIMARY KEY,
+            message_id TEXT,
+            owner TEXT DEFAULT '',
             uid TEXT,
             folder TEXT,
             reply TEXT NOT NULL,
             model_used TEXT,
-            created_at TEXT NOT NULL
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (message_id, owner)
         )
     """)
+    def _ensure_owner_scoped_message_cache(table: str):
+        try:
+            rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+            cols = {r[1] for r in rows}
+            pk_cols = [r[1] for r in sorted((r for r in rows if r[5]), key=lambda r: r[5])]
+            if "owner" in cols and pk_cols == ["message_id", "owner"]:
+                return
+            owner_expr = "COALESCE(owner, '')" if "owner" in cols else "''"
+            tmp = f"{table}__owner_migration_old"
+            conn.execute(f"DROP TABLE IF EXISTS {tmp}")
+            conn.execute(f"ALTER TABLE {table} RENAME TO {tmp}")
+            if table == "email_summaries":
+                conn.execute("""
+                    CREATE TABLE email_summaries (
+                        message_id TEXT,
+                        owner TEXT DEFAULT '',
+                        uid TEXT,
+                        folder TEXT,
+                        subject TEXT,
+                        sender TEXT,
+                        summary TEXT NOT NULL,
+                        model_used TEXT,
+                        created_at TEXT NOT NULL,
+                        PRIMARY KEY (message_id, owner)
+                    )
+                """)
+                conn.execute(f"""
+                    INSERT OR IGNORE INTO email_summaries
+                    (message_id, owner, uid, folder, subject, sender, summary, model_used, created_at)
+                    SELECT message_id, {owner_expr}, uid, folder, subject, sender, summary, model_used, created_at
+                    FROM email_summaries__owner_migration_old
+                """)
+            elif table == "email_ai_replies":
+                conn.execute("""
+                    CREATE TABLE email_ai_replies (
+                        message_id TEXT,
+                        owner TEXT DEFAULT '',
+                        uid TEXT,
+                        folder TEXT,
+                        reply TEXT NOT NULL,
+                        model_used TEXT,
+                        created_at TEXT NOT NULL,
+                        PRIMARY KEY (message_id, owner)
+                    )
+                """)
+                conn.execute(f"""
+                    INSERT OR IGNORE INTO email_ai_replies
+                    (message_id, owner, uid, folder, reply, model_used, created_at)
+                    SELECT message_id, {owner_expr}, uid, folder, reply, model_used, created_at
+                    FROM email_ai_replies__owner_migration_old
+                """)
+            conn.execute(f"DROP TABLE IF EXISTS {tmp}")
+        except Exception as _mig_e:
+            import logging as _lg
+            _lg.getLogger(__name__).warning(f"{table} owner-migration skipped: {_mig_e}")
+
+    _ensure_owner_scoped_message_cache("email_summaries")
+    _ensure_owner_scoped_message_cache("email_ai_replies")
     # Email tags / spam classification cache. SECURITY: keyed by
     # (message_id, owner) because Message-IDs are GLOBAL (a newsletter goes
     # to many users with the same Message-ID). Without owner-scoping, a
@@ -563,7 +644,7 @@ def _get_email_config(account_id: str | None = None, owner: str = "") -> dict:
                 # in depth — `require_owner` already calls `_assert_owns_account`
                 # for query-param account_ids, but other callers (cookbook
                 # rules, scheduled poller) may not.
-                if row is not None and owner and row.owner and row.owner != owner:
+                if row is not None and not _email_account_visible_to_owner(row, owner):
                     row = None
             # Fallback path — restrict to this owner's accounts so we don't
             # leak another user's default mailbox to an unconfigured user.

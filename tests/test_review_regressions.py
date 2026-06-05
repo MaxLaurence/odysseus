@@ -1,5 +1,6 @@
 """Regression tests for issues found during code review."""
 
+import asyncio
 import importlib
 import json
 import sys
@@ -449,6 +450,66 @@ async def test_public_agent_policy_blocks_sensitive_tools(monkeypatch):
         assert desc == f"{tool_name}: BLOCKED"
         assert result["exit_code"] == 1
         assert "restricted to admin users" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_manage_tasks_direct_blocks_shell_actions_for_non_admin(monkeypatch):
+    auth_mod = _install_core_auth_stub(monkeypatch)
+    from src.tool_implementations import do_manage_tasks
+
+    class FakeAuth:
+        is_configured = True
+
+        def is_admin(self, username):
+            return False
+
+    class FakeDb:
+        def close(self):
+            pass
+
+    database = types.ModuleType("core.database")
+    database.SessionLocal = lambda: FakeDb()
+    database.ScheduledTask = MagicMock()
+    monkeypatch.setattr(auth_mod, "AuthManager", lambda: FakeAuth())
+    monkeypatch.setitem(sys.modules, "core.database", database)
+
+    result = await do_manage_tasks(
+        '{"action":"create","task_type":"action","action_name":"run_local"}',
+        owner="regular-user",
+    )
+
+    assert result["exit_code"] == 1
+    assert "requires admin privileges" in result["error"]
+
+
+def test_direct_bash_tool_does_not_inherit_parent_secrets(monkeypatch):
+    from src.tool_execution import _direct_fallback
+
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-proj-parent-secret-value")
+    monkeypatch.setenv("ODYSSEUS_INTERNAL_TOKEN", "ody_internal_parent_secret")
+
+    result = asyncio.run(_direct_fallback("bash", 'printf "%s" "${OPENAI_API_KEY:-missing}"'))
+
+    assert result["exit_code"] == 0
+    assert result["output"] == "missing"
+    assert "sk-proj-parent-secret-value" not in json.dumps(result)
+
+
+def test_direct_python_tool_does_not_inherit_parent_secrets(monkeypatch):
+    from src.tool_execution import _direct_fallback
+
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-parent-secret-value")
+
+    result = asyncio.run(
+        _direct_fallback(
+            "python",
+            "import os; print(os.environ.get('ANTHROPIC_API_KEY', 'missing'))",
+        )
+    )
+
+    assert result["exit_code"] == 0
+    assert result["output"] == "missing"
+    assert "sk-ant-parent-secret-value" not in json.dumps(result)
 
 
 def test_public_agent_policy_hides_sensitive_tools(monkeypatch):

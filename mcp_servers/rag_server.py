@@ -5,6 +5,7 @@ MCP server exposing RAG document management (list, add_directory, remove_directo
 """
 
 import asyncio
+import inspect
 import os
 import sys
 from pathlib import Path
@@ -15,11 +16,74 @@ from mcp.types import Tool, TextContent
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from core.constants import PERSONAL_DIR
+from src.personal_paths import (
+    path_inside,
+    path_visible_to_personal_owner,
+    personal_upload_dir_for_owner,
+    resolve_personal_dir,
+)
+
 server = Server("rag")
 
 _rag_manager = None
 _personal_docs_manager = None
 _initialized = False
+
+
+def _request_owner(arguments: dict) -> str:
+    return str((arguments or {}).get("_odysseus_owner") or "").strip()
+
+
+def _visible_file_rows(files, owner: str) -> list:
+    visible = []
+    for f in files:
+        if not isinstance(f, dict):
+            continue
+        entry_owner = str(f.get("owner") or "").strip()
+        if entry_owner and entry_owner != owner:
+            continue
+        if path_visible_to_personal_owner(f.get("path", ""), owner):
+            visible.append(f)
+    return visible
+
+
+def _visible_directories(dirs, owner: str) -> list[str]:
+    return [
+        d for d in dirs or []
+        if isinstance(d, str) and path_visible_to_personal_owner(d, owner)
+    ]
+
+
+def _resolve_add_directory(directory: str) -> str:
+    return resolve_personal_dir(os.path.expanduser(directory), personal_dir=PERSONAL_DIR)
+
+
+def _resolve_remove_directory(directory: str, owner: str) -> str:
+    try:
+        return _resolve_add_directory(directory)
+    except ValueError:
+        upload_dir = personal_upload_dir_for_owner(owner, create=False)
+        candidate = directory if os.path.isabs(directory) else os.path.join(upload_dir, directory)
+        resolved = os.path.realpath(os.path.expanduser(candidate))
+        if path_inside(resolved, upload_dir):
+            return resolved
+        raise ValueError("Directory must be inside personal documents or your uploads")
+
+
+def _call_owner_aware(method, *args, owner: str = "", **kwargs):
+    if owner:
+        try:
+            params = inspect.signature(method).parameters.values()
+            if not any(p.kind == inspect.Parameter.VAR_KEYWORD or p.name == "owner" for p in params):
+                raise TypeError("owner-scoped RAG method does not accept owner")
+        except (TypeError, ValueError):
+            raise TypeError("owner-scoped RAG method does not accept owner")
+        return method(*args, owner=owner, **kwargs)
+    try:
+        return method(*args, owner=owner, **kwargs)
+    except TypeError:
+        return method(*args, **kwargs)
 
 
 def _ensure_init():
@@ -71,16 +135,18 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         return [TextContent(type="text", text=f"Unknown tool: {name}")]
 
     _ensure_init()
+    arguments = arguments or {}
+    owner = _request_owner(arguments)
     action = arguments.get("action", "")
 
     if action == "list":
         if not _personal_docs_manager:
             return [TextContent(type="text", text="Personal docs manager not available. RAG may not be configured.")]
         try:
-            files = getattr(_personal_docs_manager, 'index', None) or []
+            files = _visible_file_rows(getattr(_personal_docs_manager, 'index', None) or [], owner)
             dirs = []
             if hasattr(_personal_docs_manager, 'get_indexed_directories'):
-                dirs = _personal_docs_manager.get_indexed_directories()
+                dirs = _visible_directories(_personal_docs_manager.get_indexed_directories(), owner)
 
             lines = []
             if dirs:
@@ -107,13 +173,16 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             return [TextContent(type="text", text="Error: add_directory needs a directory path")]
         # Store an absolute path so indexed `source` metadata is absolute and
         # remove_directory (which abspath-normalizes) can match it later (#1660).
-        directory = os.path.abspath(os.path.expanduser(directory))
+        try:
+            directory = _resolve_add_directory(directory)
+        except ValueError as e:
+            return [TextContent(type="text", text=f"Error: {e}")]
         if not os.path.isdir(directory):
             return [TextContent(type="text", text=f"Error: Directory not found: {directory}")]
         if not _rag_manager:
             return [TextContent(type="text", text="Error: RAG manager not available")]
         try:
-            result = _rag_manager.index_personal_documents(directory)
+            result = _call_owner_aware(_rag_manager.index_personal_documents, directory, owner=owner)
             indexed = result.get("indexed_count", 0) if isinstance(result, dict) else 0
             # Record the directory so `list` and `remove_directory` can see it.
             # Indexing was just done above, so pass index=False to avoid a second
@@ -121,7 +190,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             # tracked in indexed_directories, so it was invisible/unremovable.
             if _personal_docs_manager and hasattr(_personal_docs_manager, "add_directory"):
                 try:
-                    _personal_docs_manager.add_directory(directory, index=False)
+                    _call_owner_aware(_personal_docs_manager.add_directory, directory, index=False, owner=owner)
                 except Exception:
                     pass
             return [TextContent(type="text", text=f"Directory '{directory}' added to RAG index ({indexed} chunks indexed)")]
@@ -135,14 +204,17 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             return [TextContent(type="text", text="Error: remove_directory needs a directory path")]
         # Expand ~ to match add_directory, which indexes the expanded path.
         # Without this, removing "~/docs" never matches the stored absolute path.
-        directory = os.path.expanduser(directory)
+        try:
+            directory = _resolve_remove_directory(directory, owner)
+        except ValueError as e:
+            return [TextContent(type="text", text=f"Error: {e}")]
         if not _personal_docs_manager:
             return [TextContent(type="text", text="Error: Personal docs manager not available")]
         try:
             if hasattr(_personal_docs_manager, 'remove_directory'):
-                _personal_docs_manager.remove_directory(directory)
+                _call_owner_aware(_personal_docs_manager.remove_directory, directory, owner=owner)
             if _rag_manager and hasattr(_rag_manager, 'remove_directory'):
-                _rag_manager.remove_directory(directory)
+                _call_owner_aware(_rag_manager.remove_directory, directory, owner=owner)
             return [TextContent(type="text", text=f"Directory '{directory}' removed from RAG index")]
         except Exception as e:
             return [TextContent(type="text", text=f"Error: Failed to remove directory: {e}")]

@@ -3,13 +3,19 @@
 import os
 import logging
 import uuid
+import inspect
 from typing import List, Tuple
 from fastapi import APIRouter, HTTPException, Query, Request, UploadFile, File, Depends
 from src.request_models import DirectoryRequest
 from core.constants import DATA_DIR, PERSONAL_DIR
 from src.rag_singleton import get_rag_manager
-from src.auth_helpers import get_current_user, require_user
+from src.auth_helpers import require_user
 from core.middleware import require_admin
+from src.personal_paths import (
+    path_visible_to_personal_owner,
+    personal_upload_dir_for_owner as scoped_personal_upload_dir_for_owner,
+    resolve_owned_personal_file,
+)
 from src.upload_handler import secure_filename
 
 UPLOADS_DIR = os.path.join(DATA_DIR, "personal_uploads")
@@ -22,13 +28,7 @@ logger = logging.getLogger(__name__)
 
 def _personal_upload_dir_for_owner(owner: str | None) -> str:
     """Return the per-owner upload directory used for direct RAG uploads."""
-    owner_segment = secure_filename((owner or "local").strip())[:80] or "local"
-    upload_dir = os.path.abspath(os.path.join(UPLOADS_DIR, owner_segment))
-    base_abs = os.path.abspath(UPLOADS_DIR)
-    if os.path.commonpath([upload_dir, base_abs]) != base_abs:
-        raise ValueError("Unsafe upload owner path")
-    os.makedirs(upload_dir, exist_ok=True)
-    return upload_dir
+    return scoped_personal_upload_dir_for_owner(owner, UPLOADS_DIR)
 
 
 def _unique_personal_upload_path(upload_dir: str, original_name: str | None) -> Tuple[str, str, str]:
@@ -82,18 +82,95 @@ def setup_personal_routes(personal_docs_manager, rag_manager, rag_available):
         if not in_base:
             raise HTTPException(403, "Directory must be inside personal documents")
         return resolved
+
+    def _path_visible_to_owner(path: str, owner: str | None) -> bool:
+        return path_visible_to_personal_owner(
+            path,
+            owner,
+            uploads_dir=UPLOADS_DIR,
+            personal_dir=PERSONAL_DIR,
+        )
+
+    def _visible_files(owner: str | None):
+        files = []
+        for f in personal_docs_manager.index:
+            if not isinstance(f, dict):
+                continue
+            entry_owner = (f.get("owner") or "").strip()
+            if entry_owner and entry_owner != (owner or ""):
+                continue
+            path = f.get("path", "")
+            if not _path_visible_to_owner(path, owner):
+                continue
+            files.append({"name": f["name"], "size": f["size"], "path": path})
+        return files
+
+    def _visible_directories(owner: str | None):
+        if not hasattr(personal_docs_manager, "get_indexed_directories"):
+            return []
+        return [
+            d for d in personal_docs_manager.get_indexed_directories()
+            if isinstance(d, str) and _path_visible_to_owner(d, owner)
+        ]
+
+    def _resolve_removable_directory(directory: str, owner: str | None) -> str:
+        try:
+            return _resolve_allowed_personal_dir(directory)
+        except HTTPException as personal_exc:
+            upload_dir = _personal_upload_dir_for_owner(owner)
+            candidate = directory if os.path.isabs(directory) else os.path.join(upload_dir, directory)
+            resolved = os.path.realpath(candidate)
+            if _path_visible_to_owner(resolved, owner) and os.path.commonpath(
+                [resolved, os.path.realpath(upload_dir)]
+            ) == os.path.realpath(upload_dir):
+                return resolved
+            raise HTTPException(403, "Directory must be inside personal documents or your uploads") from personal_exc
+
+    def _manager_remove_directory(directory: str, owner: str | None):
+        if owner:
+            params = inspect.signature(personal_docs_manager.remove_directory).parameters.values()
+            if not any(p.kind == inspect.Parameter.VAR_KEYWORD or p.name == "owner" for p in params):
+                raise RuntimeError("owner-scoped personal document removal is unavailable")
+            personal_docs_manager.remove_directory(directory, owner=owner)
+            return
+        try:
+            personal_docs_manager.remove_directory(directory, owner=owner)
+        except TypeError:
+            personal_docs_manager.remove_directory(directory)
+
+    def _rag_remove_directory(rag, directory: str, owner: str | None):
+        if owner:
+            params = inspect.signature(rag.remove_directory).parameters.values()
+            if not any(p.kind == inspect.Parameter.VAR_KEYWORD or p.name == "owner" for p in params):
+                raise RuntimeError("owner-scoped RAG directory removal is unavailable")
+            return rag.remove_directory(directory, owner=owner)
+        try:
+            return rag.remove_directory(directory, owner=owner)
+        except TypeError:
+            return rag.remove_directory(directory)
+
+    def _rag_delete_by_source(rag, filepath: str, owner: str | None):
+        if owner:
+            params = inspect.signature(rag.delete_by_source).parameters.values()
+            if not any(p.kind == inspect.Parameter.VAR_KEYWORD or p.name == "owner" for p in params):
+                raise RuntimeError("owner-scoped RAG source deletion is unavailable")
+            return rag.delete_by_source(filepath, owner=owner)
+        try:
+            return rag.delete_by_source(filepath, owner=owner)
+        except TypeError:
+            return rag.delete_by_source(filepath)
     
     @router.get("")
     def api_personal_list(owner: str = Depends(require_user), _admin: None = Depends(require_admin)):
         """Enhanced version that includes directories"""
-        files = [{"name": f["name"], "size": f["size"], "path": f.get("path", "")} for f in personal_docs_manager.index]
-        directories = personal_docs_manager.get_indexed_directories() if hasattr(personal_docs_manager, "get_indexed_directories") else []
+        files = _visible_files(owner)
+        directories = _visible_directories(owner)
         return {"files": files, "directories": directories}
     
     @router.post("/reload")
     def api_personal_reload(owner: str = Depends(require_user), _admin: None = Depends(require_admin)):
         personal_docs_manager.refresh_index()
-        return {"ok": True, "count": len(personal_docs_manager.index)}
+        return {"ok": True, "count": len(_visible_files(owner))}
     
     @router.post("/add_directory")
     async def add_directory_to_rag(
@@ -130,7 +207,7 @@ def setup_personal_routes(personal_docs_manager, rag_manager, rag_available):
                 
                 if result["success"]:
                     # Also update the personal_docs_manager to track this directory
-                    personal_docs_manager.add_directory(directory, index=False)
+                    personal_docs_manager.add_directory(directory, index=False, owner=owner)
                     
                     return {
                         "success": True,
@@ -164,18 +241,19 @@ def setup_personal_routes(personal_docs_manager, rag_manager, rag_available):
         try:
             if not directory:
                 raise HTTPException(400, "Directory path is required")
+            directory = _resolve_removable_directory(directory, owner)
 
             logger.info(f"Removing directory from RAG: {directory}")
 
             # Always remove from personal_docs_manager tracking
             if hasattr(personal_docs_manager, 'remove_directory'):
-                personal_docs_manager.remove_directory(directory)
+                _manager_remove_directory(directory, owner)
 
             # Remove from RAG vector store (best-effort)
             rag = _rag()
             if rag:
                 try:
-                    rag.remove_directory(directory)
+                    _rag_remove_directory(rag, directory, owner)
                 except Exception as e:
                     logger.warning(f"RAG removal failed for directory {directory}: {e}")
 
@@ -194,7 +272,7 @@ def setup_personal_routes(personal_docs_manager, rag_manager, rag_available):
     @router.post("/upload")
     async def upload_files_to_rag(request: Request, files: List[UploadFile] = File(...)):
         """Upload files directly into RAG. Supports text and PDF."""
-        user = get_current_user(request)
+        user = require_user(request)
         rag = _rag()
         if not rag:
             raise HTTPException(503, "RAG system is not available — is the embedding service running?")
@@ -265,12 +343,22 @@ def setup_personal_routes(personal_docs_manager, rag_manager, rag_available):
     async def delete_file_from_rag(filepath: str = Query(...), owner: str = Depends(require_user), _admin: None = Depends(require_admin)):
         """Delete a specific file from RAG index and optionally from disk."""
         try:
+            try:
+                filepath = resolve_owned_personal_file(
+                    filepath,
+                    owner,
+                    uploads_dir=UPLOADS_DIR,
+                    personal_dir=PERSONAL_DIR,
+                )
+            except ValueError as exc:
+                raise HTTPException(403, str(exc)) from exc
+
             # Remove chunks from RAG vector store (best-effort)
             removed = 0
             rag = _rag()
             if rag:
                 try:
-                    removed = rag.delete_by_source(filepath)
+                    removed = _rag_delete_by_source(rag, filepath, owner)
                 except Exception as e:
                     logger.warning(f"RAG removal failed for {filepath}: {e}")
 
@@ -278,7 +366,7 @@ def setup_personal_routes(personal_docs_manager, rag_manager, rag_available):
             deleted_from_disk = False
             try:
                 abs_target = os.path.abspath(filepath)
-                base_abs = os.path.abspath(UPLOADS_DIR)
+                base_abs = os.path.abspath(_personal_upload_dir_for_owner(owner))
                 in_uploads = (
                     abs_target == base_abs
                     or os.path.commonpath([abs_target, base_abs]) == base_abs
@@ -298,6 +386,8 @@ def setup_personal_routes(personal_docs_manager, rag_manager, rag_available):
                 "removed_chunks": removed,
                 "deleted_from_disk": deleted_from_disk,
             }
+        except HTTPException:
+            raise
         except Exception as e:
             logger.error(f"Failed to delete file {filepath}: {e}")
             raise HTTPException(500, f"Failed to delete file: {str(e)}")
